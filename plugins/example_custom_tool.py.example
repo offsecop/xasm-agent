@@ -1,0 +1,48 @@
+"""
+Example custom tool plugin
+Copy this file and modify to create your own custom tools
+"""
+
+from plugin_interface import ToolPlugin
+from typing import Dict, Any
+
+class ExampleCustomTool(ToolPlugin):
+    @property
+    def name(self) -> str:
+        return "custom:example_tool"
+    
+    @property
+    def description(self) -> str:
+        return "Example custom tool - modify this to create your own"
+    
+    @property
+    def schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Target to scan"
+                },
+                "option": {
+                    "type": "string",
+                    "description": "Optional parameter",
+                    "default": "default_value"
+                }
+            },
+            "required": ["target"]
+        }
+    
+    async def execute(self, parameters: Dict[str, Any]) -> Any:
+        target = parameters['target']
+        option = parameters.get('option', 'default_value')
+        
+        # Implement your custom tool logic here
+        result = {
+            'target': target,
+            'option': option,
+            'output': 'Custom tool executed successfully',
+        }
+        
+        return result
+

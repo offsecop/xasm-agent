@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  asm-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: asm-platform-agent
+    environment:
+      - AGENT_NAME=${AGENT_NAME:-Docker-Agent}
+      - AGENT_TAGS=${AGENT_TAGS:-docker,scanner,internal}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    network_mode: "host"  # Access localhost services
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

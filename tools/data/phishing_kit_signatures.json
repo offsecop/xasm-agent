@@ -1,0 +1,126 @@
+{
+  "version": "1.0",
+  "lastUpdated": "2026-03-02",
+  "probePaths": [
+    "/admin/", "/panel/", "/admin/login.php", "/result.php", "/results.php",
+    "/antibot.php", "/antibots/", "/log.txt", "/logs/", "/.env",
+    "/telegram.php", "/tg.php", "/bot.php", "/send.php", "/post.php",
+    "/next.php", "/login.php", "/verify.php", "/update.php",
+    "/Office365/", "/outlook/", "/security/", "/auth/",
+    "/validation.php", "/checker.php", "/blocker.php"
+  ],
+  "kits": {
+    "16Shop": {
+      "description": "Widely distributed phishing kit targeting Apple, Amazon, PayPal",
+      "signatures": [
+        {"type": "path_exists", "path": "/antibot.php", "weight": 3},
+        {"type": "html_pattern", "pattern": "16Shop", "weight": 5},
+        {"type": "path_exists", "path": "/antibots/antibot.php", "weight": 3},
+        {"type": "html_pattern", "pattern": "X-Mailer.*16Shop", "weight": 5},
+        {"type": "path_content", "path": "/antibot.php", "pattern": "crawlerDetect", "weight": 4}
+      ]
+    },
+    "Kr3pto": {
+      "description": "Banking phishing kit targeting UK financial institutions",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "kr3pto", "weight": 5},
+        {"type": "path_exists", "path": "/panel/admin.php", "weight": 2},
+        {"type": "html_pattern", "pattern": "bankValidation", "weight": 3},
+        {"type": "path_content", "path": "/", "pattern": "kr3pto|Kr3pto", "weight": 5}
+      ]
+    },
+    "Chase-Kit": {
+      "description": "Kit targeting Chase Bank customers",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "chase-verification|chase-secure", "weight": 4},
+        {"type": "path_exists", "path": "/verify.php", "weight": 2},
+        {"type": "path_exists", "path": "/validation.php", "weight": 2},
+        {"type": "html_pattern", "pattern": "chase\\.com.*verify", "weight": 3}
+      ]
+    },
+    "Ex-Robotos": {
+      "description": "Corporate credential harvesting kit",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "ex-robotos|exrobotos", "weight": 5},
+        {"type": "path_exists", "path": "/next.php", "weight": 3},
+        {"type": "html_pattern", "pattern": "loading\\.gif.*office", "weight": 3},
+        {"type": "path_content", "path": "/next.php", "pattern": "header\\(.*Location", "weight": 3}
+      ]
+    },
+    "CAZANOVA": {
+      "description": "Multipurpose phishing kit with admin panel",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "cazanova|CAZANOVA", "weight": 5},
+        {"type": "path_exists", "path": "/admin/", "weight": 2},
+        {"type": "path_content", "path": "/admin/", "pattern": "cazanova", "weight": 5},
+        {"type": "path_exists", "path": "/result.php", "weight": 2}
+      ]
+    },
+    "BulletProofLink": {
+      "description": "Phishing-as-a-service platform",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "bulletproof|bullet-proof", "weight": 5},
+        {"type": "path_exists", "path": "/Office365/", "weight": 3},
+        {"type": "path_content", "path": "/", "pattern": "BulletProof", "weight": 5},
+        {"type": "path_exists", "path": "/send.php", "weight": 2},
+        {"type": "html_pattern", "pattern": "o365.*login|microsoft.*signin", "weight": 2}
+      ]
+    },
+    "LogoKit": {
+      "description": "Dynamic logo-fetching phishing kit",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "logokit|logo-kit", "weight": 5},
+        {"type": "html_pattern", "pattern": "clearbit\\.com/logo|logo\\.clearbit", "weight": 4},
+        {"type": "html_pattern", "pattern": "autocomplete.*email.*logo", "weight": 3},
+        {"type": "path_content", "path": "/", "pattern": "clearbit.*logo|favicongrabber", "weight": 4}
+      ]
+    },
+    "LabHost": {
+      "description": "Phishing-as-a-service with real-time victim interaction",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "labhost|LabHost", "weight": 5},
+        {"type": "path_exists", "path": "/panel/", "weight": 2},
+        {"type": "html_pattern", "pattern": "LabHost.*panel", "weight": 5},
+        {"type": "path_exists", "path": "/bot.php", "weight": 2}
+      ]
+    },
+    "Greatness": {
+      "description": "Microsoft 365 phishing service with MFA bypass",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "greatness|Greatness", "weight": 5},
+        {"type": "path_exists", "path": "/auth/", "weight": 2},
+        {"type": "html_pattern", "pattern": "microsoftonline|microsoft365", "weight": 2},
+        {"type": "path_content", "path": "/auth/", "pattern": "greatness", "weight": 5},
+        {"type": "html_pattern", "pattern": "mfa.*verify|authenticator", "weight": 2}
+      ]
+    },
+    "EvilProxy": {
+      "description": "Reverse proxy phishing platform with session hijacking",
+      "signatures": [
+        {"type": "html_pattern", "pattern": "evilproxy|EvilProxy", "weight": 5},
+        {"type": "header_pattern", "header": "server", "pattern": "nginx.*proxy|reverse", "weight": 3},
+        {"type": "html_pattern", "pattern": "proxy.*session|session.*hijack", "weight": 4},
+        {"type": "header_pattern", "header": "x-forwarded", "pattern": ".*", "weight": 2}
+      ]
+    }
+  },
+  "genericIndicators": [
+    {"name": "Telegram Exfiltration", "type": "html_pattern", "pattern": "api\\.telegram\\.org/bot|t\\.me/", "category": "exfil", "weight": 4},
+    {"name": "Telegram PHP Exfil", "type": "path_exists", "path": "/telegram.php", "category": "exfil", "weight": 3},
+    {"name": "Telegram TG Exfil", "type": "path_exists", "path": "/tg.php", "category": "exfil", "weight": 3},
+    {"name": "Antibot Script", "type": "path_exists", "path": "/antibot.php", "category": "evasion", "weight": 3},
+    {"name": "Antibot Directory", "type": "path_exists", "path": "/antibots/", "category": "evasion", "weight": 3},
+    {"name": "Base64 Obfuscation", "type": "html_pattern", "pattern": "atob\\(|btoa\\(|base64_decode", "category": "obfuscation", "weight": 2},
+    {"name": "Credential Form POST", "type": "html_pattern", "pattern": "action=.*\\.php.*method.*post|method.*post.*action=.*\\.php", "category": "credential_harvest", "weight": 3},
+    {"name": "Password Field", "type": "html_pattern", "pattern": "type=[\"']password[\"']", "category": "credential_harvest", "weight": 1},
+    {"name": "Email Exfil Script", "type": "html_pattern", "pattern": "mail\\(.*\\$_(POST|GET)|smtp.*send", "category": "exfil", "weight": 3},
+    {"name": "Log File Exposed", "type": "path_exists", "path": "/log.txt", "category": "misconfiguration", "weight": 3},
+    {"name": "Env File Exposed", "type": "path_exists", "path": "/.env", "category": "misconfiguration", "weight": 4},
+    {"name": "Admin Panel", "type": "path_exists", "path": "/admin/", "category": "admin_panel", "weight": 2},
+    {"name": "Result Collector", "type": "path_exists", "path": "/result.php", "category": "credential_harvest", "weight": 3},
+    {"name": "Blocker Script", "type": "path_exists", "path": "/blocker.php", "category": "evasion", "weight": 3},
+    {"name": "Checker Script", "type": "path_exists", "path": "/checker.php", "category": "evasion", "weight": 2},
+    {"name": "JavaScript Keylogger", "type": "html_pattern", "pattern": "addEventListener.*keydown|onkeypress|keylogger", "category": "credential_harvest", "weight": 4},
+    {"name": "Hidden iFrame", "type": "html_pattern", "pattern": "iframe.*display.*none|iframe.*visibility.*hidden|iframe.*height.*0", "category": "obfuscation", "weight": 3}
+  ]
+}

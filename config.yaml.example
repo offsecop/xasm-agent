@@ -1,0 +1,29 @@
+agent:
+  name: "Agent-001"
+  description: "Default ASM Platform Agent"
+  tags:
+    - internal
+    - scanner
+  
+server:
+  api_url: "http://localhost:3001/api"
+  ws_url: "ws://localhost:3001/agent-ws"
+  api_key: "your-agent-api-key-here"
+
+tools:
+  - name: "system:dns_resolve"
+    enabled: true
+  - name: "nmap:host_discovery"
+    enabled: true
+  - name: "nmap:port_scan_all"
+    enabled: true
+  - name: "nmap:service_scan"
+    enabled: true
+
+heartbeat_interval: 30  # seconds
+poll_interval: 5  # seconds
+
+# Note: Make sure Nmap is installed on the agent host
+# Ubuntu/Debian: sudo apt-get install nmap
+# macOS: brew install nmap
+# Windows: Download from https://nmap.org/download.html

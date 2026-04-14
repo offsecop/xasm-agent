@@ -1,0 +1,14 @@
+agent:
+  name: "Agent-004"
+  description: "ASM Platform Agent-004 (Docker)"
+  tags:
+    - internal
+    - scanner
+
+server:
+  api_url: "http://backend:3001/api"
+  ws_url: "ws://backend:3001/agent-ws"
+  api_key: ""
+
+heartbeat_interval: 30
+poll_interval: 5
