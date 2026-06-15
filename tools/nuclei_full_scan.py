@@ -17,7 +17,27 @@ TEMPLATE_CATEGORIES = [
     "http/vulnerabilities/",
     "http/cves/",
     "http/exposures/",
+    # TLS/transport posture: deprecated protocol versions, weak/insecure cipher
+    # suites, expired/self-signed/mismatched certificates. Covers the transport
+    # findings a TLS scanner reports (insecure SSL/TLS, weak ciphers, cert expiry).
+    "ssl/",
 ]
+
+DEFAULT_CATEGORY_TIMEOUT_SECONDS = 180
+MIN_CATEGORY_TIMEOUT_SECONDS = 30
+MAX_CATEGORY_TIMEOUT_SECONDS = 900
+
+
+def coerce_category_timeout_seconds(value) -> int:
+    try:
+        timeout_seconds = int(value or DEFAULT_CATEGORY_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        timeout_seconds = DEFAULT_CATEGORY_TIMEOUT_SECONDS
+
+    return max(
+        MIN_CATEGORY_TIMEOUT_SECONDS,
+        min(timeout_seconds, MAX_CATEGORY_TIMEOUT_SECONDS),
+    )
 
 
 class NucleiFullScanTool(ToolPlugin):
@@ -68,6 +88,11 @@ class NucleiFullScanTool(ToolPlugin):
                     "type": "integer",
                     "description": "Maximum number of targets to scan from array (default: 100)",
                     "default": 100
+                },
+                "categoryTimeoutSeconds": {
+                    "type": "integer",
+                    "description": "Maximum wall-clock seconds per template category (default: 180)",
+                    "default": DEFAULT_CATEGORY_TIMEOUT_SECONDS
                 }
             },
             "oneOf": [
@@ -204,6 +229,10 @@ class NucleiFullScanTool(ToolPlugin):
                 c_val = str(rate_limit_config["concurrency"])
                 print(f"[Nuclei Full] Rate limit: {rl_val} req/s, concurrency: {c_val}")
 
+            category_timeout_seconds = coerce_category_timeout_seconds(
+                parameters.get("categoryTimeoutSeconds")
+            )
+
             # ================================================================
             # SEQUENTIAL BATCH EXECUTION per template category
             # Each category runs as a separate nuclei subprocess to stay
@@ -327,11 +356,18 @@ class NucleiFullScanTool(ToolPlugin):
 
                         await process.wait()
 
-                    # 20 minutes timeout per category
-                    await asyncio.wait_for(read_batch_output(), timeout=1200)
+                    await asyncio.wait_for(read_batch_output(), timeout=category_timeout_seconds)
 
                 except asyncio.TimeoutError:
-                    print(f"[Nuclei Full] [{cat_label}] Timed out after 20 minutes, got {len(batch_findings)} partial findings")
+                    print(
+                        f"[Nuclei Full] [{cat_label}] Timed out after "
+                        f"{category_timeout_seconds}s, got {len(batch_findings)} partial findings"
+                    )
+                    if agent:
+                        agent.append_output(
+                            f"[Nuclei Full] [{cat_label}] Timed out after "
+                            f"{category_timeout_seconds}s; keeping {len(batch_findings)} partial findings"
+                        )
                     try:
                         process.kill()
                         await process.wait()
@@ -372,6 +408,22 @@ class NucleiFullScanTool(ToolPlugin):
                     f"[Nuclei Full] Completed: {len(all_findings)} findings in {int(elapsed)}s"
                 )
 
+            # ================================================================
+            # Native TLS posture inspection (cert near-expiry + post-quantum
+            # key exchange). Nuclei's stock SSL templates flag *expired* or
+            # *weak* TLS but not (a) a certificate inside its renewal window or
+            # (b) the absence of a post-quantum hybrid key-exchange group. Both
+            # are deterministic handshake observations, emitted here as
+            # Nuclei-shaped findings so they ride the existing ingestion path.
+            # ================================================================
+            try:
+                tls_findings = await self._inspect_tls_posture(target, targets, parameters, agent)
+                if tls_findings:
+                    all_findings.extend(tls_findings)
+                    print(f"[Nuclei Full] TLS posture inspection: {len(tls_findings)} findings")
+            except Exception as e:
+                print(f"[Nuclei Full] TLS posture inspection error: {e}")
+
             # Build raw output from findings
             raw_output_sanitized = ""
             if all_findings:
@@ -406,6 +458,185 @@ class NucleiFullScanTool(ToolPlugin):
             return {"success": False, "error": "Nuclei not installed"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    # ====================================================================
+    # TLS posture inspection helpers
+    # ====================================================================
+    def _collect_tls_hosts(self, target, targets, max_hosts=10):
+        """Unique (host, port, url) tuples for HTTPS / :443 endpoints only."""
+        from urllib.parse import urlparse
+        raw = []
+        if target:
+            raw.append(target)
+        if targets:
+            if isinstance(targets, list):
+                raw.extend(targets)
+            elif isinstance(targets, str):
+                raw.append(targets)
+        out, seen = [], set()
+        for t in raw:
+            if not isinstance(t, str) or not t.strip():
+                continue
+            u = t.strip()
+            if "://" not in u:
+                u = "https://" + u
+            p = urlparse(u)
+            scheme = (p.scheme or "").lower()
+            host = p.hostname
+            port = p.port or (443 if scheme == "https" else 0)
+            if not host:
+                continue
+            # Only TLS endpoints — skip plain HTTP unless explicitly :443.
+            if scheme != "https" and port != 443:
+                continue
+            key = (host, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((host, port, f"https://{host}" + ("" if port == 443 else f":{port}")))
+            if len(out) >= max_hosts:
+                break
+        return out
+
+    def _fetch_peer_cert_der(self, host, port):
+        """DER bytes of the peer certificate (verification disabled so we can
+        inspect expired / self-signed certs too)."""
+        import ssl
+        import socket
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=12) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                return ss.getpeercert(binary_form=True)
+
+    async def _probe_pqc_support(self, host, port):
+        """Return True if the server negotiates a post-quantum (hybrid)
+        key-exchange group, False if a PQC-only ClientHello is rejected,
+        None if undetermined. Requires OpenSSL >= 3.5 (ships ML-KEM groups)."""
+        import asyncio
+        cmd = [
+            "openssl", "s_client", "-connect", f"{host}:{port}",
+            "-servername", host,
+            "-groups", "X25519MLKEM768:SecP256r1MLKEM768",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(input=b"Q\n"), timeout=18)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return None
+        text = out.decode("utf-8", errors="replace").lower()
+        # PQC-only handshake rejected -> server has no post-quantum key exchange.
+        if "handshake failure" in text or "cipher is (none)" in text or "no shared" in text:
+            return False
+        # Handshake completed with one of the offered PQC groups -> supported.
+        if "new, tlsv1.3" in text or "cipher is tls" in text or "connection established" in text:
+            return True
+        return None
+
+    async def _inspect_tls_posture(self, target, targets, parameters, agent):
+        """Emit Nuclei-shaped findings for (1) certificates inside their
+        renewal window and (2) endpoints without post-quantum key exchange."""
+        import asyncio
+        import datetime
+        findings = []
+        try:
+            warn_days = int(parameters.get("certExpiryWarningDays", 30))
+        except Exception:
+            warn_days = 30
+
+        hosts = self._collect_tls_hosts(target, targets)
+        loop = asyncio.get_event_loop()
+        for host, port, url in hosts:
+            # --- (1) certificate near-expiry / expired ---
+            try:
+                der = await loop.run_in_executor(None, self._fetch_peer_cert_der, host, port)
+                if der:
+                    from cryptography import x509
+                    cert = x509.load_der_x509_certificate(der)
+                    try:
+                        na = cert.not_valid_after_utc
+                        now = datetime.datetime.now(datetime.timezone.utc)
+                    except AttributeError:
+                        na = cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+                        now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+                    days_left = (na - now).days
+                    if days_left < warn_days:
+                        expired = days_left < 0
+                        label = "has expired" if expired else "is about to expire"
+                        findings.append({
+                            "template-id": "ssl-certificate-near-expiry",
+                            "matched-at": url,
+                            "matcher-name": "expired" if expired else "near-expiry",
+                            "extracted-results": [f"{days_left} days", na.isoformat()],
+                            "info": {
+                                "name": "SSL Certificate Expiring — Renewal Required"
+                                        if not expired
+                                        else "SSL Certificate Expired — Renewal Overdue",
+                                "severity": "low",
+                                "description": (
+                                    f"The TLS certificate served by {host}:{port} {label} "
+                                    f"(notAfter {na.isoformat()}, {days_left} days remaining; "
+                                    f"renewal window {warn_days} days). An expiring or expired "
+                                    f"certificate breaks clients and can force insecure fallbacks. "
+                                    f"Renew the certificate before the notAfter date."
+                                ),
+                                "tags": ["ssl", "tls", "certificate", "expiry"],
+                            },
+                        })
+                        if agent:
+                            agent.append_output(
+                                f"[Nuclei Full] TLS: {host}:{port} certificate {label} ({days_left}d left)"
+                            )
+            except Exception as e:
+                print(f"[Nuclei Full] TLS cert check failed for {host}:{port}: {e}")
+
+            # --- (2) post-quantum key exchange ---
+            try:
+                supported = await self._probe_pqc_support(host, port)
+                if supported is False:
+                    findings.append({
+                        "template-id": "tls-no-post-quantum-kex",
+                        "matched-at": url,
+                        "matcher-name": "no-pqc-kex",
+                        "extracted-results": ["classical-only key exchange"],
+                        "info": {
+                            "name": "Lack of Post-Quantum Cryptography Support",
+                            "severity": "low",
+                            "description": (
+                                f"The TLS endpoint {host}:{port} does not negotiate a "
+                                f"post-quantum (hybrid) key-exchange group such as "
+                                f"X25519MLKEM768. A ClientHello offering only post-quantum "
+                                f"groups was rejected with a handshake failure, confirming "
+                                f"classical-only key exchange. Traffic recorded today is "
+                                f"exposed to 'harvest-now, decrypt-later' attacks once a "
+                                f"cryptographically relevant quantum computer exists. Adopt a "
+                                f"hybrid post-quantum key exchange (e.g. X25519MLKEM768)."
+                            ),
+                            "tags": ["ssl", "tls", "pqc", "post-quantum"],
+                        },
+                    })
+                    if agent:
+                        agent.append_output(
+                            f"[Nuclei Full] TLS: {host}:{port} no post-quantum key exchange"
+                        )
+            except Exception as e:
+                print(f"[Nuclei Full] TLS PQC check failed for {host}:{port}: {e}")
+
+        return findings
 
 
 def get_tool():

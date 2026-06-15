@@ -15,6 +15,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
+from tools._katana_common import add_katana_options, extend_katana_schema, get_auth_cookie, get_headers_file
 
 class KatanaShallowCrawlTool(ToolPlugin):
     @property
@@ -29,7 +30,7 @@ class KatanaShallowCrawlTool(ToolPlugin):
     def schema(self) -> Dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
+            "properties": extend_katana_schema({
                 "url": {
                     "type": "string",
                     "description": "Base URL to crawl (e.g., http://example.com)"
@@ -51,7 +52,7 @@ class KatanaShallowCrawlTool(ToolPlugin):
                     "type": "string",
                     "description": "Cookie header value for direct injection (alternative to headers_file)"
                 }
-            },
+            }),
             "required": []
         }
 
@@ -81,8 +82,8 @@ class KatanaShallowCrawlTool(ToolPlugin):
 
         # Default to depth 1 for shallow crawl, but allow override
         depth = parameters.get('depth', 1)
-        headers_file = parameters.get('headers_file')  # Optional auth headers file
-        cookie = parameters.get('cookie')  # Optional cookie string
+        headers_file = get_headers_file(parameters)  # Optional auth headers file
+        cookie = get_auth_cookie(parameters)  # Optional cookie string
         agent = parameters.get('_agent')  # Get agent reference for progress
 
         # Extract exclusion and rate limiting
@@ -118,16 +119,7 @@ class KatanaShallowCrawlTool(ToolPlugin):
             # -ct limits crawl duration to prevent excessive output (2 minutes max for shallow crawl)
             cmd = ['katana', '-u', target, '-d', str(depth), '-ct', '2m', '-jsonl', '-silent', '-nc']
 
-            # Add rate limiting
-            if rate_limit_config:
-                cmd.extend(['-rl', str(rate_limit_config['rateLimit'])])
-
-            # Add authentication if provided
-            import os
-            if headers_file and os.path.exists(headers_file):
-                cmd.extend(['-H', f'@{headers_file}'])
-            elif cookie:
-                cmd.extend(['-H', f'Cookie: {cookie}'])
+            cmd = add_katana_options(cmd, parameters, rate_limit_config)
 
             try:
                 process = await asyncio.create_subprocess_exec(

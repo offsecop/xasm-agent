@@ -5,6 +5,7 @@ by comparing colors, logos, fonts, text, layout, and favicon.
 """
 
 import json
+import io
 import math
 import re
 from collections import Counter
@@ -90,7 +91,20 @@ def _layout_score(brand_layout: Dict[str, bool], target_layout: Dict[str, Any]) 
             total += 1
             if brand_has == target_has:
                 matches += 1
-    return (matches / total) * 100 if total > 0 else 50.0
+    return (matches / total) * 100 if total > 0 else 0.0
+
+
+def _looks_like_parked_page(texts: List[str]) -> bool:
+    joined = ' '.join(texts).lower()
+    parked_markers = [
+        'domain may be for sale',
+        'buy this domain',
+        'related searches',
+        'privacy policy',
+        'parkingcrew',
+        'sedo',
+    ]
+    return any(marker in joined for marker in parked_markers)
 
 
 def _parse_color_hex(color_str: str) -> Optional[str]:
@@ -104,6 +118,17 @@ def _parse_color_hex(color_str: str) -> Optional[str]:
     if color_str.startswith('#'):
         return color_str.lower()
     return None
+
+
+def _hash_image_bytes(image_bytes: bytes) -> Optional[str]:
+    try:
+        import imagehash
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_bytes))
+        return str(imagehash.phash(img))
+    except Exception:
+        return None
 
 
 class BrandScoreFingerprintTool(ToolPlugin):
@@ -211,6 +236,7 @@ class BrandScoreFingerprintTool(ToolPlugin):
             from tools.brand_fingerprint_identity import extract_page_identity
             from playwright.async_api import async_playwright
 
+            target_page_hash = None
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
                 context = await browser.new_context(
@@ -219,6 +245,11 @@ class BrandScoreFingerprintTool(ToolPlugin):
                 )
                 page = await context.new_page()
                 target_identity = await extract_page_identity(page, target_url)
+                try:
+                    screenshot_bytes = await page.screenshot(full_page=True, type='png')
+                    target_page_hash = _hash_image_bytes(screenshot_bytes)
+                except Exception:
+                    target_page_hash = None
                 await page.close()
                 await browser.close()
 
@@ -271,8 +302,6 @@ class BrandScoreFingerprintTool(ToolPlugin):
                     if sim > best_sim:
                         best_sim = sim
             logo_score = best_sim
-        elif not brand_logos and not target_logos:
-            logo_score = 50.0  # Neutral if neither has logos
 
         # 3. Font score (weight 0.10)
         brand_fonts = set(f.lower() for f in fingerprint.get('fontFamilies', []))
@@ -295,8 +324,21 @@ class BrandScoreFingerprintTool(ToolPlugin):
         favicon_score = 0.0
         if brand_favicon and target_favicon:
             favicon_score = _hamming_distance_normalized(brand_favicon, target_favicon)
-        elif not brand_favicon and not target_favicon:
-            favicon_score = 50.0
+
+        # 7. Reference image score (manual uploaded screenshots/logos)
+        reference_image_hashes = fingerprint.get('referenceImageHashes')
+        if not reference_image_hashes and isinstance(fingerprint.get('fingerprintVector'), dict):
+            reference_image_hashes = fingerprint.get('fingerprintVector', {}).get('referenceImageHashes', [])
+
+        reference_image_score = 0.0
+        if target_page_hash and reference_image_hashes:
+            for ref in reference_image_hashes:
+                ref_hash = ref.get('hash') if isinstance(ref, dict) else None
+                if not ref_hash:
+                    continue
+                sim = _hamming_distance_normalized(ref_hash, target_page_hash)
+                if sim > reference_image_score:
+                    reference_image_score = sim
 
         # Composite score
         composite = (
@@ -307,6 +349,16 @@ class BrandScoreFingerprintTool(ToolPlugin):
             0.10 * layout_score_val +
             0.10 * favicon_score
         )
+        if reference_image_hashes:
+            composite = (composite * 0.8) + (reference_image_score * 0.2)
+
+        direct_identity_score = max(logo_score, text_score, favicon_score, reference_image_score)
+        if _looks_like_parked_page(target_texts) and direct_identity_score < 70:
+            composite = min(composite, 15.0)
+        elif direct_identity_score < 25:
+            composite = min(composite, 20.0)
+        elif direct_identity_score < 50:
+            composite = min(composite, 35.0)
 
         composite = round(composite, 1)
         color_score = round(color_score, 1)
@@ -315,6 +367,7 @@ class BrandScoreFingerprintTool(ToolPlugin):
         text_score = round(text_score, 1)
         layout_score_val = round(layout_score_val, 1)
         favicon_score = round(favicon_score, 1)
+        reference_image_score = round(reference_image_score, 1)
 
         if agent:
             agent.report_progress(
@@ -327,7 +380,8 @@ class BrandScoreFingerprintTool(ToolPlugin):
                 f"[BrandScore] Composite: {composite} | "
                 f"Color: {color_score} | Logo: {logo_score} | "
                 f"Font: {font_score} | Text: {text_score} | "
-                f"Layout: {layout_score_val} | Favicon: {favicon_score}"
+                f"Layout: {layout_score_val} | Favicon: {favicon_score} | "
+                f"Reference Image: {reference_image_score}"
             )
 
         return {
@@ -340,6 +394,7 @@ class BrandScoreFingerprintTool(ToolPlugin):
                 'textScore': text_score,
                 'layoutScore': layout_score_val,
                 'faviconScore': favicon_score,
+                'referenceImageScore': reference_image_score,
                 'brandMonitorId': brand_monitor_id,
                 'typosquatDomainId': typosquat_domain_id,
                 'targetUrl': target_url,

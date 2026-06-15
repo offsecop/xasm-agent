@@ -5,6 +5,7 @@ Polls a threat intelligence feed and returns indicators.
 
 import json
 import requests
+import asyncio
 from typing import Dict, Any
 from plugin_interface import ToolPlugin
 
@@ -119,3 +120,7 @@ class ThreatFeedPollTool(ToolPlugin):
             }
         except Exception as e:
             return {"success": False, "error": str(e), "output": {"indicators": [], "total_fetched": 0}}
+
+    async def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute feed polling without blocking the agent event loop."""
+        return await asyncio.to_thread(self.run, parameters)

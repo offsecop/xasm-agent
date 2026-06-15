@@ -10,6 +10,7 @@ import os
 import time
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
+from urllib.parse import urlparse
 
 
 SEVERITY_MAP = {
@@ -24,6 +25,8 @@ SEVERITY_MAP = {
 
 
 class TestsslScanTool(ToolPlugin):
+    NON_TLS_SCHEMES = {"http", "ws"}
+
     @property
     def name(self) -> str:
         return "testssl:scan"
@@ -88,8 +91,35 @@ class TestsslScanTool(ToolPlugin):
             print(f"[testssl] Limiting {len(targets_list)} targets to {max_targets}")
             targets_list = targets_list[:max_targets]
 
-        # Default to port 443 if no port specified
-        targets_list = [f"{t}:443" if ":" not in t.strip() else t.strip() for t in targets_list]
+        normalized_targets = []
+        skipped_targets = []
+        for raw_target in targets_list:
+            normalized_target, skip_reason = self._normalize_target(raw_target)
+            if normalized_target:
+                normalized_targets.append(normalized_target)
+            elif skip_reason:
+                skipped_targets.append({"target": raw_target, "reason": skip_reason})
+                print(f"[testssl] Skipping {raw_target}: {skip_reason}")
+                if agent:
+                    agent.append_output(f"[testssl] Skipping {raw_target}: {skip_reason}")
+
+        if not normalized_targets:
+            return {
+                "success": True,
+                "output": {
+                    "findings": [],
+                    "total_checks": 0,
+                    "issues_found": 0,
+                    "target": "",
+                    "tool": "testssl",
+                    "scan_type": "tls",
+                    "skipped_targets": skipped_targets,
+                    "note": "No TLS-compatible targets to scan",
+                },
+                "raw_output": "",
+            }
+
+        targets_list = normalized_targets
 
         total_targets = len(targets_list)
         print(f"[testssl] Starting TLS/SSL scan on {total_targets} target(s)")
@@ -253,7 +283,8 @@ class TestsslScanTool(ToolPlugin):
                     "issues_found": issues_found,
                     "target": targets_list[0] if len(targets_list) == 1 else f"{total_targets} targets",
                     "tool": "testssl",
-                    "scan_type": "tls"
+                    "scan_type": "tls",
+                    "skipped_targets": skipped_targets,
                 },
                 "raw_output": raw_output
             }
@@ -268,7 +299,8 @@ class TestsslScanTool(ToolPlugin):
                     "issues_found": 0,
                     "target": targets_list[0] if targets_list else "",
                     "tool": "testssl",
-                    "scan_type": "tls"
+                    "scan_type": "tls",
+                    "skipped_targets": skipped_targets,
                 },
                 "raw_output": ""
             }
@@ -283,11 +315,36 @@ class TestsslScanTool(ToolPlugin):
                     "issues_found": len(all_findings),
                     "target": targets_list[0] if targets_list else "",
                     "tool": "testssl",
-                    "scan_type": "tls"
+                    "scan_type": "tls",
+                    "skipped_targets": skipped_targets,
                 },
                 "raw_output": ""
             }
 
+
+    def _normalize_target(self, raw_target: Any) -> tuple[str | None, str | None]:
+        """Normalize URL-like targets into host:port and skip plain HTTP URLs."""
+        target = str(raw_target or "").strip()
+        if not target:
+            return None, "empty target"
+
+        if "://" in target:
+            parsed = urlparse(target)
+            hostname = parsed.hostname
+            if not hostname:
+                return None, "invalid URL target"
+
+            scheme = (parsed.scheme or "").lower()
+            if scheme in self.NON_TLS_SCHEMES:
+                return None, f"non-TLS URL scheme '{scheme}'"
+
+            port = parsed.port or 443
+            return f"{hostname}:{port}", None
+
+        if ":" not in target:
+            return f"{target}:443", None
+
+        return target, None
 
     def _resolve_targets(self, parameters: Dict[str, Any]) -> list:
         """Resolve target/targets parameter into a list."""

@@ -5,9 +5,9 @@ Enumerates web application URLs and endpoints (lighter crawl)
 
 import asyncio
 import json
-import os
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
+from tools._katana_common import add_katana_options, extend_katana_schema, get_auth_cookie, get_headers_file
 
 
 class KatanaEnumerateTool(ToolPlugin):
@@ -23,7 +23,7 @@ class KatanaEnumerateTool(ToolPlugin):
     def schema(self) -> Dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
+            "properties": extend_katana_schema({
                 "target": {
                     "type": "string",
                     "description": "Base URL to enumerate (e.g., http://example.com)"
@@ -51,7 +51,7 @@ class KatanaEnumerateTool(ToolPlugin):
                     "type": "string",
                     "description": "Cookie header value for direct injection (alternative to headers_file)"
                 }
-            },
+            }),
             "oneOf": [
                 {"required": ["target"]},
                 {"required": ["targets"]}
@@ -72,8 +72,8 @@ class KatanaEnumerateTool(ToolPlugin):
 
     async def execute(self, parameters: Dict[str, Any]) -> Any:
         depth = parameters.get('depth', 2)
-        headers_file = parameters.get('headers_file')
-        cookie = parameters.get('cookie')
+        headers_file = get_headers_file(parameters)
+        cookie = get_auth_cookie(parameters)
         agent = parameters.get('_agent')
 
         # Extract exclusion and rate limiting
@@ -122,17 +122,8 @@ class KatanaEnumerateTool(ToolPlugin):
         for idx, target in enumerate(targets_list):
             try:
                 # Build Katana command with optional authentication
-                cmd = ['katana', '-u', target, '-d', str(depth), '-jsonl', '-silent', '-no-scope']
-
-                # Add rate limiting
-                if rate_limit_config:
-                    cmd.extend(['-rl', str(rate_limit_config['rateLimit'])])
-
-                # Add authentication if provided
-                if headers_file and os.path.exists(headers_file):
-                    cmd.extend(['-H', f'@{headers_file}'])
-                elif cookie:
-                    cmd.extend(['-H', f'Cookie: {cookie}'])
+                cmd = ['katana', '-u', target, '-d', str(depth), '-jsonl', '-silent', '-nc', '-no-scope']
+                cmd = add_katana_options(cmd, parameters, rate_limit_config)
 
                 process = await asyncio.create_subprocess_exec(
                     *cmd,

@@ -1,0 +1,71 @@
+{
+  "sources": [
+    {
+      "id": "ahmia-public-index",
+      "name": "Ahmia Onion Index",
+      "baseUrl": "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion",
+      "searchPaths": [
+        "/search/?q={query}"
+      ],
+      "requiresAuth": false,
+      "severity": "MEDIUM",
+      "matchType": "BRAND_MENTION",
+      "requireOnionLinks": true,
+      "sourceKind": "SEARCH_ENGINE",
+      "enabled": false
+    },
+    {
+      "id": "duckduckgo-onion-search",
+      "name": "DuckDuckGo Onion Search",
+      "baseUrl": "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion",
+      "searchPaths": [
+        "/html/?q={query}"
+      ],
+      "requiresAuth": false,
+      "severity": "LOW",
+      "matchType": "BRAND_MENTION",
+      "requireOnionLinks": false,
+      "sourceKind": "GENERAL_SEARCH",
+      "enabled": false
+    },
+    {
+      "id": "credential-marketplace-template",
+      "name": "Credential Marketplace (Template)",
+      "baseUrl": "http://replace-with-marketplace.onion",
+      "searchPaths": [
+        "/search?query={query}",
+        "/latest"
+      ],
+      "requiresAuth": true,
+      "severity": "CRITICAL",
+      "matchType": "CREDENTIAL_LEAK",
+      "enabled": false
+    },
+    {
+      "id": "actor-forum-template",
+      "name": "Threat Actor Forum (Template)",
+      "baseUrl": "http://replace-with-forum.onion",
+      "searchPaths": [
+        "/search.php?keywords={query}",
+        "/latest.php"
+      ],
+      "requiresAuth": true,
+      "severity": "HIGH",
+      "matchType": "TARGETING_DISCUSSION",
+      "enabled": false
+    },
+    {
+      "id": "onion-index-template",
+      "name": "Onion Index / Paste Mirror (Template)",
+      "baseUrl": "http://replace-with-index.onion",
+      "searchPaths": [
+        "/search/{query}",
+        "/"
+      ],
+      "requiresAuth": false,
+      "severity": "MEDIUM",
+      "matchType": "BRAND_MENTION",
+      "enabled": false
+    }
+  ]
+}

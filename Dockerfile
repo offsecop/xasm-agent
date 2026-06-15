@@ -32,17 +32,21 @@ RUN wget https://github.com/projectdiscovery/nuclei/releases/download/v3.3.6/nuc
     && nuclei -update-templates || echo "Template update skipped"
 
 # Install katana web crawler (architecture-aware)
+# v1.6.x adds automatic form fill, stronger headless crawling, page load
+# strategy controls, XHR extraction fixes, and per-host crawl controls.
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then \
         KATANA_ARCH="arm64"; \
     else \
         KATANA_ARCH="amd64"; \
     fi && \
-    wget https://github.com/projectdiscovery/katana/releases/download/v1.1.0/katana_1.1.0_linux_${KATANA_ARCH}.zip \
-    && unzip katana_1.1.0_linux_${KATANA_ARCH}.zip \
+    KATANA_VERSION="1.6.1" && \
+    wget https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_${KATANA_ARCH}.zip \
+    && unzip katana_${KATANA_VERSION}_linux_${KATANA_ARCH}.zip \
     && mv katana /usr/local/bin/ \
-    && rm katana_1.1.0_linux_${KATANA_ARCH}.zip README.md LICENSE.md \
-    && chmod +x /usr/local/bin/katana
+    && rm katana_${KATANA_VERSION}_linux_${KATANA_ARCH}.zip README.md LICENSE.md \
+    && chmod +x /usr/local/bin/katana \
+    && katana -version
 
 # Install dirsearch web directory brute forcer
 RUN pip install dirsearch
@@ -93,7 +97,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 # Install default wordlist for ffuf web fuzzer
 RUN mkdir -p /usr/share/wordlists/dirb && \
-    wget -q https://raw.githubusercontent.com/v0re/dirb/master/wordlists/common.txt -O /usr/share/wordlists/dirb/common.txt
+    wget -q https://raw.githubusercontent.com/danielmiessler/SecLists/refs/heads/master/Discovery/Web-Content/common.txt -O /usr/share/wordlists/dirb/common.txt
 
 # Install CORScanner CORS misconfiguration scanner
 RUN git clone --depth 1 https://github.com/chenjj/CORScanner.git /opt/CORScanner && \
@@ -170,6 +174,10 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     ln -sf "$(which nodejs)" /usr/local/bin/node && \
     node --version && npm --version
+
+# Install Retire.js for client-side dependency SCA. The Python tool has a
+# lightweight fallback, but the CLI provides the maintained advisory database.
+RUN npm install -g retire@5.4.3 && retire --version
 
 # Install Origami Chrome extension + MCP server for headless browser DAST
 RUN git clone --depth 1 https://github.com/iamveene/origami.git /opt/origami && \

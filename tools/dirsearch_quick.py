@@ -19,7 +19,11 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
-from tools._dirsearch_base import filter_results
+from tools._dirsearch_base import (
+    describe_wordlist_selection,
+    filter_results,
+    resolve_dirsearch_wordlist,
+)
 
 # Quick scan extensions - common web files only
 QUICK_EXTENSIONS = "php,html,js"
@@ -52,6 +56,20 @@ class DirsearchQuickTool(ToolPlugin):
                     "type": "string",
                     "description": f"File extensions to search (default: {QUICK_EXTENSIONS})"
                 },
+                "extraWordlist": {
+                    "type": "string",
+                    "description": "Optional extra wordlist path to merge with the quick dirsearch list"
+                },
+                "extraWordlists": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional extra wordlist paths to merge with the quick dirsearch list"
+                },
+                "includeFuzzWordlist": {
+                    "type": "boolean",
+                    "description": "Automatically include /app/wordlists/fuzz.txt when available (default: true)",
+                    "default": True
+                },
                 "maxTargets": {
                     "type": "integer",
                     "description": "Maximum number of targets to scan from array (default: 10)",
@@ -64,6 +82,14 @@ class DirsearchQuickTool(ToolPlugin):
                 "cookie": {
                     "type": "string",
                     "description": "Cookie header value for direct injection"
+                },
+                "authCookies": {
+                    "type": "string",
+                    "description": "Session cookies injected by authentication steps"
+                },
+                "authHeadersFile": {
+                    "type": "string",
+                    "description": "Headers file injected by authentication steps"
                 }
             },
             "oneOf": [
@@ -117,8 +143,9 @@ class DirsearchQuickTool(ToolPlugin):
             targets_list = targets_list[:max_targets]
         
         extensions = parameters.get('extensions', QUICK_EXTENSIONS)
-        headers_file = parameters.get('headers_file')
-        cookie = parameters.get('cookie')
+        from tools._scope_utils import extract_auth_cookie, extract_auth_headers_file
+        headers_file = extract_auth_headers_file(parameters)
+        cookie = extract_auth_cookie(parameters)
         agent = parameters.get('_agent')
 
         # Apply exclusion filtering to targets
@@ -147,7 +174,17 @@ class DirsearchQuickTool(ToolPlugin):
                     items_processed=0,
                     total_items=len(targets_list)
                 )
-                agent.append_output(f"[Dirsearch Quick] Using built-in common wordlist")
+
+            wordlist_to_use, wordlist_info = resolve_dirsearch_wordlist(
+                default_wordlist=None,
+                parameters=parameters,
+                tool_label="Dirsearch Quick",
+                prefer_common_wordlist=True,
+            )
+            if agent:
+                agent.append_output(
+                    f"[Dirsearch Quick] Using {describe_wordlist_selection(wordlist_info)}"
+                )
 
             # Aggregate results from all targets
             all_endpoints = []
@@ -168,6 +205,7 @@ class DirsearchQuickTool(ToolPlugin):
                     extensions=extensions,
                     headers_file=headers_file,
                     cookie=cookie,
+                    wordlist=wordlist_to_use,
                     agent=agent,
                     execution_metrics=execution_metrics,
                     rate_limit_config=rate_limit_config
@@ -230,6 +268,7 @@ class DirsearchQuickTool(ToolPlugin):
         extensions: str,
         headers_file: str,
         cookie: str,
+        wordlist: str,
         agent,
         execution_metrics: dict,
         rate_limit_config: dict = None
@@ -255,6 +294,9 @@ class DirsearchQuickTool(ToolPlugin):
                 '-o', output_file,
                 '--quiet'
             ]
+
+            if wordlist and os.path.exists(wordlist):
+                cmd.extend(['-w', wordlist])
 
             # Add authentication
             if headers_file and os.path.exists(headers_file):

@@ -64,6 +64,11 @@ class NucleiInfoScanTool(ToolPlugin):
                     "type": "integer",
                     "description": "Maximum number of targets to scan from array (default: 100)",
                     "default": 100
+                },
+                "maxFindings": {
+                    "type": "integer",
+                    "description": "Maximum informational findings to return before stopping the scan. Omit for no explicit cap.",
+                    "minimum": 1
                 }
             },
             "oneOf": [
@@ -96,9 +101,18 @@ class NucleiInfoScanTool(ToolPlugin):
         auth_password = parameters.get("authPassword")
         auth_cookies = parameters.get("authCookies")
         auth_headers = parameters.get("authHeaders", [])
+        max_findings = parameters.get("maxFindings")
+        try:
+            max_findings = int(max_findings) if max_findings is not None else None
+            if max_findings is not None and max_findings <= 0:
+                max_findings = None
+        except (TypeError, ValueError):
+            max_findings = None
 
         # Log target info (without exposing secrets)
         print(f"[Nuclei Info] target: {target}, targets count: {len(targets) if isinstance(targets, list) else ('1' if targets else '0')}")
+        if max_findings:
+            print(f"[Nuclei Info] Max findings cap: {max_findings}")
 
         # Extract exclusion patterns and rate limiting
         from tools._scope_utils import extract_exclusion_patterns, extract_rate_limit
@@ -125,6 +139,8 @@ class NucleiInfoScanTool(ToolPlugin):
                 'stderr_size': 0,
                 'execution_duration': 0,
                 'findings_count': 0,
+                'findings_capped': False,
+                'max_findings': max_findings,
                 'memory_before': psutil.Process().memory_info().rss / 1024 / 1024 if PSUTIL_AVAILABLE else None,  # MB
                 'cpu_before': psutil.cpu_percent(interval=0.1) if PSUTIL_AVAILABLE else None,
             }
@@ -319,6 +335,7 @@ class NucleiInfoScanTool(ToolPlugin):
             stderr_buffer = []
             last_progress_update = 0
             progress_update_interval = 30  # Update progress every 30 seconds
+            findings_capped = False
 
             def _get_target_key(url: str) -> str:
                 try:
@@ -332,7 +349,7 @@ class NucleiInfoScanTool(ToolPlugin):
             # Add timeout: info scans should complete in 60 minutes max
             try:
                 async def read_output():
-                    nonlocal line_buffer, last_progress_update, stderr_buffer
+                    nonlocal line_buffer, last_progress_update, stderr_buffer, findings_capped
                     import time
                     start_time = time.time()
                     
@@ -396,9 +413,22 @@ class NucleiInfoScanTool(ToolPlugin):
                                             finding_name = finding.get('info', {}).get('name', 'Unknown')
                                             finding_url = finding.get('matched-at', 'N/A')
                                             agent.append_output(f"[Nuclei Info] Found: {finding_name} at {finding_url}")
+
+                                        if max_findings and len(findings) >= max_findings:
+                                            findings_capped = True
+                                            execution_metrics['findings_capped'] = True
+                                            print(f"[Nuclei Info] Reached maxFindings cap ({max_findings}); stopping scan")
+                                            if agent:
+                                                agent.append_output(f"[Nuclei Info] Reached maxFindings cap ({max_findings}); stopping scan")
+                                            if process.returncode is None:
+                                                process.terminate()
+                                            break
                                     except json.JSONDecodeError:
                                         # Not a JSON finding, might be progress output
                                         pass
+
+                            if findings_capped:
+                                break
                             
                             # Periodic progress update even if no findings yet
                             current_time = time.time()
@@ -424,7 +454,13 @@ class NucleiInfoScanTool(ToolPlugin):
                         
                         # Wait for stderr to finish
                         await stderr_task
-                        return_code = await process.wait()
+                        if findings_capped and process.returncode is None:
+                            try:
+                                await asyncio.wait_for(process.wait(), timeout=5)
+                            except asyncio.TimeoutError:
+                                process.kill()
+                                await process.wait()
+                        return_code = process.returncode if process.returncode is not None else await process.wait()
                         execution_metrics['return_code'] = return_code
                         
                         # Check for errors in stderr
@@ -501,6 +537,8 @@ class NucleiInfoScanTool(ToolPlugin):
             print(f"[Nuclei Info] Findings count: {len(findings)}")
             print(f"[Nuclei Info] Stderr size: {execution_metrics['stderr_size']} bytes")
             print(f"[Nuclei Info] Found {len(findings)} INFORMATIONAL findings")
+            if findings_capped:
+                print(f"[Nuclei Info] Findings were capped at maxFindings={max_findings}")
 
             # Report final results
             if agent:
@@ -569,6 +607,8 @@ class NucleiInfoScanTool(ToolPlugin):
                     "tool": "nuclei",
                     "scan_type": "info",
                     "output_file": output_file,
+                    "findings_capped": findings_capped,
+                    "max_findings": max_findings,
                 },
                 "raw_output": raw_output_limited,
                 "execution_metrics": execution_metrics
@@ -607,4 +647,3 @@ class NucleiInfoScanTool(ToolPlugin):
 
 def get_tool():
     return NucleiInfoScanTool()
-

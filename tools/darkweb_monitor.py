@@ -8,14 +8,38 @@ import asyncio
 import aiohttp
 import json
 import os
+import re
+import shlex
 import time
 import hashlib
+import urllib.parse
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from html import unescape
 from plugin_interface import ToolPlugin
+
+try:
+    from playwright.async_api import async_playwright
+except Exception:
+    async_playwright = None
 
 
 class DarkWebMonitorTool(ToolPlugin):
+    def _get_env_int(self, name: str, default: int, minimum: int = 1, maximum: Optional[int] = None) -> int:
+        raw_value = os.environ.get(name, '').strip()
+        if not raw_value:
+            return default
+
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            return default
+
+        parsed = max(minimum, parsed)
+        if maximum is not None:
+            parsed = min(parsed, maximum)
+        return parsed
+
     @property
     def name(self) -> str:
         return "darkweb:monitor"
@@ -38,6 +62,28 @@ class DarkWebMonitorTool(ToolPlugin):
                     "items": {"type": "string"},
                     "description": "Additional keywords to search for"
                 },
+                "patterns": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "name": {"type": "string"},
+                                    "pattern": {"type": "string"},
+                                    "isRegex": {"type": "boolean"},
+                                    "sources": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                    "description": "Structured data leak patterns associated with the brand monitor"
+                },
                 "brandMonitorId": {
                     "type": "string",
                     "description": "Brand monitor ID for result correlation"
@@ -45,7 +91,7 @@ class DarkWebMonitorTool(ToolPlugin):
                 "sources": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Sources to query (default: all). Options: urlhaus, otx, github, leakcheck, threatfox, hibp, intelx, simulation"
+                    "description": "Sources to query (default: all). Options: urlhaus, otx, github, gitlab, bitbucket, npm, stackoverflow, pastebin, searxng, leakcheck, threatfox, hibp, intelx, onion_forums, simulation"
                 },
                 "maxResults": {
                     "type": "integer",
@@ -67,16 +113,591 @@ class DarkWebMonitorTool(ToolPlugin):
             "chainable_before": [],
         }
 
+    def _normalize_patterns(self, keywords: List[str], patterns: Any) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add_pattern(entry: Dict[str, Any]) -> None:
+            pattern = str(entry.get('pattern') or '').strip()
+            if not pattern:
+                return
+
+            normalized_entry = {
+                'id': entry.get('id'),
+                'name': str(entry.get('name') or pattern).strip(),
+                'pattern': pattern,
+                'isRegex': bool(entry.get('isRegex', False)),
+                'sources': [str(source).upper() for source in (entry.get('sources') or []) if str(source).strip()],
+            }
+
+            key = (
+                normalized_entry['pattern'].lower(),
+                normalized_entry['isRegex'],
+                tuple(sorted(normalized_entry['sources'])),
+            )
+            if key in seen:
+                return
+
+            seen.add(key)
+            normalized.append(normalized_entry)
+
+        for keyword in keywords or []:
+            if isinstance(keyword, str) and keyword.strip():
+                add_pattern({
+                    'name': keyword.strip(),
+                    'pattern': keyword.strip(),
+                    'isRegex': False,
+                    'sources': [],
+                })
+
+        for raw in patterns or []:
+            if isinstance(raw, str):
+                add_pattern({
+                    'name': raw.strip(),
+                    'pattern': raw.strip(),
+                    'isRegex': False,
+                    'sources': [],
+                })
+            elif isinstance(raw, dict):
+                add_pattern(raw)
+
+        return normalized
+
+    def _get_darkweb_settings(self, agent=None) -> Dict[str, Any]:
+        config = {}
+        if agent and isinstance(getattr(agent, 'config', None), dict):
+            config = agent.config.get('darkweb', {}) or {}
+
+        def get_str(name: str, config_key: str, default: str = '') -> str:
+            value = os.environ.get(name)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+            cfg_value = config.get(config_key)
+            return str(cfg_value).strip() if cfg_value is not None and str(cfg_value).strip() else default
+
+        def get_bool(name: str, config_key: str, default: bool = False) -> bool:
+            value = os.environ.get(name)
+            if value is not None and str(value).strip():
+                return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+            cfg_value = config.get(config_key)
+            if isinstance(cfg_value, bool):
+                return cfg_value
+            if cfg_value is not None and str(cfg_value).strip():
+                return str(cfg_value).strip().lower() in ('1', 'true', 'yes', 'on')
+            return default
+
+        def get_int(name: str, config_key: str, default: int, minimum: int = 1, maximum: Optional[int] = None) -> int:
+            env_value = os.environ.get(name)
+            if env_value is not None and str(env_value).strip():
+                try:
+                    parsed = int(env_value)
+                except ValueError:
+                    parsed = default
+            else:
+                cfg_value = config.get(config_key)
+                try:
+                    parsed = int(cfg_value) if cfg_value is not None else default
+                except (ValueError, TypeError):
+                    parsed = default
+
+            parsed = max(minimum, parsed)
+            if maximum is not None:
+                parsed = min(parsed, maximum)
+            return parsed
+
+        return {
+            'tor_proxy_url': get_str('DARKWEB_TOR_PROXY_URL', 'tor_proxy_url'),
+            'enable_onion_sources': get_bool('DARKWEB_ENABLE_ONION_SOURCES', 'enable_onion_sources', False),
+            'onion_sources_file': get_str('DARKWEB_ONION_SOURCES_FILE', 'onion_sources_file'),
+            'onion_sources_json': get_str('DARKWEB_ONION_SOURCES_JSON', 'onion_sources_json'),
+            'onion_use_browser': get_bool('DARKWEB_ONION_USE_BROWSER', 'onion_use_browser', False),
+            'onion_fetch_timeout_seconds': get_int('DARKWEB_ONION_FETCH_TIMEOUT_SECONDS', 'onion_fetch_timeout_seconds', 45, minimum=5, maximum=180),
+            'onion_max_sources': get_int('DARKWEB_ONION_MAX_SOURCES', 'onion_max_sources', 8, minimum=1, maximum=30),
+            'onion_max_pages_per_source': get_int('DARKWEB_ONION_MAX_PAGES_PER_SOURCE', 'onion_max_pages_per_source', 3, minimum=1, maximum=10),
+            'onion_terms_per_source': get_int('DARKWEB_ONION_TERMS_PER_SOURCE', 'onion_terms_per_source', 2, minimum=1, maximum=6),
+        }
+
+    def _resolve_data_path(self, value: str) -> Optional[Path]:
+        if not value:
+            return None
+
+        expanded = Path(os.path.expanduser(value))
+        if expanded.is_absolute():
+            return expanded
+
+        candidates = [
+            Path.cwd() / expanded,
+            Path(__file__).resolve().parent / expanded,
+            Path(__file__).resolve().parent.parent / expanded,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
+    def _load_onion_sources(self, settings: Dict[str, Any], agent=None) -> List[Dict[str, Any]]:
+        raw_sources = settings.get('onion_sources_json', '').strip()
+        payload: Any = None
+
+        if raw_sources:
+            try:
+                payload = json.loads(raw_sources)
+            except json.JSONDecodeError as error:
+                if agent:
+                    agent.report_progress(f"Invalid DARKWEB_ONION_SOURCES_JSON: {error}")
+                return []
+        else:
+            source_file = self._resolve_data_path(settings.get('onion_sources_file', ''))
+            if not source_file or not source_file.exists():
+                if agent:
+                    agent.report_progress("No onion source catalog configured, skipping onion forum crawl")
+                return []
+            try:
+                with source_file.open('r') as handle:
+                    payload = json.load(handle)
+            except Exception as error:
+                if agent:
+                    agent.report_progress(f"Failed to load onion source catalog: {error}")
+                return []
+
+        if isinstance(payload, dict):
+            payload = payload.get('sources', [])
+
+        if not isinstance(payload, list):
+            return []
+
+        sources: List[Dict[str, Any]] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('enabled', True) is False:
+                continue
+            base_url = str(entry.get('baseUrl') or '').strip()
+            if not base_url:
+                continue
+            sources.append(entry)
+
+        return sources[: settings.get('onion_max_sources', 8)]
+
+    def _pattern_applies_to_source(self, pattern: Dict[str, Any], source: str) -> bool:
+        sources = {
+            str(item).upper()
+            for item in (pattern.get('sources') or [])
+            if str(item).strip()
+        }
+        if not sources:
+            return True
+
+        source_upper = str(source or '').upper()
+        alias_map = {
+            'ONION_FORUM': {'ONION_FORUM', 'PASTE_SITE', 'THREAT_INTEL_FEED'},
+            'PASTE_SITE': {'PASTE_SITE', 'ONION_FORUM'},
+            'CREDENTIAL_DUMP': {'CREDENTIAL_DUMP', 'ONION_FORUM'},
+            'THREAT_INTEL_FEED': {'THREAT_INTEL_FEED', 'ONION_FORUM'},
+        }
+        accepted_sources = alias_map.get(source_upper, {source_upper})
+        return bool(sources.intersection(accepted_sources))
+
+    def _extract_search_terms(self, domain: str, patterns: List[Dict[str, Any]]) -> List[str]:
+        terms: List[str] = []
+        seen = set()
+
+        def add_term(value: str) -> None:
+            normalized = str(value or '').strip()
+            if not normalized:
+                return
+            lowered = normalized.lower()
+            if lowered in seen:
+                return
+            seen.add(lowered)
+            terms.append(normalized)
+
+        for pattern in patterns:
+            if pattern.get('isRegex'):
+                continue
+            add_term(pattern.get('pattern', ''))
+            add_term(pattern.get('name', ''))
+            if len(terms) >= 10:
+                break
+
+        add_term(domain.split('.')[0])
+        add_term(domain)
+
+        return terms[:10]
+
+    def _normalize_text(self, content: str) -> str:
+        text = re.sub(r'<script\b[^>]*>.*?</script>', ' ', content or '', flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r'<style\b[^>]*>.*?</style>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = unescape(text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    def _build_onion_urls(self, source: Dict[str, Any], search_terms: List[str], settings: Dict[str, Any]) -> List[str]:
+        base_url = str(source.get('baseUrl') or '').rstrip('/')
+        urls: List[str] = []
+
+        for static_path in source.get('paths') or []:
+            url = urllib.parse.urljoin(base_url + '/', str(static_path).lstrip('/'))
+            if url not in urls:
+                urls.append(url)
+
+        search_paths = source.get('searchPaths') or []
+        for term in search_terms[: settings.get('onion_terms_per_source', 2)]:
+            encoded_term = urllib.parse.quote_plus(term)
+            for search_path in search_paths:
+                rendered_path = str(search_path).replace('{query}', encoded_term).replace('{raw_query}', term)
+                url = urllib.parse.urljoin(base_url + '/', rendered_path.lstrip('/'))
+                if url not in urls:
+                    urls.append(url)
+
+        if not urls:
+            urls.append(base_url)
+
+        return urls[: settings.get('onion_max_pages_per_source', 3)]
+
+    async def _fetch_via_tor_http(self, url: str, settings: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        proxy_url = settings.get('tor_proxy_url', '').strip()
+        if not proxy_url:
+            return None
+
+        timeout = settings.get('onion_fetch_timeout_seconds', 45)
+        parsed = urllib.parse.urlparse(proxy_url)
+        proxy_host = parsed.hostname or proxy_url
+        proxy_port = parsed.port or 9050
+
+        command = [
+            'curl',
+            '--silent',
+            '--show-error',
+            '--location',
+            '--max-time',
+            str(timeout),
+            '--connect-timeout',
+            '20',
+            '--socks5-hostname',
+            f'{proxy_host}:{proxy_port}',
+            '--user-agent',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            url,
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(stderr.decode().strip() or f'curl exited with {process.returncode}')
+
+        content = stdout.decode(errors='replace')
+        title_match = re.search(r'<title[^>]*>(.*?)</title>', content, re.IGNORECASE | re.DOTALL)
+        title = self._normalize_text(title_match.group(1)) if title_match else url
+        return {
+            'title': title,
+            'content': content,
+            'fetchMethod': 'curl+socks5',
+        }
+
+    async def _fetch_via_tor_browser(self, url: str, settings: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        proxy_url = settings.get('tor_proxy_url', '').strip()
+        if not proxy_url or async_playwright is None:
+            return None
+
+        timeout_ms = settings.get('onion_fetch_timeout_seconds', 45) * 1000
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=True,
+                proxy={'server': proxy_url},
+                args=['--disable-dev-shm-usage'],
+            )
+            try:
+                page = await browser.new_page()
+                await page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
+                await page.wait_for_timeout(1500)
+                title = await page.title()
+                content = await page.content()
+                return {
+                    'title': title or url,
+                    'content': content,
+                    'fetchMethod': 'playwright+tor',
+                }
+            finally:
+                await browser.close()
+
+    def _snippet_around_match(self, text: str, matched_terms: List[str], fallback_length: int = 500) -> str:
+        haystack = text or ''
+        lowered = haystack.lower()
+        for term in matched_terms:
+            if not term:
+                continue
+            idx = lowered.find(term.lower())
+            if idx >= 0:
+                start = max(0, idx - 180)
+                end = min(len(haystack), idx + 320)
+                return haystack[start:end].strip()
+        return haystack[:fallback_length].strip()
+
+    def _extract_onion_links(self, content: str) -> List[str]:
+        if not content:
+            return []
+
+        matches = re.findall(
+            r'https?://[a-z2-7]{16,56}\.onion[^\s"\'<>)]*',
+            content,
+            flags=re.IGNORECASE,
+        )
+        links: List[str] = []
+        seen = set()
+        for raw in matches:
+            normalized = raw.strip()
+            if normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            links.append(normalized)
+        return links
+
+    def _filter_external_onion_links(self, links: List[str], source_url: str) -> List[str]:
+        source_host = urllib.parse.urlparse(source_url).hostname or ''
+        external_links: List[str] = []
+        seen = set()
+
+        for link in links:
+            host = urllib.parse.urlparse(link).hostname or ''
+            normalized = link.strip()
+            if not host or host == source_host:
+                continue
+            lowered = normalized.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            external_links.append(normalized)
+
+        return external_links
+
+    async def _query_onion_forums(self, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        settings = self._get_darkweb_settings(agent)
+        if not settings.get('enable_onion_sources'):
+            return []
+
+        if not settings.get('tor_proxy_url'):
+            if agent:
+                agent.report_progress("Onion forum crawling enabled but no Tor proxy is configured")
+            return []
+
+        sources = self._load_onion_sources(settings, agent)
+        if not sources:
+            return []
+
+        if agent:
+            agent.report_progress(f"Querying {len(sources)} onion forum source(s) over Tor for {domain}")
+
+        search_terms = self._extract_search_terms(domain, patterns)
+        results: List[Dict[str, Any]] = []
+
+        for source in sources:
+            source_name = str(source.get('name') or source.get('id') or 'Unknown Onion Source').strip()
+            urls = self._build_onion_urls(source, search_terms, settings)
+
+            for url in urls:
+                try:
+                    if settings.get('onion_use_browser'):
+                        fetched = await self._fetch_via_tor_browser(url, settings)
+                    else:
+                        fetched = await self._fetch_via_tor_http(url, settings)
+
+                    if not fetched:
+                        continue
+
+                    normalized_text = self._normalize_text(fetched.get('content', ''))
+                    onion_links = self._extract_onion_links(fetched.get('content', ''))
+                    external_onion_links = self._filter_external_onion_links(onion_links, source.get('baseUrl', ''))
+                    if source.get('requireOnionLinks') and not external_onion_links:
+                        continue
+
+                    matched_keywords = self._text_matches_search_terms(
+                        f"{fetched.get('title', '')} {normalized_text}",
+                        patterns,
+                        'ONION_FORUM',
+                    )
+
+                    if not matched_keywords:
+                        matched_keywords = [
+                            term for term in search_terms
+                            if term.lower() in f"{fetched.get('title', '')} {normalized_text}".lower()
+                        ][:5]
+
+                    if not matched_keywords:
+                        continue
+
+                    severity = str(source.get('severity') or 'HIGH').upper()
+                    match_type = str(source.get('matchType') or 'TARGETING_DISCUSSION').upper()
+                    result_id = hashlib.sha256(f"{source_name}{url}{domain}".encode()).hexdigest()[:12]
+                    snippet = self._snippet_around_match(normalized_text, matched_keywords)
+
+                    stored_source = 'CREDENTIAL_DUMP' if match_type == 'CREDENTIAL_LEAK' else 'PASTE_SITE'
+
+                    results.append({
+                        'source': stored_source,
+                        'sourceName': source_name,
+                        'sourceUrl': url,
+                        'sourceId': f"onion-{result_id}",
+                        'title': fetched.get('title', source_name),
+                        'contentSnippet': snippet or f"Matched {domain} on Tor-accessible source {source_name}",
+                        'matchType': match_type,
+                        'matchedKeywords': matched_keywords,
+                        'severity': severity,
+                        'relevanceScore': float(source.get('relevanceScore', 88)),
+                        'riskScore': float(source.get('riskScore', 82)),
+                        'discoveredAt': None,
+                        'metadata': {
+                            'network': 'tor',
+                            'isOnionSource': True,
+                            'sourceCategory': 'ONION_FORUM',
+                            'forumId': source.get('id'),
+                            'requiresAuth': bool(source.get('requiresAuth', False)),
+                            'fetchMethod': fetched.get('fetchMethod'),
+                            'linkedOnionUrls': external_onion_links[:10],
+                            'sourceKind': source.get('sourceKind'),
+                        },
+                    })
+                except Exception as error:
+                    if agent:
+                        agent.report_progress(f"Onion source {source_name} failed: {error}")
+                await asyncio.sleep(0.5)
+
+        return results
+
+    def _text_matches_search_terms(
+        self,
+        text: str,
+        patterns: List[Dict[str, Any]],
+        source_type: str,
+    ) -> List[str]:
+        haystack = (text or '').lower()
+        matched: List[str] = []
+
+        for pattern in patterns:
+            if not self._pattern_applies_to_source(pattern, source_type):
+                continue
+
+            try:
+                is_match = bool(
+                    re.search(pattern['pattern'], haystack, re.IGNORECASE)
+                    if pattern.get('isRegex')
+                    else pattern['pattern'].lower() in haystack
+                )
+            except re.error:
+                is_match = False
+
+            if is_match:
+                name = str(pattern.get('name') or pattern.get('pattern') or '').strip()
+                if name and name not in matched:
+                    matched.append(name)
+
+        return matched
+
+    def _annotate_results_with_patterns(
+        self,
+        results: List[Dict[str, Any]],
+        patterns: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not patterns:
+            return results
+
+        annotated = []
+        for result in results:
+            haystack_parts = [
+                str(result.get('title', '')),
+                str(result.get('contentSnippet', '')),
+                str(result.get('sourceUrl', '')),
+                str(result.get('sourceName', '')),
+            ]
+            metadata = result.get('metadata') or {}
+            if metadata:
+                try:
+                    haystack_parts.append(json.dumps(metadata, default=str))
+                except Exception:
+                    haystack_parts.append(str(metadata))
+
+            haystack = ' '.join(part for part in haystack_parts if part).lower()
+            source = str(result.get('source', '')).upper()
+            matched_patterns: List[Dict[str, Any]] = []
+
+            for pattern in patterns:
+                if not self._pattern_applies_to_source(pattern, source):
+                    continue
+
+                pattern_value = pattern['pattern']
+                try:
+                    is_match = bool(
+                        re.search(pattern_value, haystack, re.IGNORECASE)
+                        if pattern.get('isRegex')
+                        else pattern_value.lower() in haystack
+                    )
+                except re.error:
+                    is_match = False
+
+                if is_match:
+                    matched_patterns.append(pattern)
+
+            existing_keywords = [
+                str(keyword) for keyword in (result.get('matchedKeywords') or []) if str(keyword).strip()
+            ]
+            merged_keywords = existing_keywords + [
+                pattern['name']
+                for pattern in matched_patterns
+                if pattern['name'] not in existing_keywords
+            ]
+            result['matchedKeywords'] = merged_keywords
+
+            if matched_patterns:
+                metadata = dict(result.get('metadata') or {})
+                metadata['matchedPatternIds'] = [
+                    pattern['id'] for pattern in matched_patterns if pattern.get('id')
+                ]
+                metadata['matchedPatternNames'] = [
+                    pattern['name'] for pattern in matched_patterns
+                ]
+                result['metadata'] = metadata
+                result['relevanceScore'] = min(100, int(result.get('relevanceScore', 0)) + 10)
+
+            annotated.append(result)
+
+        return annotated
+
     async def execute(self, parameters: Dict[str, Any]) -> Any:
         agent = parameters.get('_agent')
         domain = parameters.get('domain', '')
         keywords = parameters.get('keywords', [])
+        patterns = parameters.get('patterns', [])
         brand_monitor_id = parameters.get('brandMonitorId', '')
-        sources = parameters.get('sources', ['urlhaus', 'otx', 'github', 'leakcheck', 'threatfox', 'hibp', 'intelx'])
+        settings = self._get_darkweb_settings(agent)
+        sources = parameters.get('sources', [
+            'urlhaus',
+            'otx',
+            'github',
+            'searxng',
+            'gitlab',
+            'bitbucket',
+            'npm',
+            'stackoverflow',
+            'pastebin',
+            'leakcheck',
+            'threatfox',
+            'hibp',
+            'intelx',
+        ])
+
+        if settings.get('enable_onion_sources') and 'onion_forums' not in sources:
+            sources.append('onion_forums')
         max_results = parameters.get('maxResults', 100)
 
         if isinstance(keywords, str):
             keywords = json.loads(keywords) if keywords.startswith('[') else [keywords]
+
+        normalized_patterns = self._normalize_patterns(keywords, patterns)
 
         start_time = time.time()
         all_results = []
@@ -101,13 +722,27 @@ class DarkWebMonitorTool(ToolPlugin):
             if 'otx' in sources:
                 tasks.append(self._query_otx(session, domain, agent))
             if 'github' in sources:
-                tasks.append(self._query_github(session, domain, keywords, agent))
+                tasks.append(self._query_github(session, domain, normalized_patterns, agent))
+            if 'gitlab' in sources:
+                tasks.append(self._query_gitlab(session, domain, normalized_patterns, agent))
+            if 'bitbucket' in sources:
+                tasks.append(self._query_bitbucket(session, domain, normalized_patterns, agent))
+            if 'npm' in sources:
+                tasks.append(self._query_npm(session, domain, normalized_patterns, agent))
+            if 'stackoverflow' in sources:
+                tasks.append(self._query_stackoverflow(session, domain, normalized_patterns, agent))
+            if 'pastebin' in sources:
+                tasks.append(self._query_pastebin(session, domain, normalized_patterns, agent))
+            if 'searxng' in sources:
+                tasks.append(self._query_searxng(session, domain, normalized_patterns, agent))
             if 'threatfox' in sources:
                 tasks.append(self._query_threatfox(session, domain, agent))
             if 'hibp' in sources:
                 tasks.append(self._query_hibp_breaches(session, domain, agent))
             if 'intelx' in sources:
                 tasks.append(self._query_intelx(session, domain, agent))
+            if 'onion_forums' in sources:
+                tasks.append(self._query_onion_forums(domain, normalized_patterns, agent))
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -162,6 +797,7 @@ class DarkWebMonitorTool(ToolPlugin):
 
         # Limit results
         unique_results = unique_results[:max_results]
+        unique_results = self._annotate_results_with_patterns(unique_results, normalized_patterns)
 
         # Build severity/matchType breakdowns
         severity_breakdown = {}
@@ -178,6 +814,7 @@ class DarkWebMonitorTool(ToolPlugin):
             'brandMonitorId': brand_monitor_id,
             'domain': domain,
             'keywords': keywords,
+            'patterns': normalized_patterns,
             'results': unique_results,
             'summary': {
                 'totalMentions': len(unique_results),
@@ -309,31 +946,78 @@ class DarkWebMonitorTool(ToolPlugin):
                 agent.report_progress(f"OTX query failed: {str(e)}")
         return results
 
-    async def _query_github(self, session: aiohttp.ClientSession, domain: str, keywords: List[str], agent=None) -> List[Dict]:
-        """Search GitHub for exposed secrets and code mentioning the domain"""
+    async def _query_github(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        """Search GitHub repositories and code for brand mentions and exposed secrets."""
         results = []
         try:
             if agent:
                 agent.report_progress(f"Searching GitHub for {domain}")
 
             github_token = os.environ.get('GITHUB_TOKEN', '')
-            if not github_token:
-                if agent:
-                    agent.report_progress("No GITHUB_TOKEN set, skipping GitHub search")
-                return results
 
             headers = {
-                'Authorization': f'token {github_token}',
                 'Accept': 'application/vnd.github.v3+json',
             }
+            if github_token:
+                headers['Authorization'] = f'token {github_token}'
 
-            # Search for domain in code (potential secrets/configs)
-            search_queries = [
-                f'"{domain}" password OR secret OR api_key OR token',
-                f'"{domain}" smtp OR database OR connection_string',
-            ]
+            search_terms = self._extract_search_terms(domain, patterns)
 
-            for query in search_queries:
+            for search_term in search_terms[:4]:
+                repo_query = f'{search_term} in:name,description,readme'
+                repo_url = f'https://api.github.com/search/repositories?q={repo_query}&sort=updated&order=desc&per_page=8'
+                async with session.get(repo_url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        items = data.get('items', [])
+                        for item in items[:5]:
+                            repo = item or {}
+                            description = repo.get('description') or ''
+                            matched_keywords = self._text_matches_search_terms(
+                                f"{repo.get('full_name', '')} {description}",
+                                patterns,
+                                'CODE_REPOSITORY',
+                            ) or [search_term]
+                            results.append({
+                                'source': 'CODE_REPOSITORY',
+                                'sourceName': 'GitHub',
+                                'sourceUrl': repo.get('html_url', ''),
+                                'sourceId': f"github-repo-{repo.get('id', '')}",
+                                'title': repo.get('full_name', f'GitHub repository matching {search_term}'),
+                                'contentSnippet': description or f"Public GitHub repository matching '{search_term}'",
+                                'matchType': 'BRAND_MENTION',
+                                'matchedKeywords': matched_keywords,
+                                'severity': 'LOW',
+                                'relevanceScore': 72,
+                                'riskScore': 48,
+                                'discoveredAt': repo.get('updated_at') or repo.get('created_at'),
+                                'metadata': {
+                                    'repository': repo.get('full_name'),
+                                    'stars': repo.get('stargazers_count', 0),
+                                    'language': repo.get('language'),
+                                    'searchTerm': search_term,
+                                }
+                            })
+                    elif resp.status == 403 and agent:
+                        agent.report_progress("GitHub repository search rate limited")
+                        break
+
+                await asyncio.sleep(1)
+
+            if not github_token:
+                if agent:
+                    agent.report_progress("No GITHUB_TOKEN set, skipping GitHub code search")
+                return results
+
+            search_queries = []
+            for term in search_terms[:4]:
+                quoted = f'"{term}"'
+                search_queries.extend([
+                    (term, f'{quoted} password OR secret OR api_key OR token'),
+                    (term, f'{quoted} leak OR credential OR dump'),
+                ])
+
+            for search_term, query in search_queries:
                 url = f'https://api.github.com/search/code?q={query}&per_page=10'
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
@@ -347,9 +1031,9 @@ class DarkWebMonitorTool(ToolPlugin):
                                 'sourceUrl': item.get('html_url', ''),
                                 'sourceId': f"github-{item.get('sha', '')[:12]}",
                                 'title': f"Potential exposed secret in {repo.get('full_name', 'unknown')}",
-                                'contentSnippet': f"Code containing references to {domain} found in {item.get('path', 'unknown file')} in repository {repo.get('full_name', 'unknown')}. This may contain exposed credentials or API keys.",
+                                'contentSnippet': f"Code search term '{search_term}' matched in {item.get('path', 'unknown file')} in repository {repo.get('full_name', 'unknown')}. This may contain exposed credentials, leak references, or API keys associated with {domain}.",
                                 'matchType': 'EXPOSED_SECRET',
-                                'matchedKeywords': [domain],
+                                'matchedKeywords': [domain, search_term] if search_term != domain else [domain],
                                 'severity': 'HIGH',
                                 'relevanceScore': 75,
                                 'riskScore': 70,
@@ -358,6 +1042,7 @@ class DarkWebMonitorTool(ToolPlugin):
                                     'repository': repo.get('full_name'),
                                     'path': item.get('path'),
                                     'sha': item.get('sha'),
+                                    'searchTerm': search_term,
                                 }
                             })
                     elif resp.status == 403:
@@ -372,6 +1057,361 @@ class DarkWebMonitorTool(ToolPlugin):
                 agent.report_progress(f"GitHub search failed: {str(e)}")
         return results
 
+    async def _query_gitlab(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        results = []
+        try:
+            if agent:
+                agent.report_progress(f"Searching GitLab for {domain}")
+
+            for search_term in self._extract_search_terms(domain, patterns)[:4]:
+                async with session.get(
+                    'https://gitlab.com/api/v4/projects',
+                    params={
+                        'search': search_term,
+                        'simple': 'true',
+                        'order_by': 'last_activity_at',
+                        'sort': 'desc',
+                        'per_page': 8,
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    projects = await resp.json()
+                    for project in projects[:5]:
+                        description = project.get('description') or ''
+                        results.append({
+                            'source': 'CODE_REPOSITORY',
+                            'sourceName': 'GitLab',
+                            'sourceUrl': project.get('web_url', ''),
+                            'sourceId': f"gitlab-{project.get('id', '')}",
+                            'title': project.get('path_with_namespace') or project.get('name', f'GitLab project matching {search_term}'),
+                            'contentSnippet': description or f"Public GitLab project matching '{search_term}'",
+                            'matchType': 'BRAND_MENTION',
+                            'matchedKeywords': self._text_matches_search_terms(
+                                f"{project.get('path_with_namespace', '')} {description}",
+                                patterns,
+                                'CODE_REPOSITORY',
+                            ) or [search_term],
+                            'severity': 'LOW',
+                            'relevanceScore': 68,
+                            'riskScore': 45,
+                            'discoveredAt': project.get('last_activity_at') or project.get('created_at'),
+                            'metadata': {
+                                'namespace': project.get('namespace', {}).get('full_path'),
+                                'visibility': project.get('visibility'),
+                                'searchTerm': search_term,
+                            }
+                        })
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            if agent:
+                agent.report_progress(f"GitLab search failed: {str(e)}")
+        return results
+
+    async def _query_bitbucket(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        results = []
+        try:
+            if agent:
+                agent.report_progress(f"Searching Bitbucket for {domain}")
+
+            for search_term in self._extract_search_terms(domain, patterns)[:3]:
+                query = f'name~"{search_term}" OR description~"{search_term}"'
+                async with session.get(
+                    'https://api.bitbucket.org/2.0/repositories',
+                    params={'q': query, 'sort': '-updated_on', 'pagelen': 8},
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    for repo in data.get('values', [])[:5]:
+                        description = repo.get('description') or ''
+                        results.append({
+                            'source': 'CODE_REPOSITORY',
+                            'sourceName': 'Bitbucket',
+                            'sourceUrl': repo.get('links', {}).get('html', {}).get('href', ''),
+                            'sourceId': f"bitbucket-{repo.get('uuid', '')}",
+                            'title': repo.get('full_name') or repo.get('name', f'Bitbucket repository matching {search_term}'),
+                            'contentSnippet': description or f"Public Bitbucket repository matching '{search_term}'",
+                            'matchType': 'BRAND_MENTION',
+                            'matchedKeywords': self._text_matches_search_terms(
+                                f"{repo.get('full_name', '')} {description}",
+                                patterns,
+                                'CODE_REPOSITORY',
+                            ) or [search_term],
+                            'severity': 'LOW',
+                            'relevanceScore': 64,
+                            'riskScore': 42,
+                            'discoveredAt': repo.get('updated_on') or repo.get('created_on'),
+                            'metadata': {
+                                'workspace': repo.get('workspace', {}).get('name'),
+                                'isPrivate': repo.get('is_private'),
+                                'searchTerm': search_term,
+                            }
+                        })
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            if agent:
+                agent.report_progress(f"Bitbucket search failed: {str(e)}")
+        return results
+
+    async def _query_npm(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        results = []
+        try:
+            if agent:
+                agent.report_progress(f"Searching npm for {domain}")
+
+            for search_term in self._extract_search_terms(domain, patterns)[:4]:
+                async with session.get(
+                    'https://registry.npmjs.org/-/v1/search',
+                    params={'text': search_term, 'size': 8},
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    for package in data.get('objects', [])[:5]:
+                        pkg = package.get('package', {})
+                        name = pkg.get('name', '')
+                        description = pkg.get('description') or ''
+                        results.append({
+                            'source': 'CODE_REPOSITORY',
+                            'sourceName': 'npm',
+                            'sourceUrl': pkg.get('links', {}).get('npm', ''),
+                            'sourceId': f"npm-{name}",
+                            'title': name or f'npm package matching {search_term}',
+                            'contentSnippet': description or f"Public npm package matching '{search_term}'",
+                            'matchType': 'BRAND_MENTION',
+                            'matchedKeywords': self._text_matches_search_terms(
+                                f"{name} {description}",
+                                patterns,
+                                'CODE_REPOSITORY',
+                            ) or [search_term],
+                            'severity': 'LOW',
+                            'relevanceScore': 60,
+                            'riskScore': 38,
+                            'discoveredAt': pkg.get('date'),
+                            'metadata': {
+                                'version': pkg.get('version'),
+                                'author': (pkg.get('author') or {}).get('name'),
+                                'searchTerm': search_term,
+                            }
+                        })
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            if agent:
+                agent.report_progress(f"npm search failed: {str(e)}")
+        return results
+
+    async def _query_stackoverflow(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        results = []
+        try:
+            if agent:
+                agent.report_progress(f"Searching Stack Overflow for {domain}")
+
+            for search_term in self._extract_search_terms(domain, patterns)[:4]:
+                async with session.get(
+                    'https://api.stackexchange.com/2.3/search/advanced',
+                    params={
+                        'order': 'desc',
+                        'sort': 'relevance',
+                        'q': search_term,
+                        'site': 'stackoverflow',
+                        'pagesize': 8,
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    for item in data.get('items', [])[:5]:
+                        title = item.get('title', f'Stack Overflow mention for {search_term}')
+                        tags = item.get('tags', [])
+                        results.append({
+                            'source': 'CODE_REPOSITORY',
+                            'sourceName': 'Stack Overflow',
+                            'sourceUrl': item.get('link', ''),
+                            'sourceId': f"stackoverflow-{item.get('question_id', '')}",
+                            'title': title,
+                            'contentSnippet': f"Public Stack Overflow discussion tagged {', '.join(tags[:5]) or 'general'} matching '{search_term}'",
+                            'matchType': 'TARGETING_DISCUSSION',
+                            'matchedKeywords': self._text_matches_search_terms(
+                                f"{title} {' '.join(tags)}",
+                                patterns,
+                                'CODE_REPOSITORY',
+                            ) or [search_term],
+                            'severity': 'LOW',
+                            'relevanceScore': 58,
+                            'riskScore': 35,
+                            'discoveredAt': None,
+                            'metadata': {
+                                'tags': tags,
+                                'score': item.get('score'),
+                                'isAnswered': item.get('is_answered'),
+                                'searchTerm': search_term,
+                            }
+                        })
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            if agent:
+                agent.report_progress(f"Stack Overflow search failed: {str(e)}")
+        return results
+
+    async def _query_pastebin(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        results = []
+        try:
+            if agent:
+                agent.report_progress(f"Scanning Pastebin scrape feed for {domain}")
+
+            async with session.get('https://scrape.pastebin.com/api_scraping.php', params={'limit': 80}) as resp:
+                if resp.status != 200:
+                    if agent:
+                        agent.report_progress(f"Pastebin scrape returned status {resp.status}")
+                    return results
+                pastes = await resp.json()
+
+            terms = self._extract_search_terms(domain, patterns)
+            semaphore = asyncio.Semaphore(8)
+
+            async def inspect_paste(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                scrape_url = entry.get('scrape_url')
+                full_url = entry.get('full_url') or ''
+                if not scrape_url:
+                    return None
+
+                async with semaphore:
+                    try:
+                        async with session.get(scrape_url) as paste_resp:
+                            if paste_resp.status != 200:
+                                return None
+                            content = await paste_resp.text()
+                    except Exception:
+                        return None
+
+                haystack = f"{entry.get('title', '')}\n{content[:4000]}"
+                matched = self._text_matches_search_terms(haystack, patterns, 'PASTE_SITE')
+                if not matched:
+                    lowered = haystack.lower()
+                    matched = [term for term in terms if term.lower() in lowered][:5]
+                if not matched:
+                    return None
+
+                title = entry.get('title') or f"Paste mentioning {matched[0]}"
+                return {
+                    'source': 'PASTE_SITE',
+                    'sourceName': 'Pastebin',
+                    'sourceUrl': full_url,
+                    'sourceId': f"pastebin-{entry.get('key', '')}",
+                    'title': title,
+                    'contentSnippet': content[:500],
+                    'matchType': 'BRAND_MENTION',
+                    'matchedKeywords': matched,
+                    'severity': 'MEDIUM',
+                    'relevanceScore': 76,
+                    'riskScore': 55,
+                    'discoveredAt': entry.get('date'),
+                    'metadata': {
+                        'syntax': entry.get('syntax'),
+                        'size': entry.get('size'),
+                        'user': entry.get('user'),
+                    }
+                }
+
+            inspected = await asyncio.gather(
+                *(inspect_paste(entry) for entry in (pastes or [])[:40]),
+                return_exceptions=True,
+            )
+            for item in inspected:
+                if isinstance(item, dict):
+                    results.append(item)
+        except Exception as e:
+            if agent:
+                agent.report_progress(f"Pastebin search failed: {str(e)}")
+        return results
+
+    async def _query_searxng(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        results = []
+        searxng_url = os.environ.get('SEARXNG_URL', '').strip()
+        if not searxng_url:
+            if agent:
+                agent.report_progress("No SEARXNG_URL configured, skipping SearxNG search")
+            return results
+
+        try:
+            if agent:
+                agent.report_progress(f"Searching SearxNG for {domain}")
+
+            engines = os.environ.get(
+                'SEARXNG_ENGINES',
+                'github,gitlab,bitbucket,npm,stackoverflow',
+            )
+            max_terms = self._get_env_int('SEARXNG_MAX_TERMS', 6, minimum=1, maximum=12)
+            max_results_per_term = self._get_env_int('SEARXNG_MAX_RESULTS_PER_TERM', 24, minimum=4, maximum=100)
+
+            for search_term in self._extract_search_terms(domain, patterns)[:max_terms]:
+                async with session.get(
+                    searxng_url.rstrip('/'),
+                    params={
+                        'q': search_term,
+                        'format': 'json',
+                        'engines': engines,
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    for item in data.get('results', [])[:max_results_per_term]:
+                        content = item.get('content') or item.get('title') or ''
+                        engine = str(item.get('engine') or 'meta-search').lower()
+                        source_type = 'CODE_REPOSITORY'
+                        match_type = 'BRAND_MENTION'
+                        relevance_score = 62
+                        risk_score = 40
+
+                        if engine == 'stackoverflow':
+                            match_type = 'TARGETING_DISCUSSION'
+                            relevance_score = 58
+                            risk_score = 35
+                        elif engine == 'npm':
+                            relevance_score = 64
+                            risk_score = 42
+
+                        matched_keywords = self._text_matches_search_terms(
+                            f"{item.get('title', '')} {content} {item.get('url', '')}",
+                            patterns,
+                            source_type,
+                        ) or [search_term]
+
+                        exact_term_match = search_term.lower() in (
+                            f"{item.get('title', '')} {content} {item.get('url', '')}"
+                        ).lower()
+                        if exact_term_match:
+                            relevance_score += 8
+                        if matched_keywords and matched_keywords != [search_term]:
+                            relevance_score += min(12, len(matched_keywords) * 4)
+
+                        results.append({
+                            'source': source_type,
+                            'sourceName': f"SearxNG ({item.get('engine', 'meta-search')})",
+                            'sourceUrl': item.get('url', ''),
+                            'sourceId': f"searxng-{hashlib.sha256((item.get('url', '') or item.get('title', '')).encode()).hexdigest()[:12]}",
+                            'title': item.get('title', f'Search result for {search_term}'),
+                            'contentSnippet': content[:500],
+                            'matchType': match_type,
+                            'matchedKeywords': matched_keywords,
+                            'severity': 'LOW',
+                            'relevanceScore': min(95, relevance_score),
+                            'riskScore': risk_score,
+                            'discoveredAt': item.get('publishedDate'),
+                            'metadata': {
+                                'engine': item.get('engine'),
+                                'category': item.get('category'),
+                                'searchTerm': search_term,
+                            }
+                        })
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            if agent:
+                agent.report_progress(f"SearxNG search failed: {str(e)}")
+        return results
+
     async def _query_leakcheck(self, session: aiohttp.ClientSession, domain: str, agent=None) -> List[Dict]:
         """Query LeakCheck public API for credential leaks"""
         results = []
@@ -384,7 +1424,10 @@ class DarkWebMonitorTool(ToolPlugin):
                 email = f"{prefix}@{domain}"
                 try:
                     url = f'https://leakcheck.io/api/public?check={email}'
-                    async with session.get(url) as resp:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=15, connect=10, sock_read=10),
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             if data.get('success') and data.get('found', 0) > 0:

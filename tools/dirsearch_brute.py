@@ -19,7 +19,12 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
-from tools._dirsearch_base import filter_results, ensure_dicc_wordlist
+from tools._dirsearch_base import (
+    describe_wordlist_selection,
+    ensure_dicc_wordlist,
+    filter_results,
+    resolve_dirsearch_wordlist,
+)
 
 # Default extensions for comprehensive web scanning
 DEFAULT_EXTENSIONS = "php,aspx,jsp,html,js,zip,txt,bkp,sql"
@@ -52,6 +57,20 @@ class DirsearchBruteTool(ToolPlugin):
                     "type": "string",
                     "description": "Wordlist file path (default: dicc.txt from dirsearch repo)"
                 },
+                "extraWordlist": {
+                    "type": "string",
+                    "description": "Optional extra wordlist path to merge with the selected dirsearch wordlist"
+                },
+                "extraWordlists": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional extra wordlist paths to merge with the selected dirsearch wordlist"
+                },
+                "includeFuzzWordlist": {
+                    "type": "boolean",
+                    "description": "Automatically include /app/wordlists/fuzz.txt when available (default: true)",
+                    "default": True
+                },
                 "extensions": {
                     "type": "string",
                     "description": f"File extensions to search (default: {DEFAULT_EXTENSIONS})"
@@ -68,6 +87,14 @@ class DirsearchBruteTool(ToolPlugin):
                 "cookie": {
                     "type": "string",
                     "description": "Cookie header value for direct injection (alternative to headers_file)"
+                },
+                "authCookies": {
+                    "type": "string",
+                    "description": "Session cookies injected by authentication steps"
+                },
+                "authHeadersFile": {
+                    "type": "string",
+                    "description": "Headers file injected by authentication steps"
                 }
             },
             "oneOf": [
@@ -123,8 +150,9 @@ class DirsearchBruteTool(ToolPlugin):
         
         wordlist = parameters.get('wordlist')
         extensions = parameters.get('extensions', DEFAULT_EXTENSIONS)
-        headers_file = parameters.get('headers_file')
-        cookie = parameters.get('cookie')
+        from tools._scope_utils import extract_auth_cookie, extract_auth_headers_file
+        headers_file = extract_auth_headers_file(parameters)
+        cookie = extract_auth_cookie(parameters)
         agent = parameters.get('_agent')
 
         # Apply exclusion filtering to targets
@@ -163,17 +191,19 @@ class DirsearchBruteTool(ToolPlugin):
             wordlist_to_use = None
             if wordlist and os.path.isabs(wordlist) and os.path.exists(wordlist):
                 wordlist_to_use = wordlist
-                if agent:
-                    agent.append_output(f"[Dirsearch] Using custom wordlist: {wordlist}")
             else:
                 # Try to use dicc.txt as default
                 wordlist_to_use = ensure_dicc_wordlist()
-                if wordlist_to_use:
-                    if agent:
-                        agent.append_output(f"[Dirsearch] Using dicc.txt wordlist")
-                else:
-                    if agent:
-                        agent.append_output(f"[Dirsearch] Using dirsearch built-in wordlist")
+
+            wordlist_to_use, wordlist_info = resolve_dirsearch_wordlist(
+                default_wordlist=wordlist_to_use,
+                parameters=parameters,
+                tool_label="Dirsearch",
+            )
+            if agent:
+                agent.append_output(
+                    f"[Dirsearch] Using {describe_wordlist_selection(wordlist_info)}"
+                )
 
             # Aggregate results from all targets
             all_endpoints = []

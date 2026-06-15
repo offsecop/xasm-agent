@@ -7,6 +7,7 @@ from reference URLs to build a brand fingerprint for typosquat comparison.
 import asyncio
 import io
 import json
+import os
 import re
 from collections import Counter
 from plugin_interface import ToolPlugin
@@ -166,6 +167,21 @@ async def _download_and_hash(page, src: str) -> Optional[str]:
         return None
 
 
+def _hash_local_image(file_path: str) -> Optional[str]:
+    try:
+        import imagehash
+        from PIL import Image
+
+        if not file_path or not os.path.exists(file_path):
+            return None
+
+        img = Image.open(file_path)
+        return str(imagehash.phash(img))
+    except Exception as e:
+        print(f"[BrandFingerprint] Local hash failed for {file_path}: {e}")
+        return None
+
+
 def _parse_color_hex(color_str: str) -> Optional[str]:
     """Convert an rgb/rgba CSS color string to hex."""
     if not color_str:
@@ -286,8 +302,13 @@ class BrandFingerprintIdentityTool(ToolPlugin):
                     "type": "string",
                     "description": "Brand monitor ID to associate the fingerprint with"
                 },
+                "referenceAssets": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional uploaded brand reference assets (logo, favicon, screenshot)"
+                },
             },
-            "required": ["referenceUrls"]
+            "required": []
         }
 
     @property
@@ -313,11 +334,17 @@ class BrandFingerprintIdentityTool(ToolPlugin):
                 reference_urls = [reference_urls]
 
         brand_monitor_id = parameters.get('brandMonitorId')
+        reference_assets = parameters.get('referenceAssets', [])
+        if isinstance(reference_assets, str):
+            try:
+                reference_assets = json.loads(reference_assets)
+            except json.JSONDecodeError:
+                reference_assets = []
 
-        if not reference_urls:
+        if not reference_urls and not reference_assets:
             return {
                 'success': False,
-                'error': 'referenceUrls parameter is required and must not be empty',
+                'error': 'Provide at least one reference URL or uploaded reference asset',
                 'output': {
                     'fingerprint': None,
                     'referenceUrlsProcessed': 0,
@@ -407,7 +434,7 @@ class BrandFingerprintIdentityTool(ToolPlugin):
                 }
             }
 
-        if not identities:
+        if not identities and not reference_assets:
             return {
                 'success': False,
                 'error': f'All URLs failed: {"; ".join(errors[:5])}',
@@ -420,7 +447,62 @@ class BrandFingerprintIdentityTool(ToolPlugin):
                 }
             }
 
-        fingerprint = aggregate_identities(identities)
+        fingerprint = aggregate_identities(identities) if identities else {
+            'dominantColors': [],
+            'logoHashes': [],
+            'fontFamilies': [],
+            'layoutPatterns': {},
+            'textPatterns': [],
+            'faviconHash': None,
+        }
+
+        normalized_assets: List[Dict[str, Any]] = []
+        reference_image_hashes: List[Dict[str, Any]] = []
+        seen_logo_hashes = {logo.get('hash') for logo in fingerprint.get('logoHashes', [])}
+
+        for asset in reference_assets or []:
+            if not isinstance(asset, dict):
+                continue
+
+            asset_type = str(asset.get('type', 'LOGO')).upper()
+            asset_hash = _hash_local_image(asset.get('filePath', ''))
+            normalized_asset = dict(asset)
+            if asset_hash:
+                normalized_asset['hash'] = asset_hash
+            normalized_assets.append(normalized_asset)
+
+            if not asset_hash:
+                continue
+
+            if asset_type == 'FAVICON':
+                fingerprint['faviconHash'] = asset_hash
+                if asset_hash not in seen_logo_hashes:
+                    fingerprint['logoHashes'].append({
+                        'hash': asset_hash,
+                        'source': 'manual_favicon',
+                        'fileName': asset.get('fileName'),
+                    })
+                    seen_logo_hashes.add(asset_hash)
+            elif asset_type == 'LOGO':
+                if asset_hash not in seen_logo_hashes:
+                    fingerprint['logoHashes'].append({
+                        'hash': asset_hash,
+                        'source': 'manual_logo',
+                        'fileName': asset.get('fileName'),
+                    })
+                    seen_logo_hashes.add(asset_hash)
+            elif asset_type == 'SCREENSHOT':
+                reference_image_hashes.append({
+                    'hash': asset_hash,
+                    'source': 'manual_screenshot',
+                    'fileName': asset.get('fileName'),
+                })
+
+        fingerprint['referenceImageHashes'] = reference_image_hashes
+        fingerprint['fingerprintVector'] = {
+            'referenceAssets': normalized_assets,
+            'referenceImageHashes': reference_image_hashes,
+        }
 
         if agent:
             agent.report_progress(
@@ -430,7 +512,8 @@ class BrandFingerprintIdentityTool(ToolPlugin):
                 total_items=len(reference_urls),
             )
             agent.append_output(
-                f"[BrandFingerprint] Fingerprint built from {len(identities)} URL(s): "
+                f"[BrandFingerprint] Fingerprint built from {len(identities)} URL(s) "
+                f"and {len(normalized_assets)} uploaded asset(s): "
                 f"{len(fingerprint['dominantColors'])} colors, "
                 f"{len(fingerprint['logoHashes'])} logos, "
                 f"{len(fingerprint['fontFamilies'])} fonts"
@@ -440,6 +523,7 @@ class BrandFingerprintIdentityTool(ToolPlugin):
             'success': True,
             'output': {
                 'fingerprint': fingerprint,
+                **fingerprint,
                 'referenceUrlsProcessed': len(identities),
                 'brandMonitorId': brand_monitor_id,
                 'errors': errors if errors else None,

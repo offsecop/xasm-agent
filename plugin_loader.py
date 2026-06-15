@@ -49,7 +49,7 @@ class PluginLoader:
         
         # Find all Python files
         for plugin_file in plugin_dir.glob('*.py'):
-            if plugin_file.name.startswith('__'):
+            if plugin_file.name.startswith('__') or plugin_file.name.startswith('.'):
                 continue
 
             try:
@@ -210,4 +210,3 @@ class PluginLoader:
                     normalized['ip'] = canonical
 
         return normalized
-

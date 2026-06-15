@@ -13,7 +13,274 @@ import os
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from urllib.parse import parse_qs, urljoin, urlparse
 from plugin_interface import ToolPlugin
+
+
+# Phase 8 hardening (BUG-556): cookie filter for AI Login output.
+# Without this, every cookie from every domain visited during the login
+# (including third-party trackers, analytics, and SSO/OIDC intermediaries)
+# was forwarded to the backend trace + cookies_string + artifact files,
+# leaking session material that does not belong to the target.
+_SESSION_COOKIE_NAME_PREFIXES = (
+    "PHPSESSID", "JSESSIONID", "ASPSESSIONID", "ASP.NET_SessionId",
+    "session", "sess", "sid", "auth", "csrf", "xsrf", "X-CSRF",
+    "AWSELB", "AWSALB", "ROUTEID", "JWT", "access_token", "refresh_token",
+    "_session", "_csrf", "remember", "rememberme",
+)
+
+USERNAME_FALLBACK_STRATEGIES = [
+    {"type": "css", "selector": "input#i0116"},
+    {"type": "css", "selector": "input[name='loginfmt']"},
+    {"type": "css", "selector": "input[type='email']"},
+    {"type": "css", "selector": "input[name='email']"},
+    {"type": "css", "selector": "input[name='username']"},
+    {"type": "css", "selector": "input[id*='email' i]"},
+    {"type": "css", "selector": "input[id*='user' i]"},
+    {"type": "css", "selector": "input[autocomplete='username']"},
+    {"type": "css", "selector": "input[type='text']"},
+]
+
+PASSWORD_FALLBACK_STRATEGIES = [
+    {"type": "css", "selector": "input#i0118"},
+    {"type": "css", "selector": "input[name='passwd']"},
+    {"type": "css", "selector": "input[name='Password']"},
+    {"type": "css", "selector": "input[type='password']"},
+    {"type": "css", "selector": "input[name='password']"},
+    {"type": "css", "selector": "input[id*='pass' i]"},
+    {"type": "css", "selector": "input[autocomplete='current-password']"},
+]
+
+SUBMIT_FALLBACK_STRATEGIES = [
+    {"type": "css", "selector": "input#idSIButton9"},
+    {"type": "css", "selector": "button#idSIButton9"},
+    {"type": "css", "selector": "input#idSubmit_SAOTCC_Continue"},
+    {"type": "css", "selector": "input[value='Next']"},
+    {"type": "css", "selector": "input[value='Sign in']"},
+    {"type": "css", "selector": "input[value='Verify']"},
+    {"type": "css", "selector": "input[value='Continue']"},
+    {"type": "css", "selector": "button[type='submit']"},
+    {"type": "css", "selector": "input[type='submit']"},
+    {"type": "css", "selector": "input[type='button']"},
+    {"type": "css", "selector": "button:has-text('Sign in')"},
+    {"type": "css", "selector": "button:has-text('Sign In')"},
+    {"type": "css", "selector": "button:has-text('Log in')"},
+    {"type": "css", "selector": "button:has-text('Login')"},
+    {"type": "css", "selector": "button:has-text('Continue')"},
+    {"type": "css", "selector": "button:has-text('Next')"},
+    {"type": "css", "selector": "button:has-text('Entrar')"},
+    {"type": "css", "selector": "button:has-text('Continuar')"},
+    {"type": "css", "selector": "input[value='Next']"},
+    {"type": "css", "selector": "input[value='Sign in']"},
+    {"type": "css", "selector": "input[value='Verify']"},
+    {"type": "css", "selector": "input[value='Entrar']"},
+    {"type": "css", "selector": "input[value='Continuar']"},
+    {"type": "css", "selector": "button:has-text('Microsoft')"},
+    {"type": "css", "selector": "a:has-text('Microsoft')"},
+    {"type": "css", "selector": "[role='button']:has-text('Microsoft')"},
+    {"type": "css", "selector": "[role='button']:has-text('Sign in')"},
+    {"type": "css", "selector": "[role='button']:has-text('Continue')"},
+    {"type": "css", "selector": "[role='button']:has-text('Next')"},
+]
+
+POST_LOGIN_INTERSTITIAL_STRATEGIES = [
+    {"type": "css", "selector": "input#idSIButton9"},
+    {"type": "css", "selector": "button#idSIButton9"},
+    {"type": "css", "selector": "input[value='Continue']"},
+    {"type": "css", "selector": "input[value='Next']"},
+    {"type": "css", "selector": "input[value='Yes']"},
+    {"type": "css", "selector": "button:has-text('Continue')"},
+    {"type": "css", "selector": "button:has-text('Continuar')"},
+    {"type": "css", "selector": "button:has-text('Next')"},
+    {"type": "css", "selector": "button:has-text('Yes')"},
+    {"type": "css", "selector": "a:has-text('Continue')"},
+    {"type": "css", "selector": "a:has-text('Continuar')"},
+    {"type": "css", "selector": "[role='button']:has-text('Continue')"},
+    {"type": "css", "selector": "[role='button']:has-text('Continuar')"},
+    {"type": "css", "selector": "[data-testid*='continue' i]"},
+]
+
+OTP_FALLBACK_STRATEGIES = [
+    {"type": "css", "selector": "input#idTxtBx_SAOTCC_OTC"},
+    {"type": "css", "selector": "input[name='otc']"},
+    {"type": "css", "selector": "input[autocomplete='one-time-code']"},
+    {"type": "css", "selector": "input[inputmode='numeric']"},
+    {"type": "css", "selector": "input[type='tel']"},
+    {"type": "css", "selector": "input[type='number']"},
+    {"type": "css", "selector": "input[id*='otp' i]"},
+    {"type": "css", "selector": "input[name*='otp' i]"},
+    {"type": "css", "selector": "input[id*='code' i]"},
+    {"type": "css", "selector": "input[name*='code' i]"},
+]
+
+NUMBER_MATCHING_MARKERS = (
+    "enter the number shown",
+    "enter the number displayed",
+    "enter this number",
+    "enter the number",
+    "type the number shown",
+    "type the number displayed",
+    "number matching",
+    "approve sign in request",
+    "approve the sign-in request",
+    "digite o número",
+    "digite o numero",
+    "insira o número",
+    "insira o numero",
+    "número mostrado",
+    "numero mostrado",
+    "número exibido",
+    "numero exibido",
+)
+
+OTP_APP_CODE_MARKERS = (
+    "enter the code displayed in the microsoft authenticator app",
+    "enter the code displayed",
+    "enter code",
+    "verification code",
+    "one-time code",
+    "código exibido",
+    "codigo exibido",
+    "código mostrado",
+    "codigo mostrado",
+    "código de verificação",
+    "codigo de verificacao",
+)
+
+LOGIN_TRIGGER_LABEL_RE = re.compile(
+    r"^(entrar|login|log in|sign in|sign-in|acessar)$",
+    re.IGNORECASE,
+)
+
+
+async def request_operator_input(
+    agent,
+    job_id: Optional[str],
+    request_id: str,
+    *,
+    kind: str,
+    label: str,
+    prompt: str,
+    helper_text: Optional[str],
+    current_target: str,
+    expires_in_seconds: int,
+    mfa_round: int,
+    challenge_code: Optional[str] = None,
+    display_value: Optional[str] = None,
+    challenge_prompt: Optional[str] = None,
+) -> bool:
+    """Tell the backend/UI that this job is blocked on human MFA input."""
+    if not agent or not job_id:
+        return False
+    try:
+        import aiohttp
+
+        payload = {
+            "requestId": request_id,
+            "kind": kind,
+            "label": label,
+            "prompt": prompt,
+            "helperText": helper_text,
+            "currentOperation": label,
+            "currentTarget": current_target,
+            "expiresInSeconds": expires_in_seconds,
+            "mfaRound": mfa_round,
+        }
+        if challenge_code:
+            payload["challengeCode"] = challenge_code
+        if display_value:
+            payload["displayValue"] = display_value
+        if challenge_prompt:
+            payload["challengePrompt"] = challenge_prompt
+        async with aiohttp.ClientSession(headers={"X-API-Key": agent.api_key}) as session:
+            async with session.post(
+                f"{agent.api_url}/agents/jobs/{job_id}/operator-input/request",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                body = await resp.text()
+                print(f"[AI Login] Operator input request failed: HTTP {resp.status} {body[:200]}")
+    except Exception as exc:
+        print(f"[AI Login] Operator input request error: {exc}")
+    return False
+
+
+async def consume_operator_input(agent, job_id: Optional[str], request_id: str) -> Optional[Dict[str, Any]]:
+    """Poll the backend for an operator-supplied MFA response."""
+    if not agent or not job_id:
+        return None
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession(headers={"X-API-Key": agent.api_key}) as session:
+            async with session.get(
+                f"{agent.api_url}/agents/jobs/{job_id}/operator-input",
+                params={"requestId": request_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if 200 <= resp.status < 300:
+                    data = await resp.json()
+                    if data.get("available"):
+                        return data
+                return None
+    except Exception as exc:
+        print(f"[AI Login] Operator input poll error: {exc}")
+        return None
+
+
+def _domain_matches(cookie_domain: str, target_host: str) -> bool:
+    """True if cookie_domain belongs to target_host (allowing leading dot)."""
+    if not cookie_domain or not target_host:
+        return False
+    cd = cookie_domain.lstrip(".").lower()
+    th = target_host.lower()
+    return th == cd or th.endswith("." + cd) or cd.endswith("." + th)
+
+
+def _is_session_cookie_name(name: str) -> bool:
+    if not name:
+        return False
+    lower = name.lower()
+    for prefix in _SESSION_COOKIE_NAME_PREFIXES:
+        if lower == prefix.lower() or lower.startswith(prefix.lower()):
+            return True
+    return False
+
+
+def filter_login_cookies(
+    cookies: List[dict],
+    login_url: str,
+    extra_urls: Optional[List[str]] = None,
+) -> List[dict]:
+    """Restrict the cookie list to (a) the target domain or (b) known session
+    cookie name prefixes. Defense in depth — drops third-party trackers and
+    analytics cookies set during the login page load."""
+    if not cookies:
+        return []
+    try:
+        target_hosts = [urlparse(login_url).hostname or ""]
+        for extra_url in extra_urls or []:
+            extra_host = urlparse(extra_url).hostname or ""
+            if extra_host:
+                target_hosts.append(extra_host)
+    except Exception:
+        target_hosts = []
+    out: List[dict] = []
+    for c in cookies:
+        try:
+            domain_ok = any(
+                _domain_matches(c.get("domain", ""), target_host)
+                for target_host in target_hosts
+            )
+            name_ok = _is_session_cookie_name(c.get("name", ""))
+            if domain_ok or name_ok:
+                out.append(c)
+        except Exception:
+            # On any anomaly, exclude the cookie — fail closed.
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +323,13 @@ def extract_form_elements(html: str, max_chars: int = 12000) -> str:
 # Multi-strategy field filling
 # ---------------------------------------------------------------------------
 
-async def fill_field(page, strategies: list, value: str, field_name: str) -> bool:
+async def fill_field(
+    page,
+    strategies: list,
+    value: str,
+    field_name: str,
+    timeout_ms: int = 2500,
+) -> bool:
     """Try multiple Playwright strategies to fill a form field."""
     for i, strat in enumerate(strategies):
         stype = strat.get("type", "")
@@ -74,9 +347,10 @@ async def fill_field(page, strategies: list, value: str, field_name: str) -> boo
             else:
                 continue
 
-            await locator.wait_for(state="visible", timeout=5000)
-            await locator.click()
-            await locator.fill(value)
+            locator = first_locator(locator)
+            await locator.wait_for(state="visible", timeout=timeout_ms)
+            await locator.click(timeout=timeout_ms)
+            await locator.fill(value, timeout=timeout_ms)
             print(f"[AI Login]   {field_name}: filled via '{stype}' strategy (attempt {i+1})")
             return True
         except Exception as exc:
@@ -86,7 +360,12 @@ async def fill_field(page, strategies: list, value: str, field_name: str) -> boo
     return False
 
 
-async def click_element(page, strategies: list, element_name: str) -> bool:
+async def click_element(
+    page,
+    strategies: list,
+    element_name: str,
+    timeout_ms: int = 2500,
+) -> bool:
     """Try multiple Playwright strategies to click an element."""
     for i, strat in enumerate(strategies):
         stype = strat.get("type", "")
@@ -104,8 +383,9 @@ async def click_element(page, strategies: list, element_name: str) -> bool:
             else:
                 continue
 
-            await locator.wait_for(state="visible", timeout=5000)
-            await locator.click()
+            locator = first_locator(locator)
+            await locator.wait_for(state="visible", timeout=timeout_ms)
+            await locator.click(timeout=timeout_ms)
             print(f"[AI Login]   {element_name}: clicked via '{stype}' strategy (attempt {i+1})")
             return True
         except Exception as exc:
@@ -113,6 +393,535 @@ async def click_element(page, strategies: list, element_name: str) -> bool:
             continue
 
     return False
+
+
+def first_locator(locator):
+    """Return the first locator for both old and new Playwright Python APIs."""
+    first = getattr(locator, "first", None)
+    return first() if callable(first) else first
+
+
+async def has_visible_fillable_field(page, strategies: list, timeout_ms: int = 800) -> bool:
+    """Return true only when a locator strategy points at a visible, enabled input."""
+    for strat in strategies:
+        stype = strat.get("type", "")
+        try:
+            if stype == "role":
+                locator = page.get_by_role(strat["role"], name=strat.get("name"))
+            elif stype == "label":
+                locator = page.get_by_label(strat["label"])
+            elif stype == "placeholder":
+                locator = page.get_by_placeholder(strat["placeholder"])
+            elif stype == "css":
+                locator = page.locator(strat["selector"])
+            elif stype == "test_id":
+                locator = page.get_by_test_id(strat["testId"])
+            else:
+                continue
+
+            locator = first_locator(locator)
+            await locator.wait_for(state="visible", timeout=timeout_ms)
+            if await locator.is_enabled(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def extract_number_matching_challenge(page) -> Dict[str, Any]:
+    """Detect Microsoft/SSO number matching where the operator enters the browser number in an app."""
+    body_texts: List[str] = []
+    visible_texts: List[str] = []
+    number_candidates: List[Dict[str, Any]] = []
+    extract_script = """() => {
+        const isVisible = (el) => {
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+        };
+        const texts = [];
+        const numbers = [];
+        const pushText = (value, el, rect, style) => {
+          const text = String(value || '').replace(/[\u200b\u200c\u200d]/g, '').trim();
+          if (!text) return;
+          texts.push(text);
+          const clean = text.replace(/\\s+/g, ' ').trim();
+          const compactDigits = clean.replace(/[\\s\\u00a0]+/g, '');
+          const isChallengeSized = /^\\d{2,3}$/.test(compactDigits);
+          const isStandaloneOrSpaced = /^\\d{2,3}$/.test(clean) || /^\\d(?:\\s+\\d){1,2}$/.test(clean);
+          if (isChallengeSized && isStandaloneOrSpaced) {
+            numbers.push({
+              text: compactDigits,
+              rawText: clean,
+              fontSize: parseFloat(style.fontSize || '0') || 0,
+              fontWeight: parseFloat(style.fontWeight || '0') || 0,
+              area: Math.max(rect.width * rect.height, 0),
+            });
+          }
+        };
+        for (const el of Array.from(document.body ? document.body.querySelectorAll('*') : [])) {
+          if (!isVisible(el)) continue;
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          const parts = [
+            el.innerText,
+            el.textContent,
+            el.getAttribute('aria-label'),
+            el.getAttribute('aria-description'),
+            el.getAttribute('title'),
+            el.getAttribute('value'),
+            el.getAttribute('data-value'),
+            el.getAttribute('data-code'),
+          ];
+          for (const text of Array.from(new Set(parts.filter(Boolean)))) {
+            pushText(text, el, rect, style);
+          }
+        }
+        numbers.sort((a, b) => (b.fontSize - a.fontSize) || (b.fontWeight - a.fontWeight) || (b.area - a.area));
+        return {
+          texts: Array.from(new Set(texts)).slice(0, 1200),
+          numbers: numbers.slice(0, 30),
+        };
+    }"""
+
+    frames = getattr(page, "frames", None) or []
+    if callable(frames):
+        try:
+            frames = frames()
+        except Exception:
+            frames = []
+    if not frames:
+        frames = [page]
+
+    for frame in frames:
+        try:
+            body_text = await frame.locator("body").inner_text(timeout=1200)
+            if body_text:
+                body_texts.append(body_text)
+        except Exception:
+            pass
+        try:
+            extracted = await frame.evaluate(extract_script)
+            if isinstance(extracted, dict):
+                visible_texts.extend(extracted.get("texts") or [])
+                number_candidates.extend(extracted.get("numbers") or [])
+        except Exception:
+            continue
+
+    combined_text = "\n".join(body_texts + visible_texts)
+    normalized = combined_text.lower()
+    if any(marker in normalized for marker in OTP_APP_CODE_MARKERS):
+        return {"detected": False}
+
+    marker_detected = any(marker in normalized for marker in NUMBER_MATCHING_MARKERS)
+    if not marker_detected:
+        return {"detected": False}
+
+    candidates: List[str] = []
+    for item in number_candidates:
+        value = str(item.get("text", "")).strip()
+        if re.fullmatch(r"\d{2,3}", value):
+            candidates.append(value)
+
+    body_lines = [line for text in body_texts for line in str(text).splitlines()]
+    for text in visible_texts + body_lines:
+        clean = " ".join(str(text).strip().split())
+        if re.fullmatch(r"\d{2,3}", clean):
+            candidates.append(clean)
+
+    code_context_pattern = re.compile(
+        r"(code|código|codigo|number|número|numero|shown|displayed|insira|enter|type|digite)",
+        re.IGNORECASE,
+    )
+    noisy_context_pattern = re.compile(
+        r"(phone|telefone|service desk|support|helpdesk|ticket|case|year|copyright)",
+        re.IGNORECASE,
+    )
+    separated_digits_pattern = re.compile(r"(?<!\d)(\d(?:[\s\u00a0\u200b\u200c\u200d]*\d){1,2})(?!\d)")
+    for raw_line in combined_text.splitlines():
+        clean_line = " ".join(str(raw_line).strip().split())
+        if not clean_line or noisy_context_pattern.search(clean_line):
+            continue
+        if not code_context_pattern.search(clean_line):
+            continue
+        for match in separated_digits_pattern.finditer(clean_line):
+            compact = re.sub(r"\D", "", match.group(1))
+            if 2 <= len(compact) <= 3:
+                candidates.append(compact)
+
+    if not candidates:
+        contextual_patterns = [
+            r"(?:enter|type|use|digite|insira)[^\d]{0,120}(\d(?:[\s\u00a0\u200b\u200c\u200d]*\d){1,2})",
+            r"(\d(?:[\s\u00a0\u200b\u200c\u200d]*\d){1,2})[^\n]{0,120}(?:authenticator|aplicativo|app|aprovar|approve)",
+            r"(?:code|código|codigo|number|número|numero)[^\d]{0,120}(\d(?:[\s\u00a0\u200b\u200c\u200d]*\d){1,2})",
+        ]
+        for pattern in contextual_patterns:
+            match = re.search(pattern, combined_text, re.IGNORECASE)
+            if match:
+                candidates.append(re.sub(r"\D", "", match.group(1)))
+                break
+
+    seen_candidates = []
+    for candidate in candidates:
+        if candidate not in seen_candidates and not re.fullmatch(r"19\d{2}|20\d{2}", candidate):
+            seen_candidates.append(candidate)
+
+    challenge_code = seen_candidates[0] if seen_candidates else None
+    snippet = " ".join(combined_text.split())[:240]
+    return {
+        "detected": True,
+        "challengeCode": challenge_code,
+        "displayValue": challenge_code,
+        "challengePrompt": snippet,
+    }
+
+
+def normalize_number_matching_code(value: Any) -> Optional[str]:
+    """Return a 2-3 digit Microsoft Authenticator number if one is present."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    compact = re.sub(r"\D", "", text)
+    if 2 <= len(compact) <= 3 and not re.fullmatch(r"19\d{2}|20\d{2}", compact):
+        return compact
+    return None
+
+
+async def count_visible_login_inputs(page) -> int:
+    """Count visible fields that can plausibly participate in a login form."""
+    try:
+        return await page.locator(
+            "input:visible, textarea:visible, [contenteditable='true']:visible"
+        ).count()
+    except Exception:
+        return 0
+
+
+async def count_visible_auth_challenge_inputs(page) -> int:
+    """Count visible fields that strongly indicate an auth challenge.
+
+    Authenticated apps commonly expose search boxes, filters, comments, and
+    other inputs. Those must not make a protected resource validation fail.
+    Only count fields that look like login, password, username, or IdP prompts.
+    """
+    selectors = [
+        "input[type='password']:visible",
+        "input[autocomplete='current-password']:visible",
+        "input[autocomplete='username']:visible",
+        "input[name='password' i]:visible",
+        "input[id*='pass' i]:visible",
+        "input[placeholder*='password' i]:visible",
+        "input[type='email']:visible",
+        "input[name='email' i]:visible",
+        "input[id*='email' i]:visible",
+        "input[placeholder*='email' i]:visible",
+        "input[name='username' i]:visible",
+        "input[id*='user' i]:visible",
+        "input[placeholder*='username' i]:visible",
+        "input[name='loginfmt']:visible",
+        "input#i0116:visible",
+        "input#i0118:visible",
+    ]
+    total = 0
+    for selector in selectors:
+        try:
+            total += await page.locator(selector).count()
+        except Exception:
+            continue
+    return total
+
+
+async def open_login_surface_if_needed(page, wait_ms: int = 1000) -> bool:
+    """Open SPA login modals/drawers when the initial URL has no form fields.
+
+    Some apps keep the URL unchanged and expose the login form only after a
+    header button ("Entrar", "Login", "Sign in") is clicked. Testing should be
+    fast and deterministic for that common case instead of asking the LLM to
+    infer selectors from a page that has no inputs.
+    """
+    if await count_visible_login_inputs(page) > 0:
+        return False
+
+    trigger_locators = [
+        page.get_by_role("button", name=LOGIN_TRIGGER_LABEL_RE),
+        page.get_by_role("link", name=LOGIN_TRIGGER_LABEL_RE),
+        page.locator("button:has-text('Entrar')"),
+        page.locator("a:has-text('Entrar')"),
+        page.locator("button:has-text('Login')"),
+        page.locator("a:has-text('Login')"),
+        page.locator("button:has-text('Sign in')"),
+        page.locator("a:has-text('Sign in')"),
+    ]
+
+    for i, locator in enumerate(trigger_locators):
+        try:
+            candidate = first_locator(locator)
+            await candidate.wait_for(state="visible", timeout=1500)
+            await candidate.click()
+            await page.wait_for_timeout(wait_ms)
+            if await count_visible_login_inputs(page) > 0:
+                print(f"[AI Login]   Opened login surface via trigger strategy {i + 1}")
+                return True
+        except Exception as exc:
+            print(f"[AI Login]   Login trigger strategy {i + 1} failed - {exc.__class__.__name__}")
+            continue
+
+    return False
+
+
+def _url_host(url: Optional[str]) -> str:
+    try:
+        return urlparse(url or "").hostname or ""
+    except Exception:
+        return ""
+
+
+def _looks_like_auth_url(current_url: str, login_url: str, protected_resource_url: str) -> bool:
+    """Detect common IdP/login redirects after a supposed successful login."""
+    current_host = _url_host(current_url)
+    login_host = _url_host(login_url)
+    protected_host = _url_host(protected_resource_url)
+    if not current_host:
+        return True
+    if protected_host and _domain_matches(current_host, protected_host):
+        return False
+    if login_host and _domain_matches(current_host, login_host):
+        return True
+    lowered = current_url.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "/login",
+            "/signin",
+            "/sign-in",
+            "/auth",
+            "/oauth",
+            "/saml",
+            "mfa",
+            "2fa",
+            "idp",
+            "identity",
+        )
+    )
+
+
+def _continue_chain_reaches_protected(
+    candidate_url: str,
+    protected_resource_url: str,
+    *,
+    depth: int = 0,
+) -> bool:
+    """Return true when a redirect/continue chain eventually targets the protected app."""
+    if depth > 3:
+        return False
+    protected_host = _url_host(protected_resource_url)
+    candidate_host = _url_host(candidate_url)
+    if candidate_host and protected_host and _domain_matches(candidate_host, protected_host):
+        return True
+    try:
+        parsed = urlparse(candidate_url)
+        query = parse_qs(parsed.query)
+        for key, values in query.items():
+            if key.lower() not in ("continue", "redirect", "redirect_uri", "return", "returnurl", "relaystate"):
+                continue
+            for value in values:
+                nested = urljoin(candidate_url, value)
+                if nested != candidate_url and _continue_chain_reaches_protected(
+                    nested,
+                    protected_resource_url,
+                    depth=depth + 1,
+                ):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _extract_protected_continue_url(current_url: str, protected_resource_url: str) -> Optional[str]:
+    """Return a safe IdP continuation URL when it points back to the protected app."""
+    try:
+        parsed = urlparse(current_url)
+        query = parse_qs(parsed.query)
+        protected_host = _url_host(protected_resource_url)
+        for key, values in query.items():
+            if key.lower() not in ("continue", "redirect", "redirect_uri", "return", "returnurl", "relaystate"):
+                continue
+            for value in values:
+                candidate = urljoin(current_url, value)
+                candidate_host = _url_host(candidate)
+                if candidate_host and protected_host and _domain_matches(candidate_host, protected_host):
+                    return candidate
+                if _continue_chain_reaches_protected(candidate, protected_resource_url):
+                    return candidate
+    except Exception:
+        return None
+    return None
+
+
+async def advance_post_login_interstitials(
+    page,
+    protected_resource_url: str,
+    *,
+    login_url: str,
+    page_load_strategy: str,
+    timeout_ms: int,
+    settle_ms: int,
+) -> List[Dict[str, Any]]:
+    """Try to complete harmless post-login continue screens before validation.
+
+    SSO providers frequently land on an IdP-hosted "continue to app" or
+    "stay signed in" page after MFA. These are not new credentials prompts, so
+    we can safely advance through explicit continue buttons or redirect params.
+    We intentionally avoid "Request access" style actions because they create
+    an external side effect and do not prove a reusable app session.
+    """
+    actions: List[Dict[str, Any]] = []
+    visited: set = set()
+
+    for attempt in range(6):
+        current_url = page.url or ""
+        if current_url in visited:
+            break
+        visited.add(current_url)
+
+        if not _looks_like_auth_url(current_url, login_url, protected_resource_url):
+            break
+
+        continue_url = _extract_protected_continue_url(current_url, protected_resource_url)
+        if continue_url and continue_url != current_url:
+            actions.append({
+                "action": "follow_continue_url",
+                "from": current_url,
+                "to": continue_url,
+            })
+            try:
+                await page.goto(
+                    continue_url,
+                    wait_until=page_load_strategy,
+                    timeout=timeout_ms,
+                )
+            except Exception as exc:
+                actions.append({
+                    "action": "follow_continue_url_failed",
+                    "error": exc.__class__.__name__,
+                })
+                break
+            if settle_ms > 0:
+                await asyncio.sleep(max(settle_ms, 2500) / 1000)
+            continue
+
+        before_click_url = current_url
+        clicked = await click_element(
+            page,
+            POST_LOGIN_INTERSTITIAL_STRATEGIES,
+            "post_login_interstitial",
+            timeout_ms=1500,
+        )
+        if clicked:
+            actions.append({
+                "action": "click_continue_control",
+                "from": before_click_url,
+            })
+            try:
+                await page.wait_for_load_state(page_load_strategy, timeout=min(timeout_ms, 10000))
+            except Exception:
+                pass
+            if settle_ms > 0:
+                await asyncio.sleep(max(settle_ms, 2500) / 1000)
+
+            if page.url != before_click_url:
+                continue
+
+        break
+
+
+    return actions
+
+
+async def validate_protected_resource_session(
+    page,
+    protected_resource_url: Optional[str],
+    *,
+    login_url: str,
+    page_load_strategy: str,
+    timeout_ms: int,
+    settle_ms: int,
+    agent,
+) -> Dict[str, Any]:
+    """Open the protected app URL and verify the browser is not still at login.
+
+    Job completion alone is not enough for SSO/MFA. The reusable session is only
+    trustworthy when the browser can reach the tenant/app resource after the IdP
+    flow has finished.
+    """
+    if not protected_resource_url:
+        return {"valid": True, "reason": "no protected resource configured"}
+
+    if agent:
+        agent.report_progress(
+            current_operation="Validating captured session against protected resource",
+            current_target=protected_resource_url,
+        )
+
+    try:
+        await page.goto(
+            protected_resource_url,
+            wait_until=page_load_strategy,
+            timeout=timeout_ms,
+        )
+    except Exception as exc:
+        return {
+            "valid": False,
+            "reason": f"Protected resource navigation failed: {exc.__class__.__name__}",
+            "current_url": getattr(page, "url", protected_resource_url),
+        }
+
+    if settle_ms > 0:
+        await asyncio.sleep(settle_ms / 1000)
+    try:
+        await page.wait_for_load_state(page_load_strategy, timeout=min(timeout_ms, 10000))
+    except Exception:
+        pass
+
+    interstitial_actions = await advance_post_login_interstitials(
+        page,
+        protected_resource_url,
+        login_url=login_url,
+        page_load_strategy=page_load_strategy,
+        timeout_ms=timeout_ms,
+        settle_ms=settle_ms,
+    )
+
+    current_url = page.url or protected_resource_url
+    page_inputs = await count_visible_login_inputs(page)
+    auth_inputs = await count_visible_auth_challenge_inputs(page)
+    auth_url = _looks_like_auth_url(current_url, login_url, protected_resource_url)
+
+    if auth_url or auth_inputs > 0:
+        return {
+            "valid": False,
+            "reason": (
+                "Protected resource still looks unauthenticated "
+                f"(currentUrl={current_url}, visibleAuthInputs={auth_inputs}, visiblePageInputs={page_inputs})"
+            ),
+            "current_url": current_url,
+            "visible_login_inputs": auth_inputs,
+            "visible_page_inputs": page_inputs,
+            "auth_url": auth_url,
+            "interstitial_actions": interstitial_actions,
+        }
+
+    return {
+        "valid": True,
+        "reason": "protected resource loaded without a login challenge",
+        "current_url": current_url,
+        "visible_login_inputs": auth_inputs,
+        "visible_page_inputs": page_inputs,
+        "auth_url": auth_url,
+        "interstitial_actions": interstitial_actions,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -185,11 +994,73 @@ If B (MFA page), also provide Playwright locator strategies for:
 - The code / OTP / verification input field (if present - some MFA pages are just method selection with no code field)
 - The verify / submit / continue button
 
+If the screenshot shows Microsoft Authenticator number matching, where the browser displays a
+2-3 digit number that the operator must type into the mobile authenticator app, return that exact
+number as "numberMatchingCode". This is different from an OTP input field. If no number is visible,
+set "numberMatchingCode" to null.
+
 Respond ONLY with valid JSON (no markdown fences):
 For success: {{"status":"success"}}
-For MFA:     {{"status":"mfa","codeField":[{{"type":"css","selector":"#otp"}}],"submitButton":[{{"type":"role","role":"button","name":"Verify"}}]}}
-For MFA without code field (method selection): {{"status":"mfa","codeField":[],"submitButton":[{{"type":"role","role":"button","name":"Continue"}}]}}
+For MFA:     {{"status":"mfa","codeField":[{{"type":"css","selector":"#otp"}}],"submitButton":[{{"type":"role","role":"button","name":"Verify"}}],"numberMatchingCode":null}}
+For number matching MFA: {{"status":"mfa","codeField":[],"submitButton":[{{"type":"role","role":"button","name":"Continue"}}],"numberMatchingCode":"64"}}
+For MFA without code field (method selection): {{"status":"mfa","codeField":[],"submitButton":[{{"type":"role","role":"button","name":"Continue"}}],"numberMatchingCode":null}}
 For error:   {{"status":"error","message":"description"}}"""
+
+
+RELAY_JSON_SYSTEM_PROMPT = (
+    "You are an AI browser login assistant. Analyze screenshots and form HTML, "
+    "then return only the requested JSON object. Do not include markdown fences."
+)
+
+
+def build_backend_url(api_url: str, path: str) -> str:
+    """Resolve backend-relative config paths against the agent's /api URL."""
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    parsed = urlparse(api_url)
+    if path.startswith("/"):
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return urljoin(api_url.rstrip("/") + "/", path)
+
+
+async def ask_backend_relay(
+    relay_url: str,
+    agent_api_key: str,
+    screenshot_b64: str,
+    text_prompt: str,
+    timeout_seconds: int = 75,
+) -> dict:
+    """Send screenshot + text to the backend LLM relay and parse JSON response."""
+    import aiohttp
+
+    body = {
+        "kind": "agent_relay",
+        "purpose": "browser_login_ai",
+        "systemPrompt": RELAY_JSON_SYSTEM_PROMPT,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "mediaType": "image/png",
+                        "data": screenshot_b64,
+                    },
+                    {"type": "text", "text": text_prompt},
+                ],
+            }
+        ],
+        "maxOutputTokens": 1500,
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"X-API-Key": agent_api_key}) as session:
+        async with session.post(relay_url, json=body, headers={"Content-Type": "application/json"}) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Backend LLM relay error {resp.status}: {text[:500]}")
+            data = json.loads(text)
+    raw = data.get("content") or ""
+    return _extract_json_object(raw, vendor='backend_relay')
 
 
 async def ask_claude(client, screenshot_b64: str, text_prompt: str) -> dict:
@@ -215,10 +1086,97 @@ async def ask_claude(client, screenshot_b64: str, text_prompt: str) -> dict:
     )
 
     raw = response.content[0].text
-    # Find the first '{' and match brackets to extract the JSON object
+    return _extract_json_object(raw, vendor='anthropic')
+
+
+# Phase 6 — Gemini multimodal client. The platform LLM is vendor-agnostic;
+# when the operator configures Gemini (vendor='google'), this code path runs
+# instead of `ask_claude` with the same multimodal contract (image + text →
+# JSON). Uses Gemini's REST API directly so no new SDK install is required —
+# the agent already has aiohttp.
+# Phase 8 hardening (BUG-557): pass the Gemini API key in the `x-goog-api-key`
+# header rather than as a `?key=` URL query parameter. URL query strings are
+# captured verbatim in HTTP access logs on the agent host, by any TLS-
+# terminating proxy in the path, and by Gemini error response bodies.
+GEMINI_GENERATE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+# Translate the platform's stored model name into one the Gemini REST API
+# accepts. The "preview" suffix is used by some internal naming; map to the
+# closest published multimodal-capable Gemini for AI Login.
+def _resolve_gemini_model(name: Optional[str]) -> str:
+    if not name:
+        return "gemini-2.5-flash"
+    n = name.lower()
+    if "flash-lite" in n:
+        return "gemini-2.5-flash-lite"
+    if "flash" in n:
+        return "gemini-2.5-flash"
+    if "pro" in n:
+        return "gemini-2.5-pro"
+    return "gemini-2.5-flash"
+
+
+async def ask_gemini(
+    api_key: str,
+    model: str,
+    screenshot_b64: str,
+    text_prompt: str,
+    timeout_seconds: int = 60,
+) -> dict:
+    """Send screenshot + text to Gemini multimodal API and parse JSON response."""
+    import aiohttp
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": text_prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": screenshot_b64,
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 1500,
+            "responseMimeType": "application/json",
+        },
+    }
+    resolved = _resolve_gemini_model(model)
+    url = GEMINI_GENERATE_URL.format(model=resolved)
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=body, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                # Sanitize any echo of the API key from the error body before raising.
+                safe_text = text[:300].replace(api_key, "***REDACTED***") if api_key else text[:300]
+                raise RuntimeError(f"Gemini API error {resp.status}: {safe_text}")
+            data = json.loads(text)
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise ValueError(f"Gemini returned no candidates: {text[:300]}")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    raw_text = next((p.get("text") for p in parts if p.get("text")), None)
+    if not raw_text:
+        raise ValueError(f"Gemini returned no text content: {parts}")
+    return _extract_json_object(raw_text, vendor='gemini')
+
+
+def _extract_json_object(raw: str, vendor: str = 'llm') -> dict:
+    """Extract the first balanced JSON object from a free-form LLM response."""
     start = raw.find('{')
     if start == -1:
-        raise ValueError(f"Claude did not return valid JSON.\nRaw response:\n{raw}")
+        raise ValueError(f"{vendor} did not return valid JSON.\nRaw response:\n{raw[:500]}")
     depth = 0
     end = start
     for i in range(start, len(raw)):
@@ -231,8 +1189,52 @@ async def ask_claude(client, screenshot_b64: str, text_prompt: str) -> dict:
                 break
     json_str = raw[start:end]
     if not json_str:
-        raise ValueError(f"Claude did not return valid JSON.\nRaw response:\n{raw}")
+        raise ValueError(f"{vendor} did not return valid JSON.\nRaw response:\n{raw[:500]}")
     return json.loads(json_str)
+
+
+async def ask_llm(
+    *,
+    vendor: str,
+    screenshot_b64: str,
+    text_prompt: str,
+    relay_url: Optional[str] = None,
+    agent_api_key: Optional[str] = None,
+    anthropic_client=None,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: Optional[str] = None,
+    llm_timeout_seconds: int = 75,
+) -> dict:
+    """Vendor-agnostic LLM call. Branches on vendor and forwards to the
+    matching provider implementation. Phase 6 — added Google/Gemini path so
+    AI Login works against whichever LLM the operator configured at the
+    platform (Settings → LLM)."""
+    if relay_url and agent_api_key:
+        return await ask_backend_relay(
+            relay_url,
+            agent_api_key,
+            screenshot_b64,
+            text_prompt,
+            timeout_seconds=llm_timeout_seconds,
+        )
+    if vendor == 'anthropic':
+        if anthropic_client is None:
+            raise ValueError("anthropic vendor selected but client is None")
+        return await ask_claude(anthropic_client, screenshot_b64, text_prompt)
+    if vendor in ('google', 'gemini'):
+        if not gemini_api_key:
+            raise ValueError("google/gemini vendor selected but api key is missing")
+        return await ask_gemini(
+            gemini_api_key,
+            gemini_model or "gemini-2.5-flash",
+            screenshot_b64,
+            text_prompt,
+            timeout_seconds=llm_timeout_seconds,
+        )
+    raise NotImplementedError(
+        f"AI Login does not yet support LLM vendor '{vendor}'. "
+        "Configure 'anthropic' or 'google' in platform LLM settings."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +1348,7 @@ class BrowserLoginAiTool(ToolPlugin):
         login_instructions = parameters.get('loginInstructions')
         headless = parameters.get('headless', True)
         timeout_seconds = parameters.get('timeout_seconds', 120)
+        protected_resource_url = parameters.get('protectedResourceUrl')
         agent = parameters.get('_agent')
 
         print(f"[AI Login] Starting execution for: {login_url}")
@@ -415,10 +1418,43 @@ class BrowserLoginAiTool(ToolPlugin):
                     total_items=4
                 )
 
-            # Generate output artifacts with default paths
+            # Phase 8 hardening (BUG-556): filter cookies to the login target's
+            # domain or to known session cookie name prefixes BEFORE passing
+            # them to artifact generation, the inline cookies_string, the
+            # cookies_list reported to the backend, and the result returned to
+            # the agent. Third-party tracker/analytics cookies set during the
+            # login page load do not belong to the target and must not be
+            # forwarded to downstream scanners or to the trace event stream.
+            raw_cookies = login_result.get('cookies', []) or []
+            filtered_cookies = filter_login_cookies(
+                raw_cookies,
+                login_url,
+                extra_urls=[protected_resource_url] if protected_resource_url else None,
+            )
+            dropped = len(raw_cookies) - len(filtered_cookies)
+            if dropped > 0:
+                print(f"[AI Login] Filtered out {dropped} non-session/cross-domain cookie(s) before artifact generation.")
+
+            if not filtered_cookies:
+                return {
+                    'status': 'FAILED',
+                    'error': (
+                        'Login flow completed, but no reusable cookies were captured for '
+                        'the login or protected resource domains.'
+                    ),
+                    'session_valid': False,
+                    'login_method': 'ai'
+                }
+
+            # Phase 8 hardening (BUG-558): do NOT forward the full
+            # `storage_state` (Playwright returns localStorage + sessionStorage
+            # for every origin visited during the login flow, including
+            # OAuth/OIDC intermediaries that may store access/refresh tokens
+            # in localStorage in plaintext). The downstream scanners only
+            # need the cookie string; storage_state is intentionally dropped.
             artifacts = self._generate_artifacts(
-                cookies=login_result['cookies'],
-                storage_state=login_result.get('storage_state', {})
+                cookies=filtered_cookies,
+                storage_state={}
             )
 
             # Report completion
@@ -431,7 +1467,7 @@ class BrowserLoginAiTool(ToolPlugin):
                 )
 
             # Generate inline cookies string for auto-injection to subsequent steps
-            cookies_string = '; '.join([f"{c['name']}={c['value']}" for c in login_result['cookies']])
+            cookies_string = '; '.join([f"{c['name']}={c['value']}" for c in filtered_cookies])
 
             result = {
                 'status': 'SUCCESS',
@@ -443,8 +1479,10 @@ class BrowserLoginAiTool(ToolPlugin):
                 'session_valid': True,
                 'cookies_list': [
                     {'name': c['name'], 'domain': c.get('domain', '')}
-                    for c in login_result['cookies']
+                    for c in filtered_cookies
                 ],
+                'protected_resource_url': protected_resource_url,
+                'protected_resource_validation': login_result.get('protected_resource_validation'),
                 'execution_time_seconds': login_result.get('execution_time', 0),
                 'ai_actions_count': login_result.get('actions_count', 0)
             }
@@ -484,7 +1522,6 @@ class BrowserLoginAiTool(ToolPlugin):
         """
         try:
             from playwright.async_api import async_playwright
-            from anthropic import Anthropic
 
             # Read AI config parameters (injected from aiConfig)
             mfa_auto_fill_timeout = parameters.get('mfaAutoFillTimeout', 60)
@@ -495,12 +1532,53 @@ class BrowserLoginAiTool(ToolPlugin):
                 "Chrome/120.0.0.0 Safari/537.36"
             )
             browser_viewport = parameters.get('browserViewport', {"width": 1280, "height": 900})
+            protected_resource_url = parameters.get('protectedResourceUrl')
             debug_screenshots = parameters.get('debugScreenshots', False)
+            login_test_mode = bool(parameters.get('loginTestMode') or parameters.get('testMode'))
+            job_id = parameters.get('_job_id')
+            interactive_mfa = (
+                parameters.get('sessionCaptureMode') == 'INTERACTIVE_SSO'
+                or bool(parameters.get('humanMfaRequired'))
+                or parameters.get('mfaInteractionMode') == 'operator_assisted'
+            )
+            if login_test_mode and not interactive_mfa:
+                # Smoke tests must prove the auth path quickly. Full authenticated
+                # scans can still use the richer, slower defaults.
+                mfa_auto_fill_timeout = min(mfa_auto_fill_timeout, 5)
+                mfa_max_rounds = min(mfa_max_rounds, 1)
+                # 25s was too tight for a cold browser navigating a real
+                # OIDC login over a corporate VPN (observed timeouts on
+                # login.uat.questrade.com). 60s keeps the smoke test fast while
+                # tolerating cold-start + redirect latency.
+                timeout_seconds = min(timeout_seconds, 60)
+            page_load_strategy = parameters.get(
+                'pageLoadStrategy',
+                'domcontentloaded' if login_test_mode else 'networkidle',
+            )
+            if page_load_strategy not in ('commit', 'domcontentloaded', 'load', 'networkidle'):
+                page_load_strategy = 'domcontentloaded' if login_test_mode else 'networkidle'
+            post_submit_wait_ms = int(parameters.get('postSubmitWaitMs', 1000 if login_test_mode else 2000))
+            post_submit_load_timeout_ms = int(parameters.get('postSubmitLoadTimeoutMs', 3000 if login_test_mode else 15000))
+            llm_timeout_seconds = int(parameters.get('llmTimeoutSeconds', 15 if login_test_mode else 75))
+            initial_render_wait_ms = int(parameters.get('initialRenderWaitMs', 1000 if login_test_mode else 0))
 
-            print(f"[AI Login] Config: mfaAutoFillTimeout={mfa_auto_fill_timeout}s, mfaMaxRounds={mfa_max_rounds}, debug={debug_screenshots}")
+            print(
+                "[AI Login] Config: "
+                f"mfaAutoFillTimeout={mfa_auto_fill_timeout}s, "
+                f"mfaMaxRounds={mfa_max_rounds}, debug={debug_screenshots}, "
+                f"testMode={login_test_mode}, pageLoadStrategy={page_load_strategy}, "
+                f"llmTimeout={llm_timeout_seconds}s, initialRenderWait={initial_render_wait_ms}ms, "
+                f"interactiveMfa={interactive_mfa}"
+            )
 
-            # Get Anthropic API key — prefer DB-stored key (via agent config endpoint), fall back to env var
-            anthropic_api_key = None
+            # Phase 6 — vendor-agnostic LLM resolution. Pull the platform LLM
+            # config from /agents/config. Prefer the backend relay so the agent
+            # does not receive raw provider keys.
+            llm_vendor = None
+            llm_model = None
+            llm_api_key = None
+            relay_url = None
+            agent_api_key = getattr(agent, 'api_key', None)
             if agent:
                 try:
                     import aiohttp
@@ -508,33 +1586,88 @@ class BrowserLoginAiTool(ToolPlugin):
                         async with session.get(f"{agent.api_url}/agents/config", timeout=aiohttp.ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 config_data = await resp.json()
-                                llm = config_data.get('llm')
-                                if llm and llm.get('vendor') == 'anthropic' and llm.get('apiKey'):
-                                    anthropic_api_key = llm['apiKey']
-                                    print("[AI Login] Using Anthropic API key from platform LLM configuration")
-                                elif llm and llm.get('apiKey'):
-                                    # Non-Anthropic vendor configured — can still try if it's the only key available
-                                    print(f"[AI Login] LLM vendor is '{llm.get('vendor')}', not anthropic — checking env fallback")
+                                llm = config_data.get('llm') or {}
+                                llm_vendor = llm.get('vendor')
+                                llm_model = llm.get('model')
+                                llm_api_key = llm.get('apiKey')
+                                if config_data.get('relayUrl'):
+                                    relay_url = build_backend_url(agent.api_url, config_data['relayUrl'])
+                                    print(f"[AI Login] Using backend LLM relay: {relay_url}")
+                                if llm_api_key:
+                                    print(f"[AI Login] Using platform LLM: vendor={llm_vendor} model={llm_model}")
                 except Exception as e:
                     print(f"[AI Login] Could not fetch LLM config from backend: {e}")
 
-            if not anthropic_api_key:
-                anthropic_api_key = os.getenv('ANTHROPIC_API_KEY')
-                if anthropic_api_key:
+            use_backend_relay = bool(relay_url and agent_api_key)
+
+            # Env-var fallback is retained only for standalone/local execution
+            # when no agent relay is available.
+            if not use_backend_relay and not llm_api_key:
+                env_anthropic = os.getenv('ANTHROPIC_API_KEY')
+                env_google = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
+                if env_anthropic:
+                    llm_vendor = 'anthropic'
+                    llm_api_key = env_anthropic
                     print("[AI Login] Using Anthropic API key from environment variable (legacy)")
+                elif env_google:
+                    llm_vendor = 'google'
+                    llm_api_key = env_google
+                    print("[AI Login] Using Google/Gemini API key from environment variable (legacy)")
 
-            if not anthropic_api_key:
-                raise ValueError("No Anthropic API key available. Configure LLM in Administration > Integrations, or set ANTHROPIC_API_KEY environment variable.")
+            if not use_backend_relay and (not llm_api_key or not llm_vendor):
+                raise ValueError(
+                    "No LLM relay or API key available. Configure the platform LLM and "
+                    "agent backend relay, or set "
+                    "ANTHROPIC_API_KEY / GOOGLE_API_KEY in the agent environment."
+                )
 
-            client = Anthropic(api_key=anthropic_api_key)
+            anthropic_client = None
+            if use_backend_relay:
+                llm_vendor = 'backend_relay'
+            elif llm_vendor == 'anthropic':
+                from anthropic import Anthropic
+                anthropic_client = Anthropic(api_key=llm_api_key)
+            elif llm_vendor in ('google', 'gemini'):
+                # No SDK needed — ask_gemini uses aiohttp + the REST endpoint.
+                pass
+            else:
+                raise NotImplementedError(
+                    f"AI Login does not yet support LLM vendor '{llm_vendor}'. "
+                    "Use 'anthropic' or 'google'."
+                )
+
+            # Helper closure so the rest of the function stays vendor-agnostic.
+            async def _ask(screenshot_b64: str, text_prompt: str) -> dict:
+                return await ask_llm(
+                    vendor=llm_vendor,
+                    screenshot_b64=screenshot_b64,
+                    text_prompt=text_prompt,
+                    relay_url=relay_url,
+                    agent_api_key=agent_api_key,
+                    anthropic_client=anthropic_client,
+                    gemini_api_key=llm_api_key,
+                    gemini_model=llm_model,
+                    llm_timeout_seconds=llm_timeout_seconds,
+                )
+
             start_time = time.time()
             actions_count = 0
+            entry_url = (
+                protected_resource_url
+                if protected_resource_url and interactive_mfa
+                else login_url
+            )
+            if entry_url != login_url:
+                print(
+                    "[AI Login] Using protected resource as SSO entrypoint: "
+                    f"{entry_url} (loginUrl fallback: {login_url})"
+                )
 
             # Report progress
             if agent:
                 agent.report_progress(
-                    current_operation=f"Opening browser and navigating to: {login_url}",
-                    current_target=login_url
+                    current_operation=f"Opening browser and navigating to: {entry_url}",
+                    current_target=entry_url
                 )
 
             # Initialize Playwright with hardened browser settings
@@ -555,8 +1688,24 @@ class BrowserLoginAiTool(ToolPlugin):
 
                 try:
                     # Step 1: Navigate to login page
-                    print(f"[AI Login] Step 1: Navigating to {login_url}")
-                    await page.goto(login_url, wait_until='networkidle', timeout=timeout_seconds * 1000)
+                    print(f"[AI Login] Step 1: Navigating to {entry_url}")
+                    await page.goto(
+                        entry_url,
+                        wait_until=page_load_strategy,
+                        timeout=timeout_seconds * 1000,
+                    )
+                    if initial_render_wait_ms > 0:
+                        await asyncio.sleep(initial_render_wait_ms / 1000)
+
+                    opened_login_surface = await open_login_surface_if_needed(
+                        page,
+                        wait_ms=max(initial_render_wait_ms, 1000),
+                    )
+                    if opened_login_surface and agent:
+                        agent.report_progress(
+                            current_operation="Opened login form from page trigger",
+                            current_target=entry_url,
+                        )
                     await save_debug_screenshot(page, 1, "page_loaded", debug_screenshots)
 
                     # Step 2: Capture screenshot + HTML for hybrid AI analysis
@@ -574,12 +1723,37 @@ class BrowserLoginAiTool(ToolPlugin):
                             current_target=login_url
                         )
 
-                    # Step 3: Ask Claude for multi-strategy locators
-                    print("[AI Login] Step 3: Sending to Claude for analysis...")
-                    prompt = build_selector_prompt(form_html, login_instructions)
-                    selectors = await ask_claude(client, screenshot_b64, prompt)
-                    print(f"[AI Login]   Claude returned strategies for: {list(selectors.keys())}")
-                    actions_count += 1
+                    selectors = {}
+                    deterministic_form_filled = False
+
+                    if login_test_mode:
+                        print("[AI Login] Step 3: Trying deterministic login selectors before LLM")
+                        username_ok = await fill_field(page, USERNAME_FALLBACK_STRATEGIES, username, "username")
+                        password_ok = await fill_field(page, PASSWORD_FALLBACK_STRATEGIES, password, "password")
+                        if username_ok and password_ok:
+                            deterministic_form_filled = True
+                            actions_count += 2
+                            print("[AI Login]   Deterministic login field fill succeeded")
+                        else:
+                            print("[AI Login]   Deterministic login field fill incomplete; falling back to LLM")
+
+                    # Step 3: Ask the platform LLM for multi-strategy locators
+                    if not deterministic_form_filled:
+                        print(f"[AI Login] Step 3: Sending to LLM ({llm_vendor}) for analysis...")
+                        prompt = build_selector_prompt(form_html, login_instructions)
+                        try:
+                            selectors = await _ask(screenshot_b64, prompt)
+                            print(f"[AI Login]   LLM returned strategies for: {list(selectors.keys())}")
+                        except Exception as _ask_err:
+                            # Vision-LLM locator hinting is best-effort. If the model is
+                            # unavailable or returns unparseable output (common with some
+                            # local/Ollama-served models that emit chain-of-thought prose),
+                            # degrade gracefully to the deterministic fallback selector
+                            # strategies below instead of aborting the entire login.
+                            print(f"[AI Login]   LLM locator hint failed ({_ask_err}); "
+                                  f"falling back to deterministic selectors")
+                            selectors = {}
+                        actions_count += 1
 
                     # Step 4: Fill username using multi-strategy
                     print("[AI Login] Step 4: Filling username")
@@ -589,37 +1763,161 @@ class BrowserLoginAiTool(ToolPlugin):
                             current_target=login_url
                         )
 
-                    ok = await fill_field(page, selectors.get("usernameField", []), username, "username")
-                    if not ok:
-                        print("[AI Login] FATAL: Could not fill username field with any strategy")
-                        await save_debug_screenshot(page, 4, "username_failed", debug_screenshots)
-                        return {
-                            'success': False,
-                            'error': 'Could not fill username field - all locator strategies failed',
-                            'cookies': [],
-                            'storage_state': {}
-                        }
-                    await save_debug_screenshot(page, 4, "username_filled", debug_screenshots)
-                    actions_count += 1
+                    if not deterministic_form_filled:
+                        username_strategies = (selectors.get("usernameField", []) or []) + USERNAME_FALLBACK_STRATEGIES
+                        ok = await fill_field(page, username_strategies, username, "username")
+                        if not ok:
+                            print("[AI Login] FATAL: Could not fill username field with any strategy")
+                            await save_debug_screenshot(page, 4, "username_failed", debug_screenshots)
+                            return {
+                                'success': False,
+                                'error': 'Could not fill username field - all locator strategies failed',
+                                'cookies': [],
+                                'storage_state': {}
+                            }
+                        await save_debug_screenshot(page, 4, "username_filled", debug_screenshots)
+                        actions_count += 1
 
-                    # Step 5: Fill password using multi-strategy
+                    submit_strategies = (selectors.get("submitButton", []) or []) + SUBMIT_FALLBACK_STRATEGIES
+
+                    # Step 5: Fill password using multi-strategy. SSO flows
+                    # often split identity-provider login across screens:
+                    # email -> continue -> Microsoft/Okta -> password -> MFA.
+                    # Do not fail just because the first page has no password
+                    # field; advance through a small number of "next" surfaces.
                     print("[AI Login] Step 5: Filling password")
-                    ok = await fill_field(page, selectors.get("passwordField", []), password, "password")
-                    if not ok:
-                        print("[AI Login] FATAL: Could not fill password field with any strategy")
-                        await save_debug_screenshot(page, 5, "password_failed", debug_screenshots)
-                        return {
-                            'success': False,
-                            'error': 'Could not fill password field - all locator strategies failed',
-                            'cookies': [],
-                            'storage_state': {}
-                        }
-                    await save_debug_screenshot(page, 5, "password_filled", debug_screenshots)
-                    actions_count += 1
+                    if not deterministic_form_filled:
+                        fast_staged_login = login_test_mode or interactive_mfa
+                        password_strategies = (selectors.get("passwordField", []) or []) + PASSWORD_FALLBACK_STRATEGIES
+                        ok = await fill_field(
+                            page,
+                            password_strategies,
+                            password,
+                            "password",
+                            timeout_ms=1500 if fast_staged_login else 2500,
+                        )
+                        if not ok:
+                            username_strategies = (selectors.get("usernameField", []) or []) + USERNAME_FALLBACK_STRATEGIES
+                            for stage_attempt in range(3):
+                                print(
+                                    "[AI Login]   Password field not visible yet; "
+                                    f"advancing staged SSO/login flow ({stage_attempt + 1}/3)"
+                                )
+                                if agent:
+                                    agent.report_progress(
+                                        current_operation=(
+                                            "Advancing multi-step SSO/login flow before password entry"
+                                        ),
+                                        current_target=page.url or login_url,
+                                    )
+
+                                # Some IdPs ask for email again after the tenant
+                                # login page redirects to Microsoft/Okta/Google.
+                                await fill_field(
+                                    page,
+                                    username_strategies,
+                                    username,
+                                    f"username stage {stage_attempt + 1}",
+                                    timeout_ms=1200,
+                                )
+
+                                advanced = await click_element(
+                                    page,
+                                    submit_strategies,
+                                    f"continue_to_password_{stage_attempt + 1}",
+                                    timeout_ms=1200,
+                                )
+                                if not advanced:
+                                    print("[AI Login]   Could not advance staged login flow")
+                                    break
+                                actions_count += 1
+                                await asyncio.sleep(max(post_submit_wait_ms, 0) / 1000)
+                                try:
+                                    await page.wait_for_load_state(
+                                        page_load_strategy,
+                                        timeout=post_submit_load_timeout_ms,
+                                    )
+                                except Exception:
+                                    pass
+                                await save_debug_screenshot(
+                                    page,
+                                    5,
+                                    f"staged_login_{stage_attempt + 1}",
+                                    debug_screenshots,
+                                )
+
+                                # Refresh selectors after navigation/modal
+                                # changes. Try deterministic IdP selectors
+                                # first so Microsoft/Okta flows do not spend
+                                # a full LLM round trip on every transition.
+                                password_strategies = PASSWORD_FALLBACK_STRATEGIES
+                                ok = await fill_field(
+                                    page,
+                                    password_strategies,
+                                    password,
+                                    f"password stage {stage_attempt + 1}",
+                                    timeout_ms=1200,
+                                )
+                                if ok:
+                                    break
+
+                                if fast_staged_login:
+                                    # Interactive SSO tests must reach the MFA
+                                    # prompt quickly. Microsoft/Okta/Google
+                                    # screens are covered by deterministic
+                                    # selectors, so avoid spending a full LLM
+                                    # round trip on every "next" transition.
+                                    continue
+
+                                try:
+                                    stage_screenshot = await page.screenshot()
+                                    stage_b64 = base64.b64encode(stage_screenshot).decode("utf-8")
+                                    stage_html = extract_form_elements(await page.content())
+                                    stage_selectors = await _ask(
+                                        stage_b64,
+                                        build_selector_prompt(stage_html, login_instructions),
+                                    )
+                                    password_strategies = (
+                                        stage_selectors.get("passwordField", []) or []
+                                    ) + PASSWORD_FALLBACK_STRATEGIES
+                                    submit_strategies = (
+                                        stage_selectors.get("submitButton", []) or []
+                                    ) + submit_strategies
+                                    actions_count += 1
+                                except Exception as stage_err:
+                                    print(
+                                        "[AI Login]   Staged selector refresh failed "
+                                        f"({stage_err}); using deterministic selectors"
+                                    )
+
+                                ok = await fill_field(
+                                    page,
+                                    password_strategies,
+                                    password,
+                                    f"password stage {stage_attempt + 1}",
+                                    timeout_ms=1200,
+                                )
+                                if ok:
+                                    break
+
+                        if not ok:
+                            print("[AI Login] FATAL: Could not fill password field with any strategy")
+                            await save_debug_screenshot(page, 5, "password_failed", debug_screenshots)
+                            return {
+                                'success': False,
+                                'error': (
+                                    'Could not fill password field after staged SSO/login advances - '
+                                    'all locator strategies failed'
+                                ),
+                                'cookies': [],
+                                'storage_state': {}
+                            }
+                        await save_debug_screenshot(page, 5, "password_filled", debug_screenshots)
+                        actions_count += 1
 
                     # Step 6: Click submit using multi-strategy
                     print("[AI Login] Step 6: Clicking submit")
-                    ok = await click_element(page, selectors.get("submitButton", []), "submit")
+                    ok = await click_element(page, submit_strategies, "submit")
                     if not ok:
                         print("[AI Login] FATAL: Could not click submit button with any strategy")
                         await save_debug_screenshot(page, 6, "submit_failed", debug_screenshots)
@@ -632,9 +1930,12 @@ class BrowserLoginAiTool(ToolPlugin):
                     actions_count += 1
 
                     # Wait for navigation/response
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(max(post_submit_wait_ms, 0) / 1000)
                     try:
-                        await page.wait_for_load_state('networkidle', timeout=15000)
+                        await page.wait_for_load_state(
+                            page_load_strategy,
+                            timeout=post_submit_load_timeout_ms,
+                        )
                     except Exception:
                         pass
                     await save_debug_screenshot(page, 6, "post_submit", debug_screenshots)
@@ -660,7 +1961,17 @@ class BrowserLoginAiTool(ToolPlugin):
                         post_form_html = extract_form_elements(post_html)
 
                         post_prompt = build_post_submit_prompt(post_form_html, login_instructions)
-                        post_result = await ask_claude(client, post_b64, post_prompt)
+                        try:
+                            post_result = await _ask(post_b64, post_prompt)
+                        except Exception as classify_error:
+                            if protected_resource_url:
+                                print(
+                                    "[AI Login]   Post-submit page classification failed; "
+                                    "deferring to protected resource validation: "
+                                    f"{classify_error}"
+                                )
+                                break
+                            raise
                         status = post_result.get("status", "unknown")
                         print(f"[AI Login]   Page classification: {status}")
                         actions_count += 1
@@ -681,25 +1992,195 @@ class BrowserLoginAiTool(ToolPlugin):
                             }
 
                         if status != "mfa":
-                            print(f"[AI Login]   Unknown status '{status}', assuming success")
+                            if protected_resource_url:
+                                print(
+                                    f"[AI Login]   Unknown status '{status}', "
+                                    "deferring to protected resource validation"
+                                )
+                                break
+                            if login_test_mode:
+                                return {
+                                    'success': False,
+                                    'error': (
+                                        f"AI could not confirm login success (status={status}) "
+                                        "and no protectedResourceUrl was configured for validation."
+                                    ),
+                                    'cookies': [],
+                                    'storage_state': {}
+                                }
+                            print(f"[AI Login]   Unknown status '{status}', assuming success for non-test flow")
                             break
 
                         # MFA step detected
                         print(f"[AI Login]   MFA step {mfa_round} detected")
-                        code_strategies = post_result.get("codeField", [])
-                        mfa_submit_strategies = post_result.get("submitButton", [])
+                        detected_code_strategies = post_result.get("codeField", []) or []
+                        code_strategies = detected_code_strategies + OTP_FALLBACK_STRATEGIES
+                        mfa_submit_strategies = (
+                            post_result.get("submitButton", []) or []
+                        ) + SUBMIT_FALLBACK_STRATEGIES
+                        number_challenge = await extract_number_matching_challenge(page)
+                        llm_number_matching_code = normalize_number_matching_code(
+                            post_result.get("numberMatchingCode")
+                            or post_result.get("authenticatorNumber")
+                            or post_result.get("challengeCode")
+                            or post_result.get("displayValue")
+                        )
+                        if number_challenge.get("detected") and llm_number_matching_code:
+                            if not number_challenge.get("challengeCode"):
+                                number_challenge["challengeCode"] = llm_number_matching_code
+                                number_challenge["displayValue"] = llm_number_matching_code
+                            number_challenge["challengePrompt"] = (
+                                number_challenge.get("challengePrompt")
+                                or f"LLM extracted authenticator number {llm_number_matching_code} from the screenshot."
+                            )
+                        if number_challenge.get("detected") and not number_challenge.get("challengeCode"):
+                            if agent:
+                                agent.report_progress(
+                                    current_operation=(
+                                        f"MFA step {mfa_round}: waiting for authenticator number to render"
+                                    ),
+                                    current_target=page.url or login_url,
+                                )
+                            for _ in range(2):
+                                await asyncio.sleep(1)
+                                refreshed_number_challenge = await extract_number_matching_challenge(page)
+                                if refreshed_number_challenge.get("challengeCode"):
+                                    number_challenge = refreshed_number_challenge
+                                    break
+                        has_otp_field = (
+                            False
+                            if number_challenge.get("detected")
+                            else await has_visible_fillable_field(page, code_strategies, timeout_ms=800)
+                        )
 
                         if agent:
+                            if number_challenge.get("detected"):
+                                mfa_operation = "Waiting for operator to enter authenticator number"
+                            elif has_otp_field:
+                                mfa_operation = "Waiting for operator/auto-filled OTP"
+                            else:
+                                mfa_operation = "Waiting for push/method confirmation"
                             agent.report_progress(
-                                current_operation=f"MFA step {mfa_round}: {'Waiting for OTP auto-fill' if code_strategies else 'Method selection/confirmation'}",
+                                current_operation=(
+                                    f"MFA step {mfa_round}: {mfa_operation}"
+                                ),
                                 current_target=login_url
                             )
 
-                        # If there's an OTP code field, poll for auto-fill
-                        if code_strategies:
-                            print(f"[AI Login]   Waiting for OTP auto-fill (up to {mfa_auto_fill_timeout}s)...")
+                        # Number matching is a push-style challenge where the
+                        # operator types the browser number into Authenticator.
+                        number_matching_approved = False
+                        if number_challenge.get("detected"):
+                            challenge_code = number_challenge.get("challengeCode")
+                            print(
+                                "[AI Login]   Number matching MFA detected"
+                                + (f" (challenge: {challenge_code})" if challenge_code else "")
+                            )
+                            if interactive_mfa:
+                                request_id = f"{job_id or 'local'}-mfa-{mfa_round}-number"
+                                await request_operator_input(
+                                    agent,
+                                    job_id,
+                                    request_id,
+                                    kind="number_matching",
+                                    label=f"Authenticator number required (round {mfa_round})",
+                                    prompt=(
+                                        "Enter the number shown here in your authenticator app, "
+                                        "approve the sign-in request, then confirm below."
+                                    ),
+                                    helper_text=(
+                                        "This is not an OTP to type into xASM. Type the displayed number "
+                                        "in Microsoft Authenticator or the SSO app."
+                                    ),
+                                    current_target=page.url or login_url,
+                                    expires_in_seconds=mfa_auto_fill_timeout,
+                                    mfa_round=mfa_round,
+                                    challenge_code=challenge_code,
+                                    display_value=number_challenge.get("displayValue"),
+                                    challenge_prompt=number_challenge.get("challengePrompt"),
+                                )
+                                for elapsed in range(mfa_auto_fill_timeout):
+                                    operator_response = await consume_operator_input(
+                                        agent,
+                                        job_id,
+                                        request_id,
+                                    )
+                                    if operator_response:
+                                        print(
+                                            f"[AI Login]   Operator confirmed number matching after {elapsed+1}s"
+                                        )
+                                        number_matching_approved = True
+                                        break
+                                    if elapsed % 10 == 9:
+                                        print(
+                                            f"[AI Login]   Still waiting for number matching approval... ({elapsed+1}s)"
+                                        )
+                                    await asyncio.sleep(1)
+                                if not number_matching_approved:
+                                    return {
+                                        'success': False,
+                                        'error': (
+                                            f'Number matching MFA was not approved within '
+                                            f'{mfa_auto_fill_timeout} seconds'
+                                        ),
+                                        'cookies': [],
+                                        'storage_state': {},
+                                    }
+
+                        # If there's an OTP code field, poll while the operator
+                        # enters the code in the live browser or the IdP auto-fills it.
+                        elif has_otp_field:
+                            print(f"[AI Login]   Waiting for OTP/operator entry (up to {mfa_auto_fill_timeout}s)...")
                             otp_filled = False
+                            request_id = f"{job_id or 'local'}-mfa-{mfa_round}"
+                            if interactive_mfa:
+                                await request_operator_input(
+                                    agent,
+                                    job_id,
+                                    request_id,
+                                    kind="otp",
+                                    label=f"MFA code required (round {mfa_round})",
+                                    prompt=(
+                                        "Enter the one-time verification code shown by the identity provider. "
+                                        "The agent will fill it into the remote browser and continue."
+                                    ),
+                                    helper_text="Use this for SMS, email, authenticator app, or any OTP-style challenge.",
+                                    current_target=page.url or login_url,
+                                    expires_in_seconds=mfa_auto_fill_timeout,
+                                    mfa_round=mfa_round,
+                                )
                             for elapsed in range(mfa_auto_fill_timeout):
+                                if interactive_mfa and elapsed % 2 == 0:
+                                    operator_response = await consume_operator_input(
+                                        agent,
+                                        job_id,
+                                        request_id,
+                                    )
+                                    operator_code = (
+                                        operator_response.get("value", "").strip()
+                                        if operator_response
+                                        else ""
+                                    )
+                                    if operator_code:
+                                        print(
+                                            f"[AI Login]   Operator OTP received after {elapsed+1}s "
+                                            f"(value length: {len(operator_code)})"
+                                        )
+                                        if agent:
+                                            agent.report_progress(
+                                                current_operation="Operator MFA code received; filling verification field",
+                                                current_target=page.url or login_url,
+                                            )
+                                        otp_filled = await fill_field(
+                                            page,
+                                            code_strategies,
+                                            operator_code,
+                                            "operator OTP",
+                                            timeout_ms=1500,
+                                        )
+                                        if otp_filled:
+                                            break
+
                                 for strat in code_strategies:
                                     try:
                                         if strat.get("type") == "css":
@@ -718,7 +2199,7 @@ class BrowserLoginAiTool(ToolPlugin):
                                             val = await loc.input_value(timeout=2000)
 
                                         if val and val.strip():
-                                            print(f"[AI Login]   OTP auto-filled after {elapsed+1}s (value length: {len(val.strip())})")
+                                            print(f"[AI Login]   OTP detected after {elapsed+1}s (value length: {len(val.strip())})")
                                             otp_filled = True
                                             break
                                     except Exception:
@@ -726,33 +2207,120 @@ class BrowserLoginAiTool(ToolPlugin):
                                 if otp_filled:
                                     break
                                 if elapsed % 10 == 9:
-                                    print(f"[AI Login]   Still waiting for OTP... ({elapsed+1}s)")
+                                    print(f"[AI Login]   Still waiting for OTP/operator action... ({elapsed+1}s)")
                                 await asyncio.sleep(1)
 
                             if not otp_filled:
-                                print(f"[AI Login]   WARNING: OTP not auto-filled after {mfa_auto_fill_timeout}s")
+                                print(f"[AI Login]   WARNING: OTP was not provided after {mfa_auto_fill_timeout}s")
                         else:
-                            print("[AI Login]   No OTP code field (method selection or confirmation page)")
+                            print("[AI Login]   No OTP code field (method selection, WebAuthn, or push confirmation page)")
+                            if interactive_mfa:
+                                request_id = f"{job_id or 'local'}-mfa-{mfa_round}-action"
+                                await request_operator_input(
+                                    agent,
+                                    job_id,
+                                    request_id,
+                                    kind="push_or_webauthn",
+                                    label=f"Approve MFA challenge (round {mfa_round})",
+                                    prompt=(
+                                        "Approve the push/WebAuthn/SSO challenge in the identity provider, "
+                                        "then confirm in the modal so the agent can continue."
+                                    ),
+                                    helper_text="Use this when there is no OTP field, such as Microsoft Authenticator push or passkey prompts.",
+                                    current_target=page.url or login_url,
+                                    expires_in_seconds=mfa_auto_fill_timeout,
+                                    mfa_round=mfa_round,
+                                )
+                                for elapsed in range(mfa_auto_fill_timeout):
+                                    operator_response = await consume_operator_input(
+                                        agent,
+                                        job_id,
+                                        request_id,
+                                    )
+                                    if operator_response:
+                                        print(
+                                            f"[AI Login]   Operator confirmed MFA action after {elapsed+1}s"
+                                        )
+                                        break
+                                    if elapsed % 10 == 9:
+                                        print(
+                                            f"[AI Login]   Still waiting for operator MFA confirmation... ({elapsed+1}s)"
+                                        )
+                                    await asyncio.sleep(1)
 
                         await save_debug_screenshot(page, step_num, f"mfa_round{mfa_round}_before_submit", debug_screenshots)
 
+                        if number_matching_approved:
+                            if agent:
+                                agent.report_progress(
+                                    current_operation="Number matching approved; waiting for identity provider to continue",
+                                    current_target=page.url or login_url,
+                                )
+                            await asyncio.sleep(3)
+                            try:
+                                await page.wait_for_load_state(
+                                    page_load_strategy,
+                                    timeout=post_submit_load_timeout_ms,
+                                )
+                            except Exception:
+                                pass
+                            await save_debug_screenshot(page, step_num, f"mfa_round{mfa_round}_number_matching_approved", debug_screenshots)
+                            if protected_resource_url:
+                                print(
+                                    "[AI Login]   Number matching approved, deferring to protected resource validation"
+                                )
+                                break
+                            print(f"[AI Login]   Number matching approved, re-analyzing...")
+                            step_num += 1
+                            continue
+
                         # Click the MFA submit/continue button
                         print(f"[AI Login]   Clicking MFA submit/continue (round {mfa_round})")
-                        ok = await click_element(page, mfa_submit_strategies, "mfa_submit")
+                        ok = await click_element(
+                            page,
+                            mfa_submit_strategies,
+                            "mfa_submit",
+                            timeout_ms=1500,
+                        )
                         if not ok:
                             print("[AI Login]   WARNING: Could not click MFA submit button")
                             await save_debug_screenshot(page, step_num, f"mfa_round{mfa_round}_submit_failed", debug_screenshots)
-                            break
-                        actions_count += 1
+                            if has_otp_field:
+                                break
+                        else:
+                            actions_count += 1
 
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(max(post_submit_wait_ms, 0) / 1000)
                         try:
-                            await page.wait_for_load_state('networkidle', timeout=15000)
+                            await page.wait_for_load_state(
+                                page_load_strategy,
+                                timeout=post_submit_load_timeout_ms,
+                            )
                         except Exception:
                             pass
                         await save_debug_screenshot(page, step_num, f"mfa_round{mfa_round}_submitted", debug_screenshots)
                         print(f"[AI Login]   MFA round {mfa_round} submitted, re-analyzing...")
                         step_num += 1
+
+                    protected_validation = await validate_protected_resource_session(
+                        page,
+                        protected_resource_url,
+                        login_url=login_url,
+                        page_load_strategy=page_load_strategy,
+                        timeout_ms=max(post_submit_load_timeout_ms, 10000),
+                        settle_ms=max(initial_render_wait_ms, 1000),
+                        agent=agent,
+                    )
+                    if not protected_validation.get("valid"):
+                        error = protected_validation.get("reason") or "protected resource validation failed"
+                        print(f"[AI Login] Protected resource validation FAILED: {error}")
+                        return {
+                            'success': False,
+                            'error': error,
+                            'protected_resource_validation': protected_validation,
+                            'cookies': [],
+                            'storage_state': {}
+                        }
 
                     # Extract cookies and storage state
                     execution_time = time.time() - start_time
@@ -770,6 +2338,7 @@ class BrowserLoginAiTool(ToolPlugin):
                         'storage_state': storage_state,
                         'execution_time': execution_time,
                         'actions_count': actions_count,
+                        'protected_resource_validation': protected_validation,
                     }
 
                 finally:

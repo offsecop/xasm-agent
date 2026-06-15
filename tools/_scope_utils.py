@@ -34,6 +34,16 @@ def extract_rate_limit(parameters: dict) -> dict:
     return {}
 
 
+def extract_auth_cookie(parameters: dict) -> str:
+    """Return explicit or workflow-injected session cookies."""
+    return parameters.get("cookie") or parameters.get("authCookies") or ""
+
+
+def extract_auth_headers_file(parameters: dict) -> str:
+    """Return explicit or workflow-injected auth headers file."""
+    return parameters.get("headers_file") or parameters.get("authHeadersFile") or ""
+
+
 def filter_excluded_urls(urls: list, exclusion_url_patterns: list, log_prefix: str = "") -> list:
     """Filter URLs against exclusion patterns. Returns filtered list.
     Each pattern is treated as a regex match against the full URL.

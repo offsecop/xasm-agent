@@ -21,6 +21,8 @@ UA_PROFILES = {
     'bot': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
 }
 
+CLOAKING_DISTANCE_THRESHOLD = 0.55
+
 
 class BrandMonitorScreenshotTool(ToolPlugin):
     @property
@@ -510,49 +512,50 @@ class BrandMonitorScreenshotTool(ToolPlugin):
     def _detect_cloaking(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Compare screenshots across UA profiles to detect cloaking.
 
-        Uses perceptual hash Hamming distance when available, falls back to
-        SHA file hash comparison. Returns detected=True when any pair exceeds
-        the normalized distance threshold of 0.15.
+        Only bot-vs-human differences are cloaking candidates. Comparing
+        desktop and mobile directly creates false positives for ordinary
+        responsive layouts, especially parked-domain pages.
         """
         successful = [r for r in results if r.get('success') and r.get('filePath')]
-        if len(successful) < 2:
+        human_results = [r for r in successful if r.get('userAgent') in ('desktop', 'mobile')]
+        bot_results = [r for r in successful if r.get('userAgent') == 'bot']
+        if not human_results or not bot_results:
             return {'detected': False, 'score': 0.0}
 
         max_distance = 0.0
+        used_phash = False
 
-        # Try perceptual hash comparison first
-        phashes = []
-        for r in successful:
-            raw = r.get('perceptualHash')
-            if raw and raw.startswith('phash:'):
-                phashes.append((r, raw[len('phash:'):]))
+        try:
+            import imagehash
+            parsed = []
+            for r in successful:
+                raw = r.get('perceptualHash')
+                if raw and raw.startswith('phash:'):
+                    parsed.append((r, imagehash.hex_to_hash(raw[len('phash:'):])))
 
-        if len(phashes) >= 2:
-            try:
-                import imagehash
-                parsed = [(r, imagehash.hex_to_hash(h)) for r, h in phashes]
-                hash_bit_length = len(parsed[0][1].hash.flatten())
-                for i in range(len(parsed)):
-                    for j in range(i + 1, len(parsed)):
-                        hamming = parsed[i][1] - parsed[j][1]
+            parsed_humans = [(r, h) for r, h in parsed if r.get('userAgent') in ('desktop', 'mobile')]
+            parsed_bots = [(r, h) for r, h in parsed if r.get('userAgent') == 'bot']
+            if parsed_humans and parsed_bots:
+                used_phash = True
+                hash_bit_length = len(parsed_humans[0][1].hash.flatten())
+                for _, bot_hash in parsed_bots:
+                    for _, human_hash in parsed_humans:
+                        hamming = bot_hash - human_hash
                         normalized = hamming / hash_bit_length if hash_bit_length > 0 else 0.0
-                        if normalized > max_distance:
-                            max_distance = normalized
-            except Exception as e:
-                print(f"[BrandMonitor:Screenshot] pHash cloaking comparison failed, falling back to SHA: {e}")
-                phashes = []  # fall through to SHA comparison
+                        max_distance = max(max_distance, normalized)
+        except Exception as e:
+            print(f"[BrandMonitor:Screenshot] pHash cloaking comparison failed, falling back to SHA: {e}")
 
-        # Fallback: compare SHA file hashes
-        if len(phashes) < 2:
-            file_hashes = [r.get('fileHash') for r in successful if r.get('fileHash')]
-            unique_hashes = set(file_hashes)
-            if len(unique_hashes) > 1:
-                # Different file hashes = cloaking likely
+        # Fallback: only compare bot hashes against human hashes. SHA-only
+        # differences are noisy, so they are treated as strong only when all
+        # bot captures differ from all human captures and no pHash was usable.
+        if not used_phash:
+            human_hashes = {r.get('fileHash') for r in human_results if r.get('fileHash')}
+            bot_hashes = {r.get('fileHash') for r in bot_results if r.get('fileHash')}
+            if human_hashes and bot_hashes and human_hashes.isdisjoint(bot_hashes):
                 max_distance = 1.0
-            else:
-                max_distance = 0.0
 
-        detected = max_distance > 0.15
+        detected = max_distance >= CLOAKING_DISTANCE_THRESHOLD
         return {'detected': detected, 'score': round(max_distance, 4)}
 
 

@@ -9,6 +9,7 @@ import os
 import time
 from plugin_interface import ToolPlugin
 from typing import Dict, Any, Optional
+from urllib.parse import urlparse
 from tools.screenshot_utils import find_chrome_path, compute_sha256
 
 
@@ -112,6 +113,7 @@ class GoWitnessScreenshotTool(ToolPlugin):
                 total_items=len(targets_list)
             )
 
+        targets_list = [self._ensure_url(str(t)) for t in targets_list]
         screenshots = []
         all_raw = []
 
@@ -265,6 +267,17 @@ class GoWitnessScreenshotTool(ToolPlugin):
         elif 'target' in parameters and parameters['target']:
             return [parameters['target']]
         return []
+
+    def _ensure_url(self, raw_target: str) -> str:
+        target = raw_target.strip()
+        if not target:
+            return raw_target
+        if "://" in target:
+            return target
+        parsed = urlparse(f"//{target}", scheme="http")
+        if parsed.hostname:
+            return f"http://{target}"
+        return target
 
     def _find_recent_screenshot(self, directory: str) -> str:
         """Find the most recently created screenshot file."""

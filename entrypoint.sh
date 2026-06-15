@@ -32,6 +32,13 @@ server:
 
 heartbeat_interval: 30
 poll_interval: 5
+
+darkweb:
+  tor_proxy_url: "socks5://tor-proxy:9050"
+  enable_onion_sources: true
+  onion_sources_file: "tools/data/darkweb_onion_sources.json"
+  onion_use_browser: false
+  onion_fetch_timeout_seconds: 45
 YAML
   echo "[Entrypoint] Config generated: $CONFIG_FILE"
 fi

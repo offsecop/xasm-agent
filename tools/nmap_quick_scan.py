@@ -6,6 +6,7 @@ Scans top 1000 most common ports for fast results
 import asyncio
 import subprocess
 import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
 from plugin_interface import ToolPlugin
 
 
@@ -25,12 +26,12 @@ class NmapQuickScanTool(ToolPlugin):
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "IP address or hostname to scan"
+                    "description": "IP address, hostname, URL, or host:port to scan"
                 },
                 "targets": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Multiple IP addresses or hostnames to scan (alternative to target)"
+                    "description": "Multiple IP addresses, hostnames, URLs, or host:port targets to scan (alternative to target)"
                 }
             },
             "oneOf": [
@@ -79,10 +80,17 @@ class NmapQuickScanTool(ToolPlugin):
 
         try:
             for scan_target in targets:
-                # Nmap quick scan: top 1000 ports with service version detection
-                cmd = ["nmap", "-Pn", "-sV", "--top-ports", "1000", "-oX", "-", scan_target]
+                normalized_target, explicit_port = self._split_host_port(str(scan_target))
 
-                print(f"[Nmap Quick] Scanning top 1000 ports on {scan_target}")
+                # Nmap does not accept host:port or URL strings as scan
+                # targets. UI-created infra workflows naturally use
+                # frontend:3000/backend:3001 style targets, so preserve that
+                # UX while dispatching a valid host plus optional -p.
+                port_args = ["-p", str(explicit_port)] if explicit_port else ["--top-ports", "1000"]
+                cmd = ["nmap", "-Pn", "-sV", *port_args, "-oX", "-", normalized_target]
+
+                port_label = f"port {explicit_port}" if explicit_port else "top 1000 ports"
+                print(f"[Nmap Quick] Scanning {port_label} on {normalized_target}")
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -123,7 +131,8 @@ class NmapQuickScanTool(ToolPlugin):
                                     'port': int(port_id),
                                     'protocol': protocol,
                                     'state': 'open',
-                                    'target': scan_target
+                                    'target': normalized_target,
+                                    'originalTarget': scan_target
                                 }
 
                                 if service_elem is not None:
@@ -165,6 +174,28 @@ class NmapQuickScanTool(ToolPlugin):
                 "success": False,
                 "error": f"Error running Nmap quick scan: {str(e)}"
             }
+
+    def _split_host_port(self, raw_target: str):
+        """Return (host, port) for URL or host:port targets."""
+        target = raw_target.strip()
+        if not target:
+            return raw_target, None
+
+        try:
+            parsed = urlparse(target if "://" in target else f"//{target}", scheme="http")
+            host = parsed.hostname
+            port = parsed.port
+            if host:
+                return host, port
+        except ValueError:
+            pass
+
+        if ":" in target and target.count(":") == 1:
+            host_part, port_part = target.rsplit(":", 1)
+            if port_part.isdigit():
+                return host_part, int(port_part)
+
+        return target, None
 
 
 def get_tool():

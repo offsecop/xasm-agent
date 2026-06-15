@@ -39,6 +39,11 @@ class SubfinderEnumerateTool(ToolPlugin):
                     "type": "boolean",
                     "description": "Use all available sources for comprehensive enumeration (slower but more thorough)",
                     "default": False
+                },
+                "createAssets": {
+                    "type": "boolean",
+                    "description": "Create FQDN assets during ingestion. Set false when using a validation/promotion workflow.",
+                    "default": True
                 }
             },
             "oneOf": [
@@ -94,16 +99,17 @@ class SubfinderEnumerateTool(ToolPlugin):
             }
 
         all_sources = parameters.get('allSources', False)
+        create_assets = parameters.get('createAssets', True)
 
         # If multiple domains, enumerate each and aggregate
         if len(domains_list) > 1:
-            return await self._enumerate_multiple(domains_list, all_sources, agent)
+            return await self._enumerate_multiple(domains_list, all_sources, create_assets, agent)
 
         # Single domain enumeration
         domain = domains_list[0]
-        return await self._enumerate_single(domain, all_sources, agent)
+        return await self._enumerate_single(domain, all_sources, create_assets, agent)
 
-    async def _enumerate_single(self, domain: str, all_sources: bool, agent) -> Dict[str, Any]:
+    async def _enumerate_single(self, domain: str, all_sources: bool, create_assets: bool, agent) -> Dict[str, Any]:
         """Enumerate subdomains for a single domain."""
         start_time = time.time()
 
@@ -244,7 +250,8 @@ class SubfinderEnumerateTool(ToolPlugin):
                     'total': len(subdomains),
                     'sources': sources_count,
                     'tool': 'subfinder',
-                    'scan_type': 'enumerate'
+                    'scan_type': 'enumerate',
+                    'createAssets': create_assets,
                 },
                 'raw_output': raw_output
             }
@@ -279,7 +286,7 @@ class SubfinderEnumerateTool(ToolPlugin):
                 'raw_output': ''
             }
 
-    async def _enumerate_multiple(self, domains_list: list, all_sources: bool, agent) -> Dict[str, Any]:
+    async def _enumerate_multiple(self, domains_list: list, all_sources: bool, create_assets: bool, agent) -> Dict[str, Any]:
         """Enumerate subdomains for multiple domains and aggregate results."""
         start_time = time.time()
 
@@ -393,7 +400,8 @@ class SubfinderEnumerateTool(ToolPlugin):
                     'total': len(subdomains),
                     'sources': sources_count,
                     'tool': 'subfinder',
-                    'scan_type': 'enumerate'
+                    'scan_type': 'enumerate',
+                    'createAssets': create_assets,
                 },
                 'raw_output': raw_output
             }

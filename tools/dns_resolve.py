@@ -8,6 +8,7 @@ import ipaddress
 import json
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
+from urllib.parse import urlparse
 
 
 class DNSResolveTool(ToolPlugin):
@@ -26,7 +27,19 @@ class DNSResolveTool(ToolPlugin):
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "FQDN to resolve"
+                    "description": "FQDN, hostname, URL, or host:port value to resolve"
+                },
+                "hostname": {
+                    "type": "string",
+                    "description": "Hostname alias for target"
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host alias for target"
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Domain alias for target"
                 },
                 "targets": {
                     "type": "array",
@@ -41,7 +54,10 @@ class DNSResolveTool(ToolPlugin):
             },
             "oneOf": [
                 {"required": ["target"]},
-                {"required": ["targets"]}
+                {"required": ["targets"]},
+                {"required": ["hostname"]},
+                {"required": ["host"]},
+                {"required": ["domain"]}
             ]
         }
 
@@ -65,7 +81,7 @@ class DNSResolveTool(ToolPlugin):
         if not targets_list:
             # If targets was explicitly provided as empty (e.g., from a previous step
             # that found nothing), return success with 0 results instead of erroring.
-            has_explicit_targets = 'targets' in parameters or 'target' in parameters
+            has_explicit_targets = any(k in parameters for k in ('targets', 'target', 'hostname', 'host', 'domain'))
             if has_explicit_targets:
                 print("[DNS Resolve] Received empty targets list from previous step — nothing to resolve")
                 return {
@@ -232,16 +248,34 @@ class DNSResolveTool(ToolPlugin):
             targets_param = parameters['targets']
             if isinstance(targets_param, str):
                 try:
-                    return json.loads(targets_param)
+                    targets = json.loads(targets_param)
                 except json.JSONDecodeError:
-                    return [targets_param]
+                    targets = [targets_param]
             elif isinstance(targets_param, list):
-                return targets_param
+                targets = targets_param
             else:
-                return [str(targets_param)]
-        elif 'target' in parameters and parameters['target']:
-            return [parameters['target']]
+                targets = [str(targets_param)]
+            return [self._normalize_hostname(str(t)) for t in targets if str(t).strip()]
+        for key in ('target', 'hostname', 'host', 'domain'):
+            if key in parameters and parameters[key]:
+                return [self._normalize_hostname(str(parameters[key]))]
         return []
+
+    def _normalize_hostname(self, raw_target: str) -> str:
+        target = raw_target.strip()
+        if not target:
+            return raw_target
+        try:
+            parsed = urlparse(target if '://' in target else f'//{target}', scheme='http')
+            if parsed.hostname:
+                return parsed.hostname
+        except ValueError:
+            pass
+        if ':' in target and target.count(':') == 1:
+            host_part, port_part = target.rsplit(':', 1)
+            if port_part.isdigit():
+                return host_part
+        return target
 
     def _is_ip(self, value: str) -> bool:
         """Check if value is an IP address (IPv4 or IPv6)"""

@@ -63,6 +63,14 @@ class ArjunParameterDiscoveryTool(ToolPlugin):
                     "type": "string",
                     "description": "Cookie header value for authenticated scanning"
                 },
+                "authCookies": {
+                    "type": "string",
+                    "description": "Session cookies injected by authentication steps"
+                },
+                "authHeadersFile": {
+                    "type": "string",
+                    "description": "Headers file injected by authentication steps"
+                },
                 "stable": {
                     "type": "boolean",
                     "description": "Only return stable/confirmed parameters (default: true)",
@@ -126,8 +134,9 @@ class ArjunParameterDiscoveryTool(ToolPlugin):
             targets_list = targets_list[:max_targets]
 
         methods = parameters.get('methods', 'GET')
-        headers_file = parameters.get('headers_file')
-        cookie = parameters.get('cookie')
+        from tools._scope_utils import extract_auth_cookie, extract_auth_headers_file
+        headers_file = extract_auth_headers_file(parameters)
+        cookie = extract_auth_cookie(parameters)
         stable = parameters.get('stable', True)
         threads = parameters.get('threads', 5)
         agent = parameters.get('_agent')

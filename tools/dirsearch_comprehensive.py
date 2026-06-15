@@ -19,7 +19,12 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
-from tools._dirsearch_base import filter_results, ensure_dicc_wordlist
+from tools._dirsearch_base import (
+    describe_wordlist_selection,
+    ensure_dicc_wordlist,
+    filter_results,
+    resolve_dirsearch_wordlist,
+)
 
 # Comprehensive extensions - includes backup and config files
 COMPREHENSIVE_EXTENSIONS = "php,aspx,jsp,html,js,css,json,xml,zip,tar,gz,bkp,sql,bak,old,swp,config,conf,ini,log,txt"
@@ -52,6 +57,20 @@ class DirsearchComprehensiveTool(ToolPlugin):
                     "type": "string",
                     "description": f"File extensions to search (default: {COMPREHENSIVE_EXTENSIONS})"
                 },
+                "extraWordlist": {
+                    "type": "string",
+                    "description": "Optional extra wordlist path to merge with the comprehensive dirsearch wordlist"
+                },
+                "extraWordlists": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional extra wordlist paths to merge with the comprehensive dirsearch wordlist"
+                },
+                "includeFuzzWordlist": {
+                    "type": "boolean",
+                    "description": "Automatically include /app/wordlists/fuzz.txt when available (default: true)",
+                    "default": True
+                },
                 "maxTargets": {
                     "type": "integer",
                     "description": "Maximum number of targets to scan from array (default: 5)",
@@ -64,6 +83,14 @@ class DirsearchComprehensiveTool(ToolPlugin):
                 "cookie": {
                     "type": "string",
                     "description": "Cookie header value for direct injection"
+                },
+                "authCookies": {
+                    "type": "string",
+                    "description": "Session cookies injected by authentication steps"
+                },
+                "authHeadersFile": {
+                    "type": "string",
+                    "description": "Headers file injected by authentication steps"
                 }
             },
             "oneOf": [
@@ -117,8 +144,9 @@ class DirsearchComprehensiveTool(ToolPlugin):
             targets_list = targets_list[:max_targets]
         
         extensions = parameters.get('extensions', COMPREHENSIVE_EXTENSIONS)
-        headers_file = parameters.get('headers_file')
-        cookie = parameters.get('cookie')
+        from tools._scope_utils import extract_auth_cookie, extract_auth_headers_file
+        headers_file = extract_auth_headers_file(parameters)
+        cookie = extract_auth_cookie(parameters)
         agent = parameters.get('_agent')
 
         # Apply exclusion filtering to targets
@@ -150,12 +178,16 @@ class DirsearchComprehensiveTool(ToolPlugin):
 
             # Try to use dicc.txt as default
             wordlist_to_use = ensure_dicc_wordlist()
-            if wordlist_to_use:
-                if agent:
-                    agent.append_output(f"[Dirsearch Comprehensive] Using dicc.txt wordlist with extended extensions")
-            else:
-                if agent:
-                    agent.append_output(f"[Dirsearch Comprehensive] Using built-in wordlist with extended extensions")
+            wordlist_to_use, wordlist_info = resolve_dirsearch_wordlist(
+                default_wordlist=wordlist_to_use,
+                parameters=parameters,
+                tool_label="Dirsearch Comprehensive",
+            )
+            if agent:
+                agent.append_output(
+                    "[Dirsearch Comprehensive] Using "
+                    f"{describe_wordlist_selection(wordlist_info)} with extended extensions"
+                )
 
             # Aggregate results from all targets
             all_endpoints = []

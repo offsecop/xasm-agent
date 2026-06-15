@@ -14,6 +14,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
+from tools._katana_common import add_katana_options, extend_katana_schema, get_auth_cookie, get_headers_file
 
 class KatanaCrawlTool(ToolPlugin):
     @property
@@ -28,7 +29,7 @@ class KatanaCrawlTool(ToolPlugin):
     def schema(self) -> Dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
+            "properties": extend_katana_schema({
                 "target": {
                     "type": "string",
                     "description": "Base URL to crawl (e.g., http://example.com)"
@@ -48,6 +49,11 @@ class KatanaCrawlTool(ToolPlugin):
                     "description": "Maximum number of URLs to crawl (prevents excessive output)",
                     "default": 1000
                 },
+                "crawlTimeoutSeconds": {
+                    "type": "integer",
+                    "description": "Maximum Katana crawl duration in seconds",
+                    "default": 180
+                },
                 "maxTargets": {
                     "type": "integer",
                     "description": "Maximum number of targets to crawl from array (default: 10)",
@@ -61,7 +67,7 @@ class KatanaCrawlTool(ToolPlugin):
                     "type": "string",
                     "description": "Cookie header value for direct injection (alternative to headers_file)"
                 }
-            },
+            }),
             "oneOf": [
                 {"required": ["target"]},
                 {"required": ["targets"]}
@@ -110,14 +116,14 @@ class KatanaCrawlTool(ToolPlugin):
             }
 
         # Apply maxTargets limit
-        max_targets = parameters.get('maxTargets', 10)
+        max_targets = int(parameters.get('maxTargets', 10) or 10)
         if len(targets_list) > max_targets:
             targets_list = targets_list[:max_targets]
 
         depth = parameters.get('depth', 2)
-        max_urls = parameters.get('max_urls', 1000)  # Limit URLs to prevent excessive output
-        headers_file = parameters.get('headers_file')  # Optional auth headers file
-        cookie = parameters.get('cookie')  # Optional cookie string
+        max_urls = int(parameters.get('max_urls', 1000) or 1000)  # Limit URLs to prevent excessive output
+        headers_file = get_headers_file(parameters)  # Optional auth headers file
+        cookie = get_auth_cookie(parameters)  # Optional cookie string
         agent = parameters.get('_agent')  # Get agent reference for progress
 
         # Extract exclusion and rate limiting
@@ -142,6 +148,9 @@ class KatanaCrawlTool(ToolPlugin):
 
 
         try:
+            crawl_timeout_seconds = int(parameters.get('crawlTimeoutSeconds') or parameters.get('crawlTimeout') or 180)
+            crawl_timeout_seconds = max(30, min(crawl_timeout_seconds, 600))
+
             # Execution metrics
             execution_start = time.time()
             execution_metrics = {
@@ -158,7 +167,7 @@ class KatanaCrawlTool(ToolPlugin):
                 if headers_file or cookie:
                     operation_desc += " [authenticated]"
                 agent.report_progress(
-                    current_operation=operation_desc,
+                    current_operation=f"{operation_desc} (limit {crawl_timeout_seconds}s)",
                     current_target=target,
                     items_processed=0,
                     total_items=None
@@ -166,20 +175,12 @@ class KatanaCrawlTool(ToolPlugin):
 
             # Run Katana crawler using asyncio for proper timeout handling
             # -nc (no-color) prevents ANSI escape codes from corrupting JSONL output
-            # -ct limits crawl duration to prevent excessive output (3 minutes max)
-            cmd = ['katana', '-u', target, '-d', str(depth), '-ct', '3m', '-jsonl', '-silent', '-nc']
+            # -ct limits crawl duration to prevent excessive output.
+            cmd = ['katana', '-u', target, '-d', str(depth), '-ct', f'{crawl_timeout_seconds}s', '-jsonl', '-silent', '-nc']
 
-            # Add rate limiting
+            cmd = add_katana_options(cmd, parameters, rate_limit_config)
             if rate_limit_config:
-                cmd.extend(['-rl', str(rate_limit_config['rateLimit'])])
                 print(f"[Katana] Rate limit: {rate_limit_config['rateLimit']} req/s")
-
-            # Add authentication if provided
-            import os
-            if headers_file and os.path.exists(headers_file):
-                cmd.extend(['-H', f'@{headers_file}'])
-            elif cookie:
-                cmd.extend(['-H', f'Cookie: {cookie}'])
 
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -195,7 +196,7 @@ class KatanaCrawlTool(ToolPlugin):
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=180  # 3 minutes - sufficient for small sites
+                    timeout=crawl_timeout_seconds + 20
                 )
             except asyncio.TimeoutError:
                 # Kill the process if it times out
@@ -235,11 +236,13 @@ class KatanaCrawlTool(ToolPlugin):
                                     if endpoint_url not in urls_set:
                                         urls_set.add(endpoint_url)
                                         urls.append(endpoint_url)
+                                        if len(urls) >= max_urls:
+                                            break
                             except json.JSONDecodeError:
                                 pass
 
                     return {
-                        'error': f'Katana crawl timed out after 3 minutes for {target} (partial results included)',
+                        'error': f'Katana crawl timed out after {crawl_timeout_seconds} seconds for {target} (partial results included)',
                         'endpoints': endpoints,
                         'urls': urls,
                         'totalEndpoints': len(endpoints),
@@ -248,7 +251,7 @@ class KatanaCrawlTool(ToolPlugin):
                     }
 
                 return {
-                    'error': f'Katana crawl timed out after 3 minutes for {target}',
+                    'error': f'Katana crawl timed out after {crawl_timeout_seconds} seconds for {target}',
                     'endpoints': [],
                     'urls': [],
                     'totalEndpoints': 0,
@@ -332,6 +335,8 @@ class KatanaCrawlTool(ToolPlugin):
                             if endpoint_url not in urls_set:
                                 urls_set.add(endpoint_url)
                                 urls.append(endpoint_url)
+                                if len(urls) >= max_urls:
+                                    break
                     except json.JSONDecodeError as e:
                         parse_errors += 1
                         continue
@@ -411,8 +416,6 @@ class KatanaCrawlTool(ToolPlugin):
         parameters: Dict[str, Any]
     ) -> list:
         """Crawl multiple targets and return a list of per-target results"""
-        import os
-
         if agent:
             agent.report_progress(
                 current_operation=f"Starting Katana crawl on {len(targets_list)} targets",
@@ -439,13 +442,7 @@ class KatanaCrawlTool(ToolPlugin):
             # Add rate limiting
             from tools._scope_utils import extract_rate_limit
             rl = extract_rate_limit(parameters)
-            if rl:
-                cmd.extend(['-rl', str(rl['rateLimit'])])
-
-            if headers_file and os.path.exists(headers_file):
-                cmd.extend(['-H', f'@{headers_file}'])
-            elif cookie:
-                cmd.extend(['-H', f'Cookie: {cookie}'])
+            cmd = add_katana_options(cmd, parameters, rl)
 
             try:
                 process = await asyncio.create_subprocess_exec(

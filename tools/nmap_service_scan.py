@@ -8,6 +8,7 @@ import json
 import xml.etree.ElementTree as ET
 from plugin_interface import ToolPlugin
 from typing import Dict, Any
+from urllib.parse import urlparse
 
 
 class NmapServiceScanTool(ToolPlugin):
@@ -26,7 +27,7 @@ class NmapServiceScanTool(ToolPlugin):
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "IP address to scan"
+                    "description": "IP address, hostname, URL, or host:port to scan"
                 },
                 "targets": {
                     "type": "array",
@@ -63,7 +64,7 @@ class NmapServiceScanTool(ToolPlugin):
 
     async def execute(self, parameters: Dict[str, Any]) -> Any:
         agent = parameters.get('_agent')
-        port = parameters.get('port', 80)
+        port = parameters.get('port')
 
         # Resolve targets list
         targets_list = self._resolve_targets(parameters)
@@ -80,6 +81,17 @@ class NmapServiceScanTool(ToolPlugin):
                 },
                 'raw_output': ''
             }
+
+        normalized_targets = []
+        derived_port = port
+        for raw_target in targets_list:
+            normalized_target, explicit_port = self._split_host_port(str(raw_target))
+            normalized_targets.append(normalized_target)
+            if derived_port is None and explicit_port is not None:
+                derived_port = explicit_port
+
+        port = int(derived_port or 80)
+        targets_list = normalized_targets
 
         # Apply maxTargets limit
         max_targets = parameters.get('maxTargets', 20)
@@ -201,6 +213,28 @@ class NmapServiceScanTool(ToolPlugin):
         elif 'target' in parameters and parameters['target']:
             return [parameters['target']]
         return []
+
+    def _split_host_port(self, raw_target: str):
+        """Return (host, port) for URL or host:port targets."""
+        target = raw_target.strip()
+        if not target:
+            return raw_target, None
+
+        try:
+            parsed = urlparse(target if "://" in target else f"//{target}", scheme="http")
+            host = parsed.hostname
+            port = parsed.port
+            if host:
+                return host, port
+        except ValueError:
+            pass
+
+        if ":" in target and target.count(":") == 1:
+            host_part, port_part = target.rsplit(":", 1)
+            if port_part.isdigit():
+                return host_part, int(port_part)
+
+        return target, None
 
     def _parse_nmap_output(self, xml_output: str, port: int) -> dict:
         """Parse Nmap XML output to extract service information"""
