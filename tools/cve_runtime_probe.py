@@ -846,6 +846,8 @@ def _normalize_nuclei_finding(
     request = raw.get("request") or raw.get("curl-command") or _request_line(str(matched_at))
     response = raw.get("response") or raw.get("extracted-results") or raw.get("matcher-status")
     matched_content = _format_matched_content(cve_id, cve_record, raw)
+    request_evidence = _stringify_evidence(request, 6000)
+    response_evidence = _stringify_evidence(response, 8000)
     return {
         "template-id": f"cve-runtime-{safe_template_id}",
         "templateID": f"cve-runtime-{safe_template_id}",
@@ -854,6 +856,10 @@ def _normalize_nuclei_finding(
         "matched-at": matched_at,
         "matcher-name": raw.get("matcher-name") or "local-nuclei-cve-template",
         "extracted-results": _coerce_string_list(raw.get("extracted-results")) or [cve_id],
+        "matched-content": matched_content,
+        "matchedContent": matched_content,
+        "request": request_evidence,
+        "response": response_evidence,
         "info": {
             "name": f"Runtime validated CVE: {name}",
             "description": (
@@ -891,8 +897,8 @@ def _normalize_nuclei_finding(
             "target": target,
             "packages": cve_record.get("packages", []),
             "scripts": cve_record.get("scripts", []),
-            "request": _stringify_evidence(request, 6000),
-            "response": _stringify_evidence(response, 8000),
+            "request": request_evidence,
+            "response": response_evidence,
             "matchedContent": matched_content,
             "externalExploitLookup": False,
             "publicExploitIntel": public_intel,
@@ -1584,6 +1590,9 @@ def _normalize_bootstrap_context_finding(
         or strong_signal.get("snippet")
         or _format_bootstrap_context_content(context, package_label)
     )
+    matched_content = _format_bootstrap_context_content(context, package_label)
+    request_evidence = _stringify_evidence(request, 3000)
+    response_evidence = _stringify_evidence(response, 6000)
     references = dedupe_keep_order(
         [
             *[
@@ -1613,6 +1622,10 @@ def _normalize_bootstrap_context_finding(
         "matched-at": matched_at,
         "matcher-name": "bootstrap-xss-contextual-runtime-probe",
         "extracted-results": [package_label, *cve_ids],
+        "matched-content": matched_content,
+        "matchedContent": matched_content,
+        "request": request_evidence,
+        "response": response_evidence,
         "info": {
             "name": f"{title}: {package_label}",
             "description": (
@@ -1644,9 +1657,9 @@ def _normalize_bootstrap_context_finding(
             "runtimeContextValidated": True,
             "confidence": context.get("confidence"),
             "target": target,
-            "matchedContent": _format_bootstrap_context_content(context, package_label),
-            "request": _stringify_evidence(request, 3000),
-            "response": _stringify_evidence(response, 6000),
+            "matchedContent": matched_content,
+            "request": request_evidence,
+            "response": response_evidence,
             "bootstrapScripts": context.get("bootstrapScripts", []),
             "pageSignals": context.get("pageSignals", []),
             "scriptSignals": context.get("scriptSignals", []),
@@ -1836,6 +1849,9 @@ def _normalize_angularjs_context_finding(
         or strong_signal.get("snippet")
         or _format_angularjs_context_content(context, package_label)
     )
+    matched_content = _format_angularjs_context_content(context, package_label)
+    request_evidence = _stringify_evidence(request, 3000)
+    response_evidence = _stringify_evidence(response, 6000)
     references = dedupe_keep_order(
         [
             *[
@@ -1865,6 +1881,10 @@ def _normalize_angularjs_context_finding(
         "matched-at": matched_at,
         "matcher-name": "angularjs-contextual-runtime-probe",
         "extracted-results": [package_label, *cve_ids],
+        "matched-content": matched_content,
+        "matchedContent": matched_content,
+        "request": request_evidence,
+        "response": response_evidence,
         "info": {
             "name": f"{title}: {package_label}",
             "description": (
@@ -1896,9 +1916,9 @@ def _normalize_angularjs_context_finding(
             "runtimeContextValidated": True,
             "confidence": context.get("confidence"),
             "target": target,
-            "matchedContent": _format_angularjs_context_content(context, package_label),
-            "request": _stringify_evidence(request, 3000),
-            "response": _stringify_evidence(response, 6000),
+            "matchedContent": matched_content,
+            "request": request_evidence,
+            "response": response_evidence,
             "angularScripts": context.get("angularScripts", []),
             "pageSignals": context.get("pageSignals", []),
             "scriptSignals": context.get("scriptSignals", []),
@@ -2091,6 +2111,9 @@ def _normalize_dompurify_context_finding(
         ],
         fallback=_format_dompurify_context_content(context, package_label),
     )
+    matched_content = _format_dompurify_context_content(context, package_label)
+    request_evidence = _stringify_evidence(request, 4000)
+    response_evidence = _stringify_evidence(response, 7000)
     references = dedupe_keep_order(
         [
             *[
@@ -2115,6 +2138,10 @@ def _normalize_dompurify_context_finding(
         "matched-at": matched_at,
         "matcher-name": "dompurify-contextual-runtime-probe",
         "extracted-results": [package_label, *cve_ids],
+        "matched-content": matched_content,
+        "matchedContent": matched_content,
+        "request": request_evidence,
+        "response": response_evidence,
         "info": {
             "name": f"Contextual DOMPurify CVE exposure: {package_label}",
             "description": (
@@ -2142,9 +2169,9 @@ def _normalize_dompurify_context_finding(
             "runtimeContextValidated": True,
             "confidence": context.get("confidence"),
             "target": target,
-            "matchedContent": _format_dompurify_context_content(context, package_label),
-            "request": _stringify_evidence(request, 4000),
-            "response": _stringify_evidence(response, 7000),
+            "matchedContent": matched_content,
+            "request": request_evidence,
+            "response": response_evidence,
             "dompurifyScripts": context.get("dompurifyScripts", []),
             "pageSignals": context.get("pageSignals", []),
             "scriptSignals": context.get("scriptSignals", []),

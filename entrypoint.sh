@@ -2,19 +2,15 @@
 # Agent entrypoint: generate config if missing, update nuclei templates, run agent
 set -e
 
-CONFIG_FILE="${CONFIG_FILE:-config.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-config.docker.yaml}"
 
-# Auto-generate config YAML if it doesn't exist
+# Auto-generate config YAML if it doesn't exist.
+# Phase 3a (2026-05-16) collapsed per-agent configs into one shared config.docker.yaml.
+# Per-instance identity (WP4) comes from AGENT_CLIENT_ID/AGENT_CLIENT_SECRET +
+# AGENT_INSTALLATION_UID (set per-service in docker-compose) — the instance
+# self-enrolls for its own key. AGENT_NAME is set per-service too.
 if [ ! -f "$CONFIG_FILE" ]; then
-  # Determine agent name/index from config file name
-  case "$CONFIG_FILE" in
-    config.docker.yaml|config.yaml) AGENT_NAME="Agent-001"; AGENT_IDX=1 ;;
-    config.agent2.yaml)             AGENT_NAME="Agent-002"; AGENT_IDX=2 ;;
-    config.agent3.yaml)             AGENT_NAME="Agent-003"; AGENT_IDX=3 ;;
-    config.agent4.yaml)             AGENT_NAME="Agent-004"; AGENT_IDX=4 ;;
-    config.agent5.yaml)             AGENT_NAME="Agent-005"; AGENT_IDX=5 ;;
-    *)                              AGENT_NAME="Agent-001"; AGENT_IDX=1 ;;
-  esac
+  AGENT_NAME="${AGENT_NAME:-Agent-001}"
 
   echo "[Entrypoint] Generating $CONFIG_FILE for $AGENT_NAME..."
   cat > "$CONFIG_FILE" <<YAML
@@ -27,8 +23,6 @@ agent:
 
 server:
   api_url: "http://backend:3001/api"
-  ws_url: "ws://backend:3001/agent-ws"
-  api_key: ""
 
 heartbeat_interval: 30
 poll_interval: 5

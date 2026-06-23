@@ -10,6 +10,8 @@ from plugin_interface import ToolPlugin
 from typing import Dict, Any
 from urllib.parse import urlparse
 
+from lib.wrapper_helpers import resolve_targets as _resolve_targets
+
 
 class NmapServiceScanTool(ToolPlugin):
     @property
@@ -67,7 +69,7 @@ class NmapServiceScanTool(ToolPlugin):
         port = parameters.get('port')
 
         # Resolve targets list
-        targets_list = self._resolve_targets(parameters)
+        targets_list = _resolve_targets(parameters)
         if not targets_list:
             return {
                 'success': False,
@@ -196,23 +198,6 @@ class NmapServiceScanTool(ToolPlugin):
             },
             'raw_output': raw_output
         }
-
-    def _resolve_targets(self, parameters: Dict[str, Any]) -> list:
-        """Resolve target/targets parameter into a list."""
-        if 'targets' in parameters and parameters['targets']:
-            targets_param = parameters['targets']
-            if isinstance(targets_param, str):
-                try:
-                    return json.loads(targets_param)
-                except json.JSONDecodeError:
-                    return [targets_param]
-            elif isinstance(targets_param, list):
-                return targets_param
-            else:
-                return [str(targets_param)]
-        elif 'target' in parameters and parameters['target']:
-            return [parameters['target']]
-        return []
 
     def _split_host_port(self, raw_target: str):
         """Return (host, port) for URL or host:port targets."""

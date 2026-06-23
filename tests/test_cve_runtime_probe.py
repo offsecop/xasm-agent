@@ -183,6 +183,8 @@ class CveRuntimeProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finding["info"]["severity"], "high")
         self.assertTrue(finding["evidence"]["runtimeExploitValidated"])
         self.assertIn("GET /?q=xasm_bootstrap_probe_7d6f8c", finding["evidence"]["request"])
+        self.assertIn("GET /?q=xasm_bootstrap_probe_7d6f8c", finding["request"])
+        self.assertIn("xasm_bootstrap_probe_7d6f8c", finding["response"])
 
     def test_angularjs_context_probe_detects_strong_runtime_surface(self):
         cve_records = {
@@ -230,6 +232,8 @@ class CveRuntimeProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finding["info"]["severity"], "medium")
         self.assertTrue(finding["evidence"]["runtimeContextValidated"])
         self.assertIn("angularjs@1.5.11", finding["info"]["name"])
+        self.assertIn("GET /profile", finding["request"])
+        self.assertIn("ng-bind-html", finding["response"])
 
     def test_dompurify_context_probe_detects_runtime_sanitizer_surface(self):
         cve_records = {
@@ -277,6 +281,9 @@ class CveRuntimeProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(finding["evidence"]["runtimeContextValidated"])
         self.assertIn("GET /api/docs/swagger-ui-bundle.js", finding["evidence"]["request"])
         self.assertIn("DOMPurify.sanitize", finding["evidence"]["response"])
+        self.assertIn("GET /api/docs/swagger-ui-bundle.js", finding["request"])
+        self.assertIn("DOMPurify.sanitize", finding["response"])
+        self.assertIn("DOMPurify@2.3.3", finding["matchedContent"])
 
     def test_runtime_coverage_explains_template_only_gap(self):
         coverage = _build_cve_runtime_coverage(

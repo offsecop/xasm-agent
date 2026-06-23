@@ -28,17 +28,17 @@ def load_config(config_file='config.yaml'):
             },
             'server': {
                 'api_url': os.environ.get('AGENT_API_URL', 'http://localhost:3001/api'),
-                'api_key': os.environ.get('AGENT_API_KEY', ''),
+                # Per-instance identity (WP4): the instance enrolls itself via
+                # these tenant installer creds — there is no static api_key.
                 'client_id': os.environ.get('AGENT_CLIENT_ID', ''),
                 'client_secret': os.environ.get('AGENT_CLIENT_SECRET', ''),
-                'enrollment_id': os.environ.get('AGENT_ENROLLMENT_ID', ''),
-                'enrollment_token': os.environ.get('AGENT_ENROLLMENT_TOKEN', ''),
             },
             'heartbeat_interval': 30,
             'poll_interval': 30,
             'pubsub': {
+                # Push-only delivery (POST /pubsub/push) + GET /agents/poll/jobs
+                # backstop. No pull subscription, so no subscription_id needed here.
                 'project_id': os.environ.get('GCP_PROJECT_ID', 'xasm-local'),
-                'subscription_id': os.environ.get('PUBSUB_SUBSCRIPTION_ID', 'agent-push'),
             },
         }
 

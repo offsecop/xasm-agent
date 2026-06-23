@@ -112,6 +112,12 @@ class BrandMonitorScreenshotTool(ToolPlugin):
         output_dir = parameters.get('outputDir', '/app-storage/screenshots')
         max_targets = parameters.get('maxTargets', 50)
         enable_multi_ua = parameters.get('enableMultiUA', False)
+        # Cloud GCS write path: backend dispatches storageDriver (default "local")
+        # and screenshotKeyPrefix (literal "screenshots"). When the driver is
+        # "local" the GCS branch in _capture_screenshot is skipped entirely and
+        # behaviour is byte-identical to today (gowitness writes the shared volume).
+        storage_driver = (parameters.get('storageDriver') or 'local')
+        screenshot_key_prefix = parameters.get('screenshotKeyPrefix', 'screenshots')
 
         if not targets:
             return {
@@ -170,6 +176,8 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                         output_dir=output_dir,
                         user_agent_key=ua_key,
                         user_agent_string=ua_string,
+                        storage_driver=storage_driver,
+                        screenshot_key_prefix=screenshot_key_prefix,
                     )
                     ua_results.append(result)
 
@@ -196,6 +204,8 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                     brand_monitor_id=brand_monitor_id,
                     typosquat_domain_id=typosquat_domain_id,
                     output_dir=output_dir,
+                    storage_driver=storage_driver,
+                    screenshot_key_prefix=screenshot_key_prefix,
                 )
                 result['userAgent'] = 'desktop'
                 screenshots.append(result)
@@ -236,6 +246,99 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             }
         }
 
+    @staticmethod
+    def _alternate_protocol_url(url: str) -> Optional[str]:
+        """Return the same URL on the opposite scheme (http<->https), or None.
+
+        The backend picks a single scheme from a possibly-stale ``hasSslCert``,
+        so the opposite scheme is the natural fallback when the primary scheme
+        produces a failed or blank capture. Path/query are preserved.
+        """
+        if url.startswith('https://'):
+            return 'http://' + url[len('https://'):]
+        if url.startswith('http://'):
+            return 'https://' + url[len('http://'):]
+        return None
+
+    async def _run_gowitness_once(
+        self,
+        url: str,
+        target_dir: str,
+        url_hash: str,
+        ua_suffix: str,
+        chrome_path: Optional[str],
+        user_agent_string: Optional[str],
+    ) -> Dict[str, Any]:
+        """Run gowitness for ONE url, locate + rename the output, hash it.
+
+        Returns ``{ok, error, new_path, new_filename, file_hash, file_size,
+        perceptual_hash, has_content, stdout_text}``. ``ok=False`` with a
+        populated ``error`` means no usable screenshot file was produced (so the
+        caller can fall back to the alternate protocol).
+        """
+        # Snapshot pre-existing screenshots so a retry never re-picks a prior
+        # attempt's already-renamed file when this run produces nothing new.
+        try:
+            before = {
+                f for f in os.listdir(target_dir)
+                if f.endswith(('.png', '.jpeg', '.jpg', '.webp'))
+            }
+        except OSError:
+            before = set()
+
+        gowitness_cmd = [
+            'gowitness', 'scan', 'single', '--url', url,
+            '--screenshot-path', target_dir,
+            '--delay', '5', '--timeout', '30',
+        ]
+        if user_agent_string:
+            gowitness_cmd.extend(['--chrome-user-agent', user_agent_string])
+        if chrome_path:
+            gowitness_cmd.extend(['--chrome-path', chrome_path])
+
+        process = await asyncio.create_subprocess_exec(
+            *gowitness_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return {'ok': False, 'error': 'timeout', 'stdout_text': ''}
+
+        # Wait briefly for the file to appear
+        await asyncio.sleep(1)
+
+        screenshot_file = self._find_recent_screenshot(target_dir, exclude=before)
+        if not screenshot_file:
+            return {
+                'ok': False,
+                'error': 'Screenshot file not found after capture',
+                'stdout_text': stdout.decode('utf-8', errors='replace') if stdout else '',
+            }
+
+        # Rename to a deterministic name with timestamp
+        timestamp = int(time.time())
+        ext = os.path.splitext(screenshot_file)[1] or '.jpeg'
+        new_filename = f"{timestamp}_{url_hash}{ua_suffix}{ext}"
+        old_path = os.path.join(target_dir, screenshot_file)
+        new_path = os.path.join(target_dir, new_filename)
+        os.rename(old_path, new_path)
+
+        return {
+            'ok': True,
+            'error': None,
+            'new_path': new_path,
+            'new_filename': new_filename,
+            'file_hash': compute_sha256(new_path),
+            'file_size': os.path.getsize(new_path),
+            'perceptual_hash': self._compute_perceptual_hash(new_path),
+            'has_content': self._has_meaningful_content(new_path),
+            'stdout_text': stdout.decode('utf-8', errors='replace') if stdout else '',
+        }
+
     async def _capture_screenshot(
         self,
         url: str,
@@ -244,8 +347,16 @@ class BrandMonitorScreenshotTool(ToolPlugin):
         output_dir: str,
         user_agent_key: Optional[str] = None,
         user_agent_string: Optional[str] = None,
+        storage_driver: str = 'local',
+        screenshot_key_prefix: str = 'screenshots',
     ) -> Dict[str, Any]:
-        """Capture a single screenshot with hashing."""
+        """Capture a single screenshot with hashing and protocol fallback.
+
+        The primary URL is captured first. If it FAILS outright (timeout /
+        no file) OR produces a blank image, the alternate-protocol URL
+        (http<->https) is attempted before giving up. A per-target
+        ``{success: False, error}`` is returned only when every candidate fails.
+        """
         subfolder = typosquat_domain_id or 'reference'
         target_dir = os.path.join(
             output_dir, 'brand-monitoring', brand_monitor_id, subfolder
@@ -254,137 +365,96 @@ class BrandMonitorScreenshotTool(ToolPlugin):
 
         try:
             chrome_path = find_chrome_path()
-            gowitness_cmd = [
-                'gowitness', 'scan', 'single', '--url', url,
-                '--screenshot-path', target_dir,
-                '--delay', '5', '--timeout', '30',
-            ]
-            if user_agent_string:
-                gowitness_cmd.extend(['--chrome-user-agent', user_agent_string])
-            if chrome_path:
-                gowitness_cmd.extend(['--chrome-path', chrome_path])
-
-            process = await asyncio.create_subprocess_exec(
-                *gowitness_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=60
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                return {
-                    'target': url,
-                    'success': False,
-                    'error': 'timeout',
-                    'filePath': None,
-                    'fileHash': None,
-                    'perceptualHash': None,
-                    'fileSize': 0,
-                    'httpStatusCode': None,
-                    'pageTitle': None,
-                    'hasContent': False,
-                }
-
-            # Wait briefly for file to appear
-            await asyncio.sleep(1)
-
-            # Find the most recent screenshot
-            screenshot_file = self._find_recent_screenshot(target_dir)
-            if not screenshot_file:
-                return {
-                    'target': url,
-                    'success': False,
-                    'error': 'Screenshot file not found after capture',
-                    'filePath': None,
-                    'fileHash': None,
-                    'perceptualHash': None,
-                    'fileSize': 0,
-                    'httpStatusCode': None,
-                    'pageTitle': None,
-                    'hasContent': False,
-                }
-
-            # Rename to a deterministic name with timestamp
-            timestamp = int(time.time())
             url_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
-            ext = os.path.splitext(screenshot_file)[1] or '.jpeg'
             ua_suffix = f"_{user_agent_key}" if user_agent_key else ""
-            new_filename = f"{timestamp}_{url_hash}{ua_suffix}{ext}"
-            old_path = os.path.join(target_dir, screenshot_file)
-            new_path = os.path.join(target_dir, new_filename)
-            os.rename(old_path, new_path)
 
-            file_hash = compute_sha256(new_path)
-            file_size = os.path.getsize(new_path)
-            perceptual_hash = self._compute_perceptual_hash(new_path)
+            # Candidate URLs: the primary, then the opposite scheme as fallback.
+            candidates = [url]
+            alt_url = self._alternate_protocol_url(url)
+            if alt_url:
+                candidates.append(alt_url)
 
-            has_content = self._has_meaningful_content(new_path)
-
-            # Protocol fallback: if blank screenshot and URL is https, retry with http
-            if not has_content and url.startswith('https://'):
-                import re as _re
-                domain_match = _re.match(r'https://([^/]+)', url)
-                if domain_match:
-                    http_url = f'http://{domain_match.group(1)}'
-                    print(f"[BrandMonitor:Screenshot] Blank screenshot for {url}, retrying with {http_url}")
-                    retry_cmd = [
-                        'gowitness', 'scan', 'single', '--url', http_url,
-                        '--screenshot-path', target_dir,
-                        '--delay', '5', '--timeout', '30',
-                    ]
-                    if user_agent_string:
-                        retry_cmd.extend(['--chrome-user-agent', user_agent_string])
-                    if chrome_path:
-                        retry_cmd.extend(['--chrome-path', chrome_path])
-                    retry_proc = await asyncio.create_subprocess_exec(
-                        *retry_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    try:
-                        stdout, stderr = await asyncio.wait_for(
-                            retry_proc.communicate(), timeout=60
+            capture: Optional[Dict[str, Any]] = None  # best result so far
+            last_error = 'capture failed'
+            for candidate_url in candidates:
+                attempt = await self._run_gowitness_once(
+                    candidate_url, target_dir, url_hash, ua_suffix,
+                    chrome_path, user_agent_string,
+                )
+                if not attempt['ok']:
+                    last_error = attempt['error']
+                    if candidate_url != url:
+                        print(
+                            f"[BrandMonitor:Screenshot] Protocol fallback "
+                            f"({candidate_url}) failed for {url}: {attempt['error']}"
                         )
-                    except asyncio.TimeoutError:
-                        retry_proc.kill()
-                        await retry_proc.wait()
-                    else:
-                        await asyncio.sleep(3)
-                        retry_file = self._find_recent_screenshot(target_dir)
-                        if retry_file and retry_file != new_filename:
-                            retry_path = os.path.join(target_dir, retry_file)
-                            if self._has_meaningful_content(retry_path):
-                                # Replace with the http screenshot
-                                print(f"[BrandMonitor:Screenshot] HTTP fallback succeeded for {url}")
-                                os.remove(new_path)
-                                timestamp = int(time.time())
-                                new_filename = f"{timestamp}_{url_hash}{ua_suffix}{ext}"
-                                new_path = os.path.join(target_dir, new_filename)
-                                os.rename(retry_path, new_path)
-                                file_hash = compute_sha256(new_path)
-                                file_size = os.path.getsize(new_path)
-                                perceptual_hash = self._compute_perceptual_hash(new_path)
-                                has_content = True
-                            else:
-                                print(f"[BrandMonitor:Screenshot] HTTP fallback also produced blank screenshot for {url}")
-                        else:
-                            print(f"[BrandMonitor:Screenshot] HTTP fallback produced no new file for {url}")
+                    continue
+
+                attempt['source_url'] = candidate_url
+                if capture is None:
+                    capture = attempt
+                elif attempt['has_content'] and not capture['has_content']:
+                    # A real capture beats a previously-held blank one.
+                    try:
+                        os.remove(capture['new_path'])
+                    except OSError:
+                        pass
+                    capture = attempt
+                else:
+                    # Redundant (we already have content, or both blank).
+                    try:
+                        os.remove(attempt['new_path'])
+                    except OSError:
+                        pass
+
+                if capture['has_content']:
+                    break
+                # Blank so far — only the alternate protocol remains; loop on.
+                if candidate_url != url:
+                    print(
+                        f"[BrandMonitor:Screenshot] Protocol fallback "
+                        f"({candidate_url}) also produced a blank screenshot for {url}"
+                    )
+
+            if capture is None:
+                # Every candidate (primary + alternate protocol) failed.
+                return {
+                    'target': url,
+                    'success': False,
+                    'error': last_error,
+                    'filePath': None,
+                    'fileHash': None,
+                    'perceptualHash': None,
+                    'fileSize': 0,
+                    'httpStatusCode': None,
+                    'pageTitle': None,
+                    'hasContent': False,
+                    'userAgent': user_agent_key or 'desktop',
+                }
+
+            if capture.get('source_url') and capture['source_url'] != url and capture['has_content']:
+                print(
+                    f"[BrandMonitor:Screenshot] Protocol fallback "
+                    f"({capture['source_url']}) succeeded for {url}"
+                )
+
+            new_path = capture['new_path']
+            new_filename = capture['new_filename']
+            file_hash = capture['file_hash']
+            file_size = capture['file_size']
+            perceptual_hash = capture['perceptual_hash']
+            has_content = capture['has_content']
 
             relative_path = os.path.join(
                 'brand-monitoring', brand_monitor_id, subfolder, new_filename
             )
 
             # Parse HTTP status from gowitness output
-            stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ''
+            stdout_text = capture['stdout_text']
             http_status = self._extract_http_status(stdout_text)
             page_title = self._extract_page_title(stdout_text)
 
-            return {
+            result_entry = {
                 'target': url,
                 'filePath': relative_path,
                 'fileHash': f'sha256:{file_hash}',
@@ -397,6 +467,76 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                 'success': True,
                 'error': None,
             }
+
+            # Cloud WRITE path: when running in GCS mode the agent uploads the
+            # final screenshot bytes directly to the bucket so they never traverse
+            # the ingestion POST (a 150-image batch would breach Cloud Run's ~32MB
+            # request cap). LOCAL mode (storage_driver != 'gcs') skips this branch
+            # entirely — gowitness already wrote the shared /app-storage volume.
+            #
+            # KEY INVARIANT: object key == f"{screenshot_key_prefix}/{relative_path}"
+            # which the backend read route reconstructs as
+            # normalizeKey("screenshots/" + storedFilePath), storedFilePath being
+            # this same relative_path. Upload from relative_path ONLY — never from
+            # new_path/output_dir (output_dir already contains "screenshots", which
+            # would double the prefix). relative_path is built from generated
+            # segments (no "..", no leading slash) so it needs no normalization.
+            # The upload runs on new_path — the SETTLED winning file: the
+            # candidate loop above already removed any redundant/blank captures
+            # and `capture` points at the chosen attempt's final renamed file.
+            if storage_driver == 'gcs':
+                try:
+                    # Lazy import so local agents never need google-cloud-storage.
+                    from google.cloud import storage as gcs_storage
+
+                    bucket_name = os.environ.get('STORAGE_GCS_BUCKET', '')
+                    if not bucket_name:
+                        raise RuntimeError(
+                            'storageDriver=gcs but STORAGE_GCS_BUCKET is unset'
+                        )
+
+                    object_key = f"{screenshot_key_prefix}/{relative_path}"
+
+                    ext_lower = os.path.splitext(new_path)[1].lower()
+                    if ext_lower in ('.jpeg', '.jpg'):
+                        content_type = 'image/jpeg'
+                    elif ext_lower == '.png':
+                        content_type = 'image/png'
+                    elif ext_lower == '.webp':
+                        content_type = 'image/webp'
+                    else:
+                        content_type = 'application/octet-stream'
+
+                    # ADC via Cloud Run metadata SA — no key file.
+                    client = gcs_storage.Client()
+                    blob = client.bucket(bucket_name).blob(object_key)
+                    # Keys are timestamp+urlhash unique → create-only is safe; the
+                    # agent SA holds objectCreator (no overwrite). Never re-PUT the
+                    # same key, so no retry of an identical upload here.
+                    blob.upload_from_filename(new_path, content_type=content_type)
+                    # NO read-back (blob.exists()) here: the agent SA holds
+                    # roles/storage.objectCreator ONLY (create-only, per CLAUDE.md
+                    # + infra iam.tf), which does NOT grant storage.objects.get —
+                    # so blob.exists() would 403 in cloud, get caught below as an
+                    # uploadError, and make the backend drop EVERY successful
+                    # upload. Object presence is verified authoritatively on the
+                    # backend by IngestionService.screenshotObjectExists()
+                    # (ObjectStorageService.exists()), whose SA has objectAdmin —
+                    # the correct least-privilege place for the read-back.
+                    print(
+                        f"[BrandMonitor:Screenshot] Uploaded to "
+                        f"gs://{bucket_name}/{object_key}"
+                    )
+                except Exception as upload_err:
+                    # Upload failure does not fail the overall tool — record it on
+                    # this entry and keep going. Never retry the same key.
+                    print(
+                        f"[BrandMonitor:Screenshot] GCS upload failed for {url}: "
+                        f"{upload_err}"
+                    )
+                    result_entry['uploadError'] = str(upload_err)
+
+            return result_entry
 
         except FileNotFoundError:
             return {
@@ -443,10 +583,19 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             pass
         return obj
 
-    def _find_recent_screenshot(self, directory: str) -> Optional[str]:
-        """Find the most recently created screenshot file."""
+    def _find_recent_screenshot(self, directory: str, exclude: Optional[set] = None) -> Optional[str]:
+        """Find the most recently created screenshot file.
+
+        ``exclude`` is a set of filenames to ignore — used by the protocol
+        fallback so a retry never re-picks the PRIMARY attempt's already-renamed
+        file when the retry itself produced nothing new.
+        """
         try:
-            img_files = [f for f in os.listdir(directory) if f.endswith(('.png', '.jpeg', '.jpg', '.webp'))]
+            img_files = [
+                f for f in os.listdir(directory)
+                if f.endswith(('.png', '.jpeg', '.jpg', '.webp'))
+                and (exclude is None or f not in exclude)
+            ]
             if not img_files:
                 print(f"[BrandMonitor:Screenshot] No image files found in {directory}")
                 return None

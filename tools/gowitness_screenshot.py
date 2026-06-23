@@ -12,6 +12,8 @@ from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 from tools.screenshot_utils import find_chrome_path, compute_sha256
 
+from lib.wrapper_helpers import resolve_targets as _resolve_targets
+
 
 class GoWitnessScreenshotTool(ToolPlugin):
     @property
@@ -76,7 +78,7 @@ class GoWitnessScreenshotTool(ToolPlugin):
         agent = parameters.get('_agent')
 
         # Resolve targets list
-        targets_list = self._resolve_targets(parameters)
+        targets_list = _resolve_targets(parameters)
         if not targets_list:
             return {
                 'success': False,
@@ -250,23 +252,6 @@ class GoWitnessScreenshotTool(ToolPlugin):
             },
             'raw_output': raw_output
         }
-
-    def _resolve_targets(self, parameters: Dict[str, Any]) -> list:
-        """Resolve target/targets parameter into a list."""
-        if 'targets' in parameters and parameters['targets']:
-            targets_param = parameters['targets']
-            if isinstance(targets_param, str):
-                try:
-                    return json.loads(targets_param)
-                except json.JSONDecodeError:
-                    return [targets_param]
-            elif isinstance(targets_param, list):
-                return targets_param
-            else:
-                return [str(targets_param)]
-        elif 'target' in parameters and parameters['target']:
-            return [parameters['target']]
-        return []
 
     def _ensure_url(self, raw_target: str) -> str:
         target = raw_target.strip()

@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 from typing import Dict, Any, Optional
 from plugin_interface import ToolPlugin
 
+from lib.wrapper_helpers import resolve_targets as _resolve_targets
+
 
 # CWE mapping for Origami finding categories
 CWE_MAP = {
@@ -365,26 +367,9 @@ class OrigamiBrowserDastTool(ToolPlugin):
             "chainable_before": [],
         }
 
-    def _resolve_targets(self, parameters: Dict[str, Any]) -> list:
-        """Resolve target/targets parameter into a list."""
-        if 'targets' in parameters and parameters['targets']:
-            targets_param = parameters['targets']
-            if isinstance(targets_param, str):
-                try:
-                    return json.loads(targets_param)
-                except json.JSONDecodeError:
-                    return [targets_param]
-            elif isinstance(targets_param, list):
-                return targets_param
-            else:
-                return [str(targets_param)]
-        elif 'target' in parameters and parameters['target']:
-            return [parameters['target']]
-        return []
-
     async def execute(self, parameters: Dict[str, Any]) -> Any:
         agent = parameters.get('_agent')
-        targets = self._resolve_targets(parameters)
+        targets = _resolve_targets(parameters)
         max_targets = parameters.get('maxTargets', 10)
         timeout_seconds = parameters.get('timeout_seconds', 120)
         auth_cookies = parameters.get('authCookies', '')

@@ -9,6 +9,8 @@ from plugin_interface import ToolPlugin
 from typing import Dict, Any
 from tools._katana_common import add_katana_options, extend_katana_schema, get_auth_cookie, get_headers_file
 
+from lib.wrapper_helpers import resolve_targets as _resolve_targets
+
 
 class KatanaEnumerateTool(ToolPlugin):
     @property
@@ -82,7 +84,7 @@ class KatanaEnumerateTool(ToolPlugin):
         rate_limit_config = extract_rate_limit(parameters)
 
         # Resolve targets list
-        targets_list = self._resolve_targets(parameters)
+        targets_list = _resolve_targets(parameters)
         if not targets_list:
             return {
                 'success': False,
@@ -234,24 +236,6 @@ class KatanaEnumerateTool(ToolPlugin):
             },
             'raw_output': raw_output
         }
-
-    def _resolve_targets(self, parameters: Dict[str, Any]) -> list:
-        """Resolve target/targets parameter into a list."""
-        if 'targets' in parameters and parameters['targets']:
-            targets_param = parameters['targets']
-            if isinstance(targets_param, str):
-                try:
-                    return json.loads(targets_param)
-                except json.JSONDecodeError:
-                    return [targets_param]
-            elif isinstance(targets_param, list):
-                return targets_param
-            else:
-                return [str(targets_param)]
-        elif 'target' in parameters and parameters['target']:
-            return [parameters['target']]
-        return []
-
 
 def get_tool():
     return KatanaEnumerateTool()

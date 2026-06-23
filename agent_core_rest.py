@@ -12,6 +12,7 @@ usage to `aiohttp` or wrapping in run_in_executor().
 import asyncio
 import base64
 import json
+import signal
 import aiohttp
 from aiohttp import web
 from contextvars import ContextVar
@@ -22,7 +23,6 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timezone
 from plugin_loader import PluginLoader
-from google.cloud import pubsub_v1
 
 def parse_env_tags(raw_tags):
     if not raw_tags:
@@ -47,31 +47,40 @@ class Agent:
         self.agent_description = os.environ.get('AGENT_DESCRIPTION') or config['agent'].get('description', self.agent_name)
         self.tags = parse_env_tags(os.environ.get('AGENT_TAGS')) or config['agent'].get('tags', [])
         self.api_url = os.environ.get('AGENT_API_URL') or config['server']['api_url']
-        self.api_key = os.environ.get('AGENT_API_KEY') or self._read_key_from_volume(config) or config['server']['api_key']
+        # Per-instance identity (WP4): there is NO static single key. Every
+        # running instance enrolls itself via /agents/enroll/tenant using the
+        # tenant installer client creds + its own per-instance installationUid,
+        # and receives its OWN Agent row + API key. That gives each instance its
+        # own currentLoad counter, so throughput scales with instance count.
+        self.api_key = None
         self.client_id = os.environ.get('AGENT_CLIENT_ID') or config['server'].get('client_id')
         self.client_secret = os.environ.get('AGENT_CLIENT_SECRET') or config['server'].get('client_secret')
-        self.enrollment_id = os.environ.get('AGENT_ENROLLMENT_ID') or config['server'].get('enrollment_id')
-        self.enrollment_token = os.environ.get('AGENT_ENROLLMENT_TOKEN') or config['server'].get('enrollment_token')
         self.installation_uid = self._get_or_create_installation_uid()
         self.heartbeat_interval = config.get('heartbeat_interval', 30)
         self.poll_interval = config.get('poll_interval', 5)
         self.queue_retry_interval = config.get('queue_retry_interval', 30)
-        self.queue_result_max_age_hours = config.get('queue_result_max_age_hours', 24)
+        # Lowered 24h -> 2h (V2 tenant-isolation): credential-bearing spool files
+        # must not linger a full day on the shared pool. 2h is ample resend
+        # resilience for a transient backend outage while bounding residue.
+        self.queue_result_max_age_hours = config.get('queue_result_max_age_hours', 2)
         self.runtime_started_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
         self.running = False
+        # R4 graceful drain: set on SIGTERM/SIGINT. Stops claiming new jobs and
+        # wakes the main loop so it can exit promptly after releasing in-flight
+        # claimed jobs back to the queue.
+        self._draining = False
+        self._shutdown_event: asyncio.Event | None = None
         self.plugin_loader = PluginLoader(config, agent=self)
 
-        # Pub/Sub configuration
+        # Pub/Sub configuration — push-only delivery (cloud sub is Terraform-owned,
+        # delivers via OIDC POST to /pubsub/push). The GET /agents/poll/jobs poll is
+        # the always-on backstop (Postgres SKIP LOCKED is the source of truth).
         pubsub_config = config.get('pubsub', {})
         self.project_id = os.environ.get('GCP_PROJECT_ID') or pubsub_config.get('project_id', 'xasm-local')
-        self.subscription_id = os.environ.get('PUBSUB_SUBSCRIPTION_ID') or pubsub_config.get('subscription_id', 'agent-pull')
-        self.pull_enabled = os.environ.get('PUBSUB_PULL_ENABLED', 'true').lower() == 'true'
         self.http_port = int(os.environ.get('AGENT_HTTP_PORT', '8080'))
         self._job_notify_queue = asyncio.Queue()
         self._loop = None
-        self._subscriber = None
-        self._streaming_pull_future = None
 
         # Output streaming and progress tracking (per-job)
         self.output_buffer_max_size = 100 * 1024  # 100KB before flush
@@ -85,6 +94,17 @@ class Agent:
         self._active_jobs: dict[str, JobExecutionState] = {}
         self._active_job_tasks: dict[str, asyncio.Task] = {}
 
+        # Bounded job concurrency: a Pub/Sub notification flood can otherwise
+        # fan out one heavy tool subprocess per claimed job (nuclei, headless
+        # chromium, ...) and breach the container's 1 GiB memory limit — the
+        # OOM-killed agent restarts and releases its in-flight jobs back to the
+        # queue, interrupting long scans. The default of 3 matches the agent's
+        # typical concurrency limit; lower it (e.g. AGENT_MAX_CONCURRENT_JOBS=2)
+        # via env on memory-constrained hosts. Excess claimed jobs simply wait
+        # their turn on the semaphore.
+        self.max_concurrent_jobs = int(os.environ.get('AGENT_MAX_CONCURRENT_JOBS', '3'))
+        self._job_semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
+
         # BUG-088: Reusable aiohttp session (lazy-initialized)
         self._session = None
         self._tools_registered = False
@@ -92,50 +112,31 @@ class Agent:
         self._last_completion_status = None
 
     @staticmethod
-    def _read_key_from_volume(config):
-        """Read API key from shared volume written by backend auto-onboarding."""
-        config_file = os.environ.get('CONFIG_FILE', 'config.yaml')
-        # Map config file to agent index: config.docker.yaml -> 1, config.agent2.yaml -> 2, etc.
-        if 'docker' in config_file or config_file == 'config.yaml':
-            idx = 1
-        else:
-            import re
-            m = re.search(r'agent(\d+)', config_file)
-            idx = int(m.group(1)) if m else 1
-        key_file = f'/app-storage/agent-keys/agent{idx}.key'
-        try:
-            with open(key_file, 'r') as f:
-                key = f.read().strip()
-            if key:
-                return key
-        except FileNotFoundError:
-            pass
-        return None
-
-    def _refresh_api_key(self):
-        """Refresh the cached API key so delayed backend onboarding can recover."""
-        env_key = os.environ.get('AGENT_API_KEY')
-        if env_key:
-            if env_key != self.api_key:
-                self.api_key = env_key
-                print("[Agent] Refreshed API key from environment")
-            return self.api_key
-
-        volume_key = self._read_key_from_volume(self.config)
-        if volume_key and volume_key != self.api_key:
-            self.api_key = volume_key
-            print("[Agent] Refreshed API key from shared volume")
-
-        return self.api_key or None
-
-    @staticmethod
     def _installation_uid_path():
         return Path('/var/lib/xasm-agent/installation-uid')
 
     def _get_or_create_installation_uid(self):
+        """Resolve this instance's per-instance installation UID.
+
+        Each distinct value maps to its OWN Agent row server-side, so the UID
+        must be unique per concurrently-running instance (that is what unlocks
+        instances × concurrencyLimit throughput):
+
+          - AGENT_INSTALLATION_UID — explicit override. Local docker-compose
+            sets a distinct, stable value per agent service.
+          - K_REVISION (Cloud Run) — combined with a uuid so each autoscaled
+            instance of a revision gets its own row, while the K_REVISION prefix
+            keeps the rows attributable to the deploy.
+          - else — a uuid persisted to disk so a process restart reuses the
+            same row (standalone/local execution without an explicit override).
+        """
         env_uid = os.environ.get('AGENT_INSTALLATION_UID')
         if env_uid:
             return env_uid
+
+        k_revision = os.environ.get('K_REVISION')
+        if k_revision:
+            return f"{k_revision}-{uuid4()}"
 
         uid_path = self._installation_uid_path()
         try:
@@ -156,11 +157,10 @@ class Agent:
         return new_uid
 
     def _auth_headers(self):
-        """Build request headers with the freshest API key we know about."""
-        key = self._refresh_api_key()
+        """Build request headers with this instance's enrolled API key."""
         headers = {}
-        if key:
-            headers['X-API-Key'] = key
+        if self.api_key:
+            headers['X-API-Key'] = self.api_key
         return headers
 
     async def _get_session(self):
@@ -170,78 +170,65 @@ class Agent:
         return self._session
 
     async def ensure_runtime_key(self):
-        """Exchange enrollment credentials for a runtime API key when needed."""
-        current_key = self._refresh_api_key()
-        if current_key:
+        """Obtain this instance's per-instance API key via tenant enrollment.
+
+        Always calls /agents/enroll/tenant: the backend upserts the Agent row
+        keyed on installationUid (idempotent) and returns a freshly-issued,
+        installationUid-prefixed key for THIS instance's own row. A no-op once a
+        key is already held — re-enrollment only happens after an auth failure.
+        """
+        if self.api_key:
             return True
 
-        if self.client_id and self.client_secret:
-            try:
-                session = await self._get_session()
-                timeout = aiohttp.ClientTimeout(total=15)
-                async with session.post(
-                    f"{self.api_url}/agents/enroll/tenant",
-                    json={
-                        'clientId': self.client_id,
-                        'clientSecret': self.client_secret,
-                        'installationUid': self.installation_uid,
-                        'requestedName': self.agent_name,
-                        'description': self.agent_description,
-                        'tags': self.tags,
-                    },
-                    timeout=timeout,
-                ) as response:
-                    if 200 <= response.status < 300:
-                        payload = await response.json()
-                        self.api_key = payload.get('apiKey')
-                        agent = payload.get('agent') or {}
-                        self.agent_name = agent.get('name', self.agent_name)
-                        self.agent_description = agent.get('description', self.agent_description)
-                        self.tags = agent.get('tags') or self.tags
-                        print(
-                            f"[Enroll] ✓ Tenant-enrolled agent {self.agent_name} "
-                            f"(installation UID: {self.installation_uid})"
-                        )
-                        return True
-
-                    body = await response.text()
-                    print(f"[Enroll] Tenant enrollment failed with status {response.status}: {body[:200]}")
-                    return False
-            except Exception as e:
-                print(f"[Enroll] Tenant enrollment error: {e}")
-                return False
-
-        if not self.enrollment_id or not self.enrollment_token:
-            print("[Enroll] No runtime API key or enrollment credentials configured")
+        if not (self.client_id and self.client_secret):
+            print("[Enroll] No tenant installer credentials configured (AGENT_CLIENT_ID/AGENT_CLIENT_SECRET)")
             return False
 
         try:
             session = await self._get_session()
             timeout = aiohttp.ClientTimeout(total=15)
             async with session.post(
-                f"{self.api_url}/agents/enroll",
+                f"{self.api_url}/agents/enroll/tenant",
                 json={
-                    'enrollmentId': self.enrollment_id,
-                    'enrollmentToken': self.enrollment_token,
+                    'clientId': self.client_id,
+                    'clientSecret': self.client_secret,
+                    'installationUid': self.installation_uid,
+                    'requestedName': self.agent_name,
+                    'description': self.agent_description,
+                    'tags': self.tags,
                 },
                 timeout=timeout,
             ) as response:
                 if 200 <= response.status < 300:
                     payload = await response.json()
-                    self.api_key = payload.get('apiKey')
+                    self._set_runtime_key(payload.get('apiKey'))
                     agent = payload.get('agent') or {}
                     self.agent_name = agent.get('name', self.agent_name)
                     self.agent_description = agent.get('description', self.agent_description)
                     self.tags = agent.get('tags') or self.tags
-                    print(f"[Enroll] ✓ Enrolled agent {self.agent_name} and obtained runtime API key")
+                    print(
+                        f"[Enroll] ✓ Tenant-enrolled instance {self.agent_name} "
+                        f"(installation UID: {self.installation_uid})"
+                    )
                     return True
 
                 body = await response.text()
-                print(f"[Enroll] Failed with status {response.status}: {body[:200]}")
+                print(f"[Enroll] Tenant enrollment failed with status {response.status}: {body[:200]}")
                 return False
         except Exception as e:
-            print(f"[Enroll] Error: {e}")
+            print(f"[Enroll] Tenant enrollment error: {e}")
             return False
+
+    def _set_runtime_key(self, api_key):
+        """Adopt the enrolled per-instance key and share it with the credential
+        helper so per-tool ProviderQuotaService checkouts authenticate as THIS
+        same instance (one identity for jobs and for credential leases)."""
+        self.api_key = api_key
+        try:
+            from lib.integration_credentials import set_runtime_api_key
+            set_runtime_api_key(api_key)
+        except Exception as e:
+            print(f"[Enroll] Could not publish runtime key to credential helper: {e}")
 
     async def run(self):
         """Main agent loop"""
@@ -252,7 +239,7 @@ class Agent:
         print(f"Description: {self.agent_description}")
         print(f"Tags: {', '.join(self.tags)}")
         print(f"Server: {self.api_url}")
-        print(f"Pub/Sub: project={self.project_id}, subscription={self.subscription_id}")
+        print(f"Pub/Sub: project={self.project_id}, delivery=push (/pubsub/push) + poll backstop")
         print()
 
         # Load plugins
@@ -262,6 +249,21 @@ class Agent:
 
         self.running = True
         self._loop = asyncio.get_running_loop()
+        self._shutdown_event = asyncio.Event()
+
+        # R4: register a SIGTERM (Cloud Run scale-in / revision swap) + SIGINT
+        # handler. On signal we stop claiming new jobs and release each in-flight
+        # claimed job back to the queue (status->PENDING, retryCount++) so a
+        # reclaimed instance never silently loses work. Falls back gracefully if
+        # the platform cannot install signal handlers (e.g. non-main thread).
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                self._loop.add_signal_handler(
+                    sig,
+                    lambda s=sig: asyncio.ensure_future(self._handle_shutdown_signal(s)),
+                )
+            except (NotImplementedError, RuntimeError, ValueError) as e:
+                print(f"[Agent] Could not install handler for {sig!r}: {e}")
 
         await self.ensure_runtime_key()
 
@@ -280,11 +282,8 @@ class Agent:
             lambda t: t.exception() and print(f"[HTTP] Server died: {t.exception()}")
         )
 
-        # Start Pub/Sub pull subscriber (disabled in cloud where push handles delivery)
-        if self.pull_enabled:
-            self._start_pubsub_subscriber()
-        else:
-            print("[PubSub] Pull disabled — relying on push via HTTP server")
+        # Job notifications arrive via Pub/Sub push (POST /pubsub/push). The
+        # GET /agents/poll/jobs poll in main_loop is the always-on backstop.
 
         # Start periodic nuclei template update (every 24h)
         template_update_task = asyncio.create_task(self._periodic_template_update())
@@ -299,52 +298,18 @@ class Agent:
         except asyncio.CancelledError:
             pass
 
-    def _start_pubsub_subscriber(self):
-        """Start Pub/Sub streaming pull in background threads for job notifications"""
-        try:
-            self._subscriber = pubsub_v1.SubscriberClient()
-            subscription_path = self._subscriber.subscription_path(
-                self.project_id, self.subscription_id
-            )
-
-            def callback(message):
-                message.ack()
-                try:
-                    self._loop.call_soon_threadsafe(self._job_notify_queue.put_nowait, True)
-                except Exception:
-                    pass  # Event loop may be closed during shutdown
-
-            self._streaming_pull_future = self._subscriber.subscribe(
-                subscription_path, callback=callback
-            )
-            self._streaming_pull_future.add_done_callback(self._on_subscriber_error)
-            print(f"[PubSub] Streaming pull started on {subscription_path}")
-        except Exception as e:
-            print(f"[PubSub] Failed to start subscriber: {e}")
-            print("[PubSub] Agent will fall back to periodic polling")
-
-    def _on_subscriber_error(self, future):
-        """Called when the streaming pull subscriber dies (gRPC disconnect, etc.)"""
-        try:
-            future.result()
-        except Exception as e:
-            print(f"[PubSub] Subscriber died: {e}")
-            print("[PubSub] Attempting to restart subscriber...")
-            try:
-                self._start_pubsub_subscriber()
-            except Exception as restart_err:
-                print(f"[PubSub] Restart failed: {restart_err}. Falling back to periodic polling.")
-
     async def _start_http_server(self):
         """Start HTTP server for Pub/Sub push delivery and health checks.
 
-        In cloud (Cloud Run), Pub/Sub push subscription delivers job notifications
-        via HTTP POST to /pubsub/push. Locally, pull subscription is primary but
-        this server still runs for parity and health checks.
+        Pub/Sub push subscription delivers job notifications via HTTP POST to
+        /pubsub/push (cloud: Terraform-owned PUSH sub w/ OIDC; local: pubsub-init
+        creates a push sub targeting this endpoint). The GET /agents/poll/jobs
+        poll in main_loop is the always-on dispatch backstop.
         """
         app = web.Application()
         app.router.add_get('/health', self._handle_health)
         app.router.add_post('/pubsub/push', self._handle_pubsub_push)
+        app.router.add_get('/cache-stats', self._handle_cache_stats)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -361,6 +326,20 @@ class Agent:
             'current_jobs': sorted(self._active_jobs.keys()),
             'current_job_count': len(self._active_jobs),
         })
+
+    async def _handle_cache_stats(self, request):
+        """Cache observability — surfaces the per-process upstream cache
+        counters (size, hits, misses, stales) for Phase 2B socint cost
+        control. Five agent containers = five independent caches; query
+        each one to get a cluster-wide picture."""
+        try:
+            from lib.upstream_cache import upstream_cache
+            stats = await upstream_cache.stats()
+            return web.json_response({'agent': self.agent_name, 'cache': stats})
+        except Exception as e:
+            return web.json_response(
+                {'agent': self.agent_name, 'error': str(e)}, status=500,
+            )
 
     async def _handle_pubsub_push(self, request):
         """Handle Pub/Sub push delivery — same signal as pull, different transport"""
@@ -427,6 +406,12 @@ class Agent:
 
         while self.running:
             try:
+                # R4: a SIGTERM/SIGINT sets _draining; stop claiming and exit so
+                # the drain (release of in-flight jobs) can finish in run().
+                if self._draining:
+                    print("[Agent] Drain requested — exiting main loop, no new claims")
+                    break
+
                 await self.ensure_runtime_key()
 
                 if not self._tools_registered:
@@ -462,6 +447,11 @@ class Agent:
                 except asyncio.TimeoutError:
                     pass  # Fallback: poll anyway on timeout
 
+                # A shutdown signal may have arrived while we were waiting.
+                if self._draining:
+                    print("[Agent] Drain requested during poll wait — exiting main loop")
+                    break
+
                 # Claim and execute jobs via existing REST endpoint
                 jobs = await self.poll_jobs()
 
@@ -472,10 +462,86 @@ class Agent:
 
             except KeyboardInterrupt:
                 print("\n[Agent] Received shutdown signal")
+                self._draining = True
                 break
             except Exception as e:
                 print(f"[Agent] Error in main loop: {e}")
                 await asyncio.sleep(10)
+
+        # R4: main loop exited — if this was a drain, release in-flight jobs.
+        if self._draining:
+            await self._drain_in_flight_jobs()
+
+    async def _handle_shutdown_signal(self, sig):
+        """R4: SIGTERM/SIGINT handler — begin graceful drain.
+
+        Flips the drain flag so the main loop stops claiming new jobs, then
+        wakes the loop (which is usually blocked on the notify-queue wait) so it
+        exits promptly and releases in-flight claimed jobs. Idempotent: a second
+        signal is a no-op while a drain is already in progress.
+        """
+        if self._draining:
+            return
+        print(f"\n[Agent] Received {sig!r} — beginning graceful drain")
+        self._draining = True
+        self.running = False
+        # Wake the main loop's `wait_for(self._job_notify_queue.get(), ...)`.
+        try:
+            self._job_notify_queue.put_nowait(True)
+        except Exception:
+            pass
+
+    async def _drain_in_flight_jobs(self):
+        """R4: release every in-flight claimed job back to the queue on shutdown.
+
+        Cancels each running job task, then asks the backend to requeue the job
+        (status->PENDING, retryCount++ per BUG-032) via POST /jobs/:id/release so
+        a surviving sibling agent re-claims it. retryCount++ also invalidates a
+        late `complete` if the tool happened to finish in the drain window, so
+        there is no double-ingest.
+        """
+        job_ids = list(self._active_job_tasks.keys())
+        if not job_ids:
+            print("[Drain] No in-flight jobs to release")
+            return
+
+        print(f"[Drain] Releasing {len(job_ids)} in-flight job(s) back to the queue")
+        for job_id in job_ids:
+            task = self._active_job_tasks.get(job_id)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"[Drain] Job {job_id[:8]} task raised during cancel: {e}")
+            released = await self.release_job(job_id)
+            if released:
+                print(f"[Drain] ✓ Released job {job_id[:8]} back to PENDING")
+            else:
+                print(f"[Drain] ⚠ Release no-op for job {job_id[:8]} (already terminal/reassigned)")
+
+    async def release_job(self, job_id):
+        """R4: release a claimed job back to the queue via REST (graceful drain)."""
+        try:
+            url = f"{self.api_url}/agents/jobs/{job_id}/release"
+            session = await self._get_session()
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with session.post(
+                url,
+                headers=self._auth_headers(),
+                timeout=timeout,
+            ) as response:
+                if 200 <= response.status < 300:
+                    body = await response.json()
+                    return bool(body.get('released'))
+                text = await response.text()
+                print(f"[Release] ⚠ Failed for job {job_id[:8]}: {response.status} - {text[:200]}")
+                return False
+        except Exception as e:
+            print(f"[Release] ✗ Error for job {job_id[:8]}: {e}")
+            return False
 
     def _start_job_task(self, job):
         """Start a claimed job without blocking the main polling loop."""
@@ -643,12 +709,31 @@ class Agent:
             ) as response:
                 if response.status == 200:
                     return await response.json()
+                if response.status == 401:
+                    # This instance's key was rejected (row reaped / backend
+                    # re-seeded). Drop it so the next loop re-enrolls and gets a
+                    # fresh per-instance key + row.
+                    print("[JobPoll] 401 — dropping stale runtime key, will re-enroll")
+                    self._set_runtime_key(None)
                 return []
         except Exception as e:
             print(f"[JobPoll] Error: {e}")
             return []
 
     async def execute_job(self, job):
+        """Execute a claimed job, bounded by the concurrency semaphore.
+
+        Claimed jobs beyond max_concurrent_jobs wait here until a slot frees
+        up — this caps peak memory under a notification flood (see __init__).
+        """
+        job_id = job['id']
+        if self._job_semaphore.locked():
+            print(f"[ExecuteJob] Job {job_id[:8]} waiting for a free execution slot "
+                  f"(cap: {self.max_concurrent_jobs} concurrent jobs)")
+        async with self._job_semaphore:
+            await self._execute_job_inner(job)
+
+    async def _execute_job_inner(self, job):
         """Execute a claimed job"""
         job_id = job['id']
         tool_name = job['toolName']
@@ -671,6 +756,15 @@ class Agent:
         state = JobExecutionState(job_id=job_id, retry_count=retry_count)
         self._active_jobs[job_id] = state
         state_token = self._current_execution_state.set(state)
+
+        # WP6 — publish the active job id so money/secrets-path calls send
+        # X-Job-Id. A BOOTSTRAP agent's backend re-derives the billing tenant
+        # from this job (ownership-verified); a dedicated agent ignores it.
+        try:
+            from lib.integration_credentials import set_current_job_id
+            set_current_job_id(job_id)
+        except Exception:
+            pass
 
         # Start background heartbeat during execution
         heartbeat_task = asyncio.create_task(self.execution_heartbeat_loop(state))
@@ -759,6 +853,11 @@ class Agent:
                 pass
             self._active_jobs.pop(job_id, None)
             self._current_execution_state.reset(state_token)
+            try:
+                from lib.integration_credentials import set_current_job_id
+                set_current_job_id(None)
+            except Exception:
+                pass
 
     async def claim_job(self, job_id):
         """Claim a job via REST API"""
@@ -894,6 +993,16 @@ class Agent:
         try:
             queue_dir = "/tmp/agent_queue"
             os.makedirs(queue_dir, exist_ok=True)
+            # V2 tenant-isolation: a result can carry session credentials (e.g. the
+            # login tools' filtered cookies). On the shared bootstrap pool these
+            # spool files would otherwise sit world-readable in /tmp across other
+            # tenants' jobs. Restrict to owner-only (defense vs other containers)
+            # and rely on the bounded max-age sweep to cap residue lifetime. Full
+            # cross-tenant isolation within one process needs per-tenant pools.
+            try:
+                os.chmod(queue_dir, 0o700)
+            except OSError:
+                pass
 
             queue_file = f"{queue_dir}/result_{job_id[:8]}.json"
             with open(queue_file, 'w') as f:
@@ -904,6 +1013,10 @@ class Agent:
                     'retry_count': retry_count,  # BUG-032: Store retryCount in queue
                     'timestamp': datetime.now().isoformat()
                 }, f)
+            try:
+                os.chmod(queue_file, 0o600)
+            except OSError:
+                pass
             print(f"[Queue] Result queued: {queue_file}")
         except Exception as e:
             print(f"[Queue] Warning: Could not queue result: {e}")
@@ -1020,13 +1133,6 @@ class Agent:
         """Stop the agent"""
         print("\n[Agent] Stopping...")
         self.running = False
-        # Cancel Pub/Sub streaming pull
-        if self._streaming_pull_future:
-            self._streaming_pull_future.cancel()
-            print("[Agent] Pub/Sub streaming pull cancelled")
-        if self._subscriber:
-            self._subscriber.close()
-            print("[Agent] Pub/Sub subscriber closed")
         # BUG-088: Clean up aiohttp session
         if self._session and not self._session.closed:
             await self._session.close()

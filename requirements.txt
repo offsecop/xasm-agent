@@ -9,4 +9,17 @@ imagehash>=4.3.1
 Pillow>=10.0.0
 aiohttp>=3.9.0
 google-cloud-pubsub>=2.27.0
+google-cloud-storage>=2.18.0
+# Pin transitive `cryptography` below 48: the 48.0.x aarch64 native build
+# (Rust-backed x509 binding) executes a CPU instruction the Docker Desktop ARM
+# VM does not support, so `from cryptography import x509` dies with SIGILL
+# (exit 132). nuclei:full_scan imports it during TLS-posture inspection, which
+# crashed the agent at every scan completion. 44.0.x imports cleanly here.
+cryptography>=44,<45
+# RDAP-primary domain-age capture for typosquat_detect (Phase 2). Pure-python
+# (whodap RDAP + port-43 WHOIS fallback in one async client), ships prebuilt
+# aarch64 wheels — ARM-safe (unlike the cryptography 48.x SIGILL case). NOTE: a
+# requirements bump needs `docker-compose build agent` + rebuild/recreate of all
+# 5 agents, not just a restart (anonymous node-modules/site-packages volumes).
+asyncwhois>=1.1.12
 

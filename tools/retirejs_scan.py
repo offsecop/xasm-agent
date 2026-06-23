@@ -508,6 +508,8 @@ def _build_aggregate_finding(
     template_id = _safe_template_id(f"retirejs-{package}-{version}-aggregate")
     script_url = script.get("finalUrl") or script.get("url") or ""
     response_excerpt = _excerpt_around_package(script.get("text") or "", package, version)
+    request = _request_line(script_url)
+    response = _format_script_response(script, response_excerpt)
     advisory_count = len(advisories)
     cve_count = len(cves)
     first_summary = _first_non_empty(advisory.get("summary") for advisory in advisories)
@@ -537,6 +539,7 @@ def _build_aggregate_finding(
         "Treat this as a dependency exposure hypothesis until a runtime exploit path is confirmed."
     )
 
+    matched_content = "\n".join(matched_lines)
     return {
         "template-id": template_id,
         "templateID": template_id,
@@ -555,6 +558,10 @@ def _build_aggregate_finding(
             "classification": {"cve-id": cves} if cves else {},
             "tags": ["sca", "retirejs", "javascript", "dependency", package],
         },
+        "request": request,
+        "response": response,
+        "matched-content": matched_content,
+        "matchedContent": matched_content,
         "evidence": {
             "packageName": package,
             "packageVersion": version,
@@ -569,9 +576,9 @@ def _build_aggregate_finding(
             "scanner": source,
             "dependencyFindingType": "client_side_dependency_hypothesis",
             "runtimeExploitValidated": False,
-            "request": _request_line(script_url),
-            "response": response_excerpt,
-            "matchedContent": "\n".join(matched_lines),
+            "request": request,
+            "response": response,
+            "matchedContent": matched_content,
         },
     }
 
@@ -648,6 +655,29 @@ def _request_line(url: str) -> str:
         return f"GET {path} HTTP/1.1\nHost: {host}\nUser-Agent: xASM-AgenticExplorer/1.0"
     except Exception:
         return f"GET {url} HTTP/1.1"
+
+
+def _format_script_response(script: Dict[str, Any], excerpt: str) -> str:
+    status = int(script.get("status") or 0)
+    reason = "OK" if status and status < 400 else ""
+    lines = [f"HTTP/1.1 {status} {reason}".rstrip()]
+    for key, value in (script.get("headers") or {}).items():
+        lower = str(key).lower()
+        if lower in {"authorization", "cookie", "set-cookie", "x-api-key"}:
+            lines.append(f"{key}: [REDACTED]")
+        else:
+            lines.append(f"{key}: {value}")
+    if excerpt:
+        lines.append("")
+        lines.append(_redact_script_excerpt(excerpt))
+    return "\n".join(lines[:90])
+
+
+def _redact_script_excerpt(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"(?i)(api[_-]?key|token|secret|password|passwd|pwd)(['\"\\s:=]+)[A-Za-z0-9._~+/=-]{8,}", r"\1\2[REDACTED]", value)
+    value = re.sub(r"(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]{12,}", r"\1[REDACTED]", value)
+    return value[:1600]
 
 
 def _looks_like_script_url(value: str) -> bool:

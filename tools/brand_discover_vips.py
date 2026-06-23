@@ -175,6 +175,12 @@ class BrandDiscoverVipsTool(ToolPlugin):
 
                 for idx, path in enumerate(TEAM_PATHS):
                     url = f'https://{domain}{path}'
+                    # Bind `page` outside the try so the except-block close()
+                    # path can still reach it when `context.new_page()` itself
+                    # raises (e.g. browser crash, OOM). Without this guard the
+                    # except branch would NameError on `page.close()` and mask
+                    # the original failure.
+                    page = None
                     try:
                         page = await context.new_page()
                         response = await page.goto(url, wait_until='networkidle', timeout=15000)
@@ -192,10 +198,11 @@ class BrandDiscoverVipsTool(ToolPlugin):
                         await page.close()
                     except Exception as e:
                         print(f"[BrandVIPs] Failed to load {url}: {e}")
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
+                        if page is not None:
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
 
                     if agent:
                         agent.report_progress(

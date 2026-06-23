@@ -4,24 +4,73 @@ Queries OSINT sources and threat intelligence feeds for dark web mentions,
 credential leaks, phishing kit sales, and brand targeting discussions.
 """
 
+import sys
 import asyncio
 import aiohttp
 import json
+import logging
 import os
 import re
-import shlex
 import time
 import hashlib
 import urllib.parse
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from html import unescape
+
+logger = logging.getLogger(__name__)
+
+
+def _plain_term_matches(term: str, haystack: str) -> bool:
+    """TOKEN-BOUNDARY containment for a non-regex search term.
+
+    The legacy gate used ``term.lower() in haystack`` (bare substring), which
+    fired on unrelated text: a short brand acronym landing INSIDE an unrelated
+    word (a 3-letter term inside a longer one) or a brand landing inside a glued
+    phrase (two adjacent words concatenated). We instead require the term to
+    appear on WORD boundaries, so a whole-word / domain match still hits while an
+    arbitrary infix does not. Falls back to plain containment only if the
+    boundary regex cannot be built (never less strict on the common path)."""
+    term = (term or '').strip().lower()
+    if not term:
+        return False
+    hay = (haystack or '').lower()
+    try:
+        return re.search(r'(?<![0-9a-z])' + re.escape(term) + r'(?![0-9a-z])', hay) is not None
+    except re.error:
+        return term in hay
+
+
+# Ensure agent/ is on sys.path so `from lib.integration_credentials import ...`
+# works when the plugin is loaded via spec_from_file_location.
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.append(_parent_dir)
+
 from plugin_interface import ToolPlugin
+from lib.integration_credentials import (  # noqa: E402
+    checkout_provider,
+    reconcile_call,
+    upstream_request,
+    QuotaExceededError,
+    IntegrationCredentialsError,
+)
 
 try:
     from playwright.async_api import async_playwright
 except Exception:
     async_playwright = None
+
+
+# OTX and IntelX are out of the DRP migration vendor scope (locked-decision
+# #5; only HikerAPI / ScrapeCreators / twitterapi.io are in scope). The
+# integrations stay in the codebase for non-DRP use cases but default OFF —
+# operators must set ENABLE_OTX=true / ENABLE_INTELX=true explicitly to
+# re-enable. With the flag off, _query_otx / _query_intelx short-circuit to
+# an empty result list before any HTTP work (so no leases consumed, no
+# vendor calls).
+ENABLE_OTX = os.environ.get("ENABLE_OTX", "false").lower() in ("true", "1", "yes")
+ENABLE_INTELX = os.environ.get("ENABLE_INTELX", "false").lower() in ("true", "1", "yes")
 
 
 class DarkWebMonitorTool(ToolPlugin):
@@ -91,7 +140,7 @@ class DarkWebMonitorTool(ToolPlugin):
                 "sources": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Sources to query (default: all). Options: urlhaus, otx, github, gitlab, bitbucket, npm, stackoverflow, pastebin, searxng, leakcheck, threatfox, hibp, intelx, onion_forums, simulation"
+                    "description": "Sources to query (default: all). Options: urlhaus, otx, github, gitlab, bitbucket, npm, stackoverflow, pastebin, leakcheck, threatfox, hibp, intelx, onion_forums, simulation"
                 },
                 "maxResults": {
                     "type": "integer",
@@ -523,9 +572,10 @@ class DarkWebMonitorTool(ToolPlugin):
                     )
 
                     if not matched_keywords:
+                        fallback_hay = f"{fetched.get('title', '')} {normalized_text}"
                         matched_keywords = [
                             term for term in search_terms
-                            if term.lower() in f"{fetched.get('title', '')} {normalized_text}".lower()
+                            if _plain_term_matches(term, fallback_hay)
                         ][:5]
 
                     if not matched_keywords:
@@ -586,7 +636,7 @@ class DarkWebMonitorTool(ToolPlugin):
                 is_match = bool(
                     re.search(pattern['pattern'], haystack, re.IGNORECASE)
                     if pattern.get('isRegex')
-                    else pattern['pattern'].lower() in haystack
+                    else _plain_term_matches(pattern['pattern'], haystack)
                 )
             except re.error:
                 is_match = False
@@ -634,7 +684,7 @@ class DarkWebMonitorTool(ToolPlugin):
                     is_match = bool(
                         re.search(pattern_value, haystack, re.IGNORECASE)
                         if pattern.get('isRegex')
-                        else pattern_value.lower() in haystack
+                        else _plain_term_matches(pattern_value, haystack)
                     )
                 except re.error:
                     is_match = False
@@ -674,11 +724,14 @@ class DarkWebMonitorTool(ToolPlugin):
         patterns = parameters.get('patterns', [])
         brand_monitor_id = parameters.get('brandMonitorId', '')
         settings = self._get_darkweb_settings(agent)
+        # 2026-05-16 — SearxNG decommissioned. No longer in the default
+        # sources list and the _query_searxng method has been removed from
+        # this file. Any caller passing 'searxng' explicitly in `sources` is
+        # silently ignored (no-op task fan-out for that key).
         sources = parameters.get('sources', [
             'urlhaus',
             'otx',
             'github',
-            'searxng',
             'gitlab',
             'bitbucket',
             'npm',
@@ -733,8 +786,6 @@ class DarkWebMonitorTool(ToolPlugin):
                 tasks.append(self._query_stackoverflow(session, domain, normalized_patterns, agent))
             if 'pastebin' in sources:
                 tasks.append(self._query_pastebin(session, domain, normalized_patterns, agent))
-            if 'searxng' in sources:
-                tasks.append(self._query_searxng(session, domain, normalized_patterns, agent))
             if 'threatfox' in sources:
                 tasks.append(self._query_threatfox(session, domain, agent))
             if 'hibp' in sources:
@@ -746,9 +797,11 @@ class DarkWebMonitorTool(ToolPlugin):
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for i, result in enumerate(results):
+            for result in results:
                 sources_queried += 1
-                if isinstance(result, Exception):
+                if isinstance(result, BaseException):
+                    # asyncio.gather(return_exceptions=True) widens to
+                    # BaseException so Pyright narrows the elif branch.
                     errors.append(str(result))
                 elif result:
                     all_results.extend(result)
@@ -890,70 +943,173 @@ class DarkWebMonitorTool(ToolPlugin):
         return results
 
     async def _query_otx(self, session: aiohttp.ClientSession, domain: str, agent=None) -> List[Dict]:
-        """Query AlienVault OTX for domain intelligence"""
-        results = []
+        """Query AlienVault OTX for domain intelligence.
+
+        DRP→ASM T2.8c: per-tenant lease via ProviderQuotaService.checkout. If
+        the backend has no OTX_API integration configured we fall back to
+        anonymous OTX (free tier) — OTX accepts unauthenticated requests with
+        reduced rate limits, so a missing integration must not break the
+        scan; we just skip the lease and log.
+
+        Feature-flagged via ENABLE_OTX (default off — DRP locked-decision
+        #5). When disabled, returns [] immediately without leasing or
+        calling OTX.
+        """
+        results: List[Dict] = []
+
+        if not ENABLE_OTX:
+            if agent:
+                agent.report_progress(
+                    "OTX query skipped: ENABLE_OTX is off (set ENABLE_OTX=true to enable)"
+                )
+            return results
+
+        # Try to lease an OTX_API call. If no integration is configured we
+        # fall through to anonymous + env-var-key access.
+        lease_token: Optional[str] = None
+        otx_key = ''
+        try:
+            lease = await checkout_provider('OTX_API', requested_units=1)
+            otx_key = lease.get('apiKey') or ''
+            lease_token = lease.get('leaseToken')
+        except QuotaExceededError as e:
+            if agent:
+                agent.report_progress(f"OTX quota exceeded: retry in {e.retry_after}s")
+            return results
+        except IntegrationCredentialsError:
+            otx_key = os.environ.get('OTX_API_KEY', '')
+
+        otx_success = False
+        otx_error_code: Optional[str] = None
+        resp = None
         try:
             if agent:
                 agent.report_progress(f"Querying AlienVault OTX for {domain}")
 
             url = f'https://otx.alienvault.com/api/v1/indicators/domain/{domain}/general'
             headers = {}
-            otx_key = os.environ.get('OTX_API_KEY', '')
             if otx_key:
                 headers['X-OTX-API-KEY'] = otx_key
 
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    pulses = data.get('pulse_info', {}).get('pulses', [])
-                    for pulse in pulses[:15]:
-                        tags = pulse.get('tags', [])
-                        # Determine match type based on tags
-                        match_type = 'BRAND_MENTION'
-                        severity = 'MEDIUM'
-                        if any(t in tags for t in ['phishing', 'credential']):
-                            match_type = 'CREDENTIAL_LEAK'
-                            severity = 'HIGH'
-                        elif any(t in tags for t in ['malware', 'c2', 'botnet', 'trojan']):
-                            match_type = 'MALWARE_C2'
-                            severity = 'HIGH'
-                        elif any(t in tags for t in ['apt', 'targeted']):
-                            match_type = 'TARGETING_DISCUSSION'
-                            severity = 'HIGH'
+            # Per-call 20s timeout overrides the 120s session total. OTX has a
+            # history of intermittent slow responses on rate-limit boundaries;
+            # capping the call keeps a stalled OTX from starving the rest of
+            # the dark-web scan. Wrap upstream_request (Wave-Quota retry
+            # policy) in wait_for to keep the per-call cap intact across
+            # backoff attempts.
+            resp = await asyncio.wait_for(
+                upstream_request(
+                    session, 'GET', url,
+                    headers=headers,
+                    provider_label='darkweb:otx',
+                ),
+                timeout=20,
+            )
+            if resp.status == 200:
+                data = await resp.json()
+                pulses = data.get('pulse_info', {}).get('pulses', [])
+                for pulse in pulses[:15]:
+                    tags = pulse.get('tags', [])
+                    # Determine match type based on tags
+                    match_type = 'BRAND_MENTION'
+                    severity = 'MEDIUM'
+                    if any(t in tags for t in ['phishing', 'credential']):
+                        match_type = 'CREDENTIAL_LEAK'
+                        severity = 'HIGH'
+                    elif any(t in tags for t in ['malware', 'c2', 'botnet', 'trojan']):
+                        match_type = 'MALWARE_C2'
+                        severity = 'HIGH'
+                    elif any(t in tags for t in ['apt', 'targeted']):
+                        match_type = 'TARGETING_DISCUSSION'
+                        severity = 'HIGH'
 
-                        results.append({
-                            'source': 'THREAT_INTEL_FEED',
-                            'sourceName': 'AlienVault OTX',
-                            'sourceUrl': f"https://otx.alienvault.com/pulse/{pulse.get('id', '')}",
-                            'sourceId': pulse.get('id', ''),
-                            'title': pulse.get('name', f'OTX Pulse mentioning {domain}'),
-                            'contentSnippet': pulse.get('description', '')[:500] or f"Threat intelligence pulse mentioning {domain}. Tags: {', '.join(tags[:10])}",
-                            'matchType': match_type,
-                            'matchedKeywords': [domain] + [t for t in tags if domain.split('.')[0] in t.lower()][:5],
-                            'severity': severity,
-                            'relevanceScore': min(95, 50 + len(tags) * 5),
-                            'riskScore': min(90, 40 + len(pulses) * 3),
-                            'discoveredAt': pulse.get('created', None),
-                            'metadata': {
-                                'tags': tags[:20],
-                                'references': pulse.get('references', [])[:5],
-                                'adversary': pulse.get('adversary', None),
-                                'targeted_countries': pulse.get('targeted_countries', []),
-                            }
-                        })
+                    results.append({
+                        'source': 'THREAT_INTEL_FEED',
+                        'sourceName': 'AlienVault OTX',
+                        'sourceUrl': f"https://otx.alienvault.com/pulse/{pulse.get('id', '')}",
+                        'sourceId': pulse.get('id', ''),
+                        'title': pulse.get('name', f'OTX Pulse mentioning {domain}'),
+                        'contentSnippet': pulse.get('description', '')[:500] or f"Threat intelligence pulse mentioning {domain}. Tags: {', '.join(tags[:10])}",
+                        'matchType': match_type,
+                        'matchedKeywords': [domain] + [t for t in tags if domain.split('.')[0] in t.lower()][:5],
+                        'severity': severity,
+                        'relevanceScore': min(95, 50 + len(tags) * 5),
+                        'riskScore': min(90, 40 + len(pulses) * 3),
+                        'discoveredAt': pulse.get('created', None),
+                        'metadata': {
+                            'tags': tags[:20],
+                            'references': pulse.get('references', [])[:5],
+                            'adversary': pulse.get('adversary', None),
+                            'targeted_countries': pulse.get('targeted_countries', []),
+                        }
+                    })
+            otx_success = True
+        except asyncio.TimeoutError:
+            otx_error_code = 'TimeoutError'
+            if agent:
+                agent.report_progress("OTX query timed out after 20s")
         except Exception as e:
+            otx_error_code = type(e).__name__
             if agent:
                 agent.report_progress(f"OTX query failed: {str(e)}")
+        finally:
+            # Free the connection before returning. release() is idempotent
+            # on already-closed responses, so this is safe whether the wait_for
+            # returned normally, timed out, or raised.
+            if resp is not None:
+                try:
+                    await resp.release()
+                except Exception:
+                    pass
+            if lease_token:
+                await reconcile_call(
+                    'OTX_API',
+                    lease_token,
+                    units=1,
+                    success=otx_success,
+                    error_code=otx_error_code,
+                )
         return results
 
     async def _query_github(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
-        """Search GitHub repositories and code for brand mentions and exposed secrets."""
+        """Search GitHub repositories and code for brand mentions and exposed secrets.
+
+        DRP→ASM T2.8c: per-tenant lease via ProviderQuotaService.checkout for
+        GITHUB_SEARCH. Falls back to GITHUB_TOKEN env var if no integration
+        is configured. Reconciles with the actual number of API calls made
+        (repo search + code search × terms).
+        """
         results = []
+
+        # Lease GITHUB_SEARCH quota up front. The github_token from the lease
+        # supersedes the env var when present.
+        lease_token: Optional[str] = None
+        github_token = ''
+        try:
+            lease = await checkout_provider('GITHUB_SEARCH', requested_units=1)
+            github_token = lease.get('apiKey') or ''
+            lease_token = lease.get('leaseToken')
+        except QuotaExceededError as e:
+            if agent:
+                agent.report_progress(
+                    f"GitHub search quota exceeded: retry in {e.retry_after}s"
+                )
+            return results
+        except IntegrationCredentialsError:
+            github_token = os.environ.get('GITHUB_TOKEN', '')
+
+        success = True
+        error_code: Optional[str] = None
         try:
             if agent:
                 agent.report_progress(f"Searching GitHub for {domain}")
 
-            github_token = os.environ.get('GITHUB_TOKEN', '')
+            # Use the leased github_token (set above from checkout_provider, with
+            # an env fallback only on credential-service failure). The earlier
+            # unconditional re-read of GITHUB_TOKEN clobbered the lease key even
+            # on a successful 200 lease, bypassing per-tenant quota accounting.
+            if not github_token:
+                github_token = os.environ.get('GITHUB_TOKEN', '')
 
             headers = {
                 'Accept': 'application/vnd.github.v3+json',
@@ -1053,8 +1209,19 @@ class DarkWebMonitorTool(ToolPlugin):
                 await asyncio.sleep(2)  # Rate limiting
 
         except Exception as e:
+            success = False
+            error_code = type(e).__name__
             if agent:
                 agent.report_progress(f"GitHub search failed: {str(e)}")
+        finally:
+            if lease_token:
+                await reconcile_call(
+                    'GITHUB_SEARCH',
+                    lease_token,
+                    units=1,
+                    success=success,
+                    error_code=error_code,
+                )
         return results
 
     async def _query_gitlab(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
@@ -1326,91 +1493,11 @@ class DarkWebMonitorTool(ToolPlugin):
                 agent.report_progress(f"Pastebin search failed: {str(e)}")
         return results
 
-    async def _query_searxng(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
-        results = []
-        searxng_url = os.environ.get('SEARXNG_URL', '').strip()
-        if not searxng_url:
-            if agent:
-                agent.report_progress("No SEARXNG_URL configured, skipping SearxNG search")
-            return results
-
-        try:
-            if agent:
-                agent.report_progress(f"Searching SearxNG for {domain}")
-
-            engines = os.environ.get(
-                'SEARXNG_ENGINES',
-                'github,gitlab,bitbucket,npm,stackoverflow',
-            )
-            max_terms = self._get_env_int('SEARXNG_MAX_TERMS', 6, minimum=1, maximum=12)
-            max_results_per_term = self._get_env_int('SEARXNG_MAX_RESULTS_PER_TERM', 24, minimum=4, maximum=100)
-
-            for search_term in self._extract_search_terms(domain, patterns)[:max_terms]:
-                async with session.get(
-                    searxng_url.rstrip('/'),
-                    params={
-                        'q': search_term,
-                        'format': 'json',
-                        'engines': engines,
-                    },
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    data = await resp.json()
-                    for item in data.get('results', [])[:max_results_per_term]:
-                        content = item.get('content') or item.get('title') or ''
-                        engine = str(item.get('engine') or 'meta-search').lower()
-                        source_type = 'CODE_REPOSITORY'
-                        match_type = 'BRAND_MENTION'
-                        relevance_score = 62
-                        risk_score = 40
-
-                        if engine == 'stackoverflow':
-                            match_type = 'TARGETING_DISCUSSION'
-                            relevance_score = 58
-                            risk_score = 35
-                        elif engine == 'npm':
-                            relevance_score = 64
-                            risk_score = 42
-
-                        matched_keywords = self._text_matches_search_terms(
-                            f"{item.get('title', '')} {content} {item.get('url', '')}",
-                            patterns,
-                            source_type,
-                        ) or [search_term]
-
-                        exact_term_match = search_term.lower() in (
-                            f"{item.get('title', '')} {content} {item.get('url', '')}"
-                        ).lower()
-                        if exact_term_match:
-                            relevance_score += 8
-                        if matched_keywords and matched_keywords != [search_term]:
-                            relevance_score += min(12, len(matched_keywords) * 4)
-
-                        results.append({
-                            'source': source_type,
-                            'sourceName': f"SearxNG ({item.get('engine', 'meta-search')})",
-                            'sourceUrl': item.get('url', ''),
-                            'sourceId': f"searxng-{hashlib.sha256((item.get('url', '') or item.get('title', '')).encode()).hexdigest()[:12]}",
-                            'title': item.get('title', f'Search result for {search_term}'),
-                            'contentSnippet': content[:500],
-                            'matchType': match_type,
-                            'matchedKeywords': matched_keywords,
-                            'severity': 'LOW',
-                            'relevanceScore': min(95, relevance_score),
-                            'riskScore': risk_score,
-                            'discoveredAt': item.get('publishedDate'),
-                            'metadata': {
-                                'engine': item.get('engine'),
-                                'category': item.get('category'),
-                                'searchTerm': search_term,
-                            }
-                        })
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            if agent:
-                agent.report_progress(f"SearxNG search failed: {str(e)}")
-        return results
+    # 2026-05-16 — _query_searxng() removed. SearxNG decommissioned. Stale
+    # SearxNG-tagged DarkWebMention rows were purged in the same commit.
+    # The native github / gitlab / npm / stackoverflow queries (_query_github
+    # etc. above) provide direct coverage of the engines SearxNG was
+    # meta-searching across, so no functionality is lost.
 
     async def _query_leakcheck(self, session: aiohttp.ClientSession, domain: str, agent=None) -> List[Dict]:
         """Query LeakCheck public API for credential leaks"""
@@ -1583,13 +1670,48 @@ class DarkWebMonitorTool(ToolPlugin):
 
         Free tier (no API key): Uses Phonebook API for email enumeration.
         Pro tier (INTELX_API_KEY set): Uses Intelligent Search for deeper results.
+
+        DRP→ASM T2.8c: per-tenant lease via ProviderQuotaService.checkout for
+        INTELX. The lease covers a single logical IntelX query — whether it
+        runs as phonebook (free) or intelligent-search (pro), and whether pro
+        falls back to phonebook on 402. One operation == one lease.
+        Falls back to INTELX_API_KEY env when no integration is configured.
+
+        Feature-flagged via ENABLE_INTELX (default off — DRP locked-decision
+        #5). When disabled, returns [] immediately without leasing or
+        calling IntelX.
         """
-        results = []
+        results: List[Dict] = []
+
+        if not ENABLE_INTELX:
+            if agent:
+                agent.report_progress(
+                    "IntelX query skipped: ENABLE_INTELX is off (set ENABLE_INTELX=true to enable)"
+                )
+            return results
+
+        # Lease INTELX quota up front.
+        lease_token: Optional[str] = None
+        api_key = ''
+        try:
+            lease = await checkout_provider('INTELX', requested_units=1)
+            api_key = lease.get('apiKey') or ''
+            lease_token = lease.get('leaseToken')
+        except QuotaExceededError as e:
+            if agent:
+                agent.report_progress(
+                    f"IntelX quota exceeded: retry in {e.retry_after}s"
+                )
+            return results
+        except IntegrationCredentialsError:
+            api_key = os.environ.get('INTELX_API_KEY', '')
+
+        ix_success = False
+        ix_error_code: Optional[str] = None
         try:
             if agent:
                 agent.report_progress(f"Querying IntelX.io for {domain}")
 
-            api_key = os.environ.get('INTELX_API_KEY', '')
             base_url = 'https://2.intelx.io'
 
             if api_key:
@@ -1601,10 +1723,20 @@ class DarkWebMonitorTool(ToolPlugin):
 
             if agent and results:
                 agent.report_progress(f"IntelX found {len(results)} results for {domain}")
-
+            ix_success = True
         except Exception as e:
+            ix_error_code = type(e).__name__
             if agent:
                 agent.report_progress(f"IntelX query failed: {str(e)}")
+        finally:
+            if lease_token:
+                await reconcile_call(
+                    'INTELX',
+                    lease_token,
+                    units=1,
+                    success=ix_success,
+                    error_code=ix_error_code,
+                )
         return results
 
     async def _query_intelx_phonebook(self, session: aiohttp.ClientSession, base_url: str, domain: str, agent=None) -> List[Dict]:
@@ -1785,7 +1917,7 @@ class DarkWebMonitorTool(ToolPlugin):
 
             return results
         except Exception as e:
-            print(f"[DarkWebMonitor] Failed to load simulation data: {e}")
+            logger.warning(f"[DarkWebMonitor] Failed to load simulation data: {e}")
             return []
 
 

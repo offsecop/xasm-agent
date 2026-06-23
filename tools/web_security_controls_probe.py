@@ -5,7 +5,8 @@ These checks complement vulnerability probes by flagging missing browser,
 cookie, TLS, and form controls that materially affect exploitability.
 """
 
-from typing import Any, Dict, Iterable, List, Tuple
+import re
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -17,6 +18,7 @@ from tools._agentic_exploration_common import (
     fetch_text,
     normalize_url,
     parse_headers,
+    redact_headers,
     same_origin,
 )
 
@@ -108,14 +110,22 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                 except Exception:
                     continue
                 visited.add(url)
-                mapped = extract_html_map(fetched.get("text", ""), fetched.get("url") or url)
+                fetched_url = fetched.get("url") or url
+                mapped = extract_html_map(fetched.get("text", ""), fetched_url)
                 queue.extend([u for u in mapped.get("links", []) if self._allowed(base, u)])
+                for form in mapped.get("forms", []):
+                    if isinstance(form, dict):
+                        form["sourcePage"] = fetched_url
+                        form["sourceStatus"] = fetched.get("status")
+                        form["sourceHeaders"] = fetched.get("headers") or {}
                 forms.extend(mapped.get("forms", []))
                 page = {
-                    "url": fetched.get("url") or url,
+                    "url": fetched_url,
                     "status": fetched.get("status"),
                     "headers": fetched.get("headers", {}),
                     "title": mapped.get("title"),
+                    "request": _format_request("GET", fetched_url, headers),
+                    "response": _format_response(fetched.get("status"), fetched.get("headers") or {}),
                 }
                 pages.append(page)
                 created = self._header_findings(page)
@@ -162,6 +172,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
         headers = {str(k).lower(): str(v) for k, v in (page.get("headers") or {}).items()}
         parsed = urlparse(url)
         findings: List[Dict[str, Any]] = []
+        evidence = _page_evidence(page, "response_headers")
 
         if parsed.scheme == "https" and "strict-transport-security" not in headers:
             findings.append(
@@ -174,6 +185,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                     "Set HSTS with an appropriate max-age after confirming all subresources support HTTPS.",
                     "missing-hsts",
                     [],
+                    evidence,
                 )
             )
         if "content-security-policy" not in headers:
@@ -187,6 +199,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                     "Add a restrictive CSP to reduce XSS impact and control script/style sources.",
                     "missing-csp",
                     [],
+                    evidence,
                 )
             )
         if "x-frame-options" not in headers and "frame-ancestors" not in headers.get("content-security-policy", "").lower():
@@ -200,6 +213,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                     "Set CSP frame-ancestors or X-Frame-Options to restrict framing.",
                     "missing-frame-protection",
                     [],
+                    evidence,
                 )
             )
         if "x-content-type-options" not in headers:
@@ -213,6 +227,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                     "Set X-Content-Type-Options: nosniff on HTML and script/style responses.",
                     "missing-nosniff",
                     [],
+                    evidence,
                 )
             )
         return findings
@@ -225,6 +240,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
             return []
         cookies = raw if isinstance(raw, list) else [raw]
         findings: List[Dict[str, Any]] = []
+        evidence = _page_evidence(page, "set_cookie_flags")
         for cookie in cookies:
             cookie_text = str(cookie)
             name = cookie_text.split("=", 1)[0].strip()
@@ -247,6 +263,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                         "Set HttpOnly, Secure, and SameSite where compatible with the application flow.",
                         "weak-cookie-flags",
                         [f"cookie={name}", f"missing={','.join(missing)}"],
+                        evidence,
                     )
                 )
         return findings
@@ -268,6 +285,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
             types = {str(f.get("type") or "").lower() for f in fields if isinstance(f, dict)}
             is_password = "password" in types or bool(names & PASSWORD_FIELD_NAMES)
             probes.append({"type": "form_controls", "url": action, "method": method, "fields": sorted(names), "passwordForm": is_password})
+            evidence = _form_evidence(form, action, method, sorted(names))
             if method in {"POST", "PUT", "PATCH"} and not (names & CSRF_FIELD_NAMES):
                 findings.append(
                     self._finding(
@@ -279,6 +297,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                         "Add per-request CSRF tokens or a robust SameSite-based anti-CSRF design.",
                         "missing-csrf-field",
                         [f"method={method}", f"fields={','.join(sorted(names))[:160]}"],
+                        evidence,
                     )
                 )
             if is_password and urlparse(action).scheme == "http":
@@ -292,6 +311,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                         "Serve login pages and submit credentials over HTTPS only.",
                         "http-password-form",
                         [action],
+                        evidence,
                     )
                 )
         return findings, probes
@@ -325,8 +345,10 @@ class WebSecurityControlsProbeTool(ToolPlugin):
         remediation: str,
         matcher_name: str,
         extracted: List[str],
+        evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return {
+        cleaned_evidence = _clean_evidence(evidence or {})
+        finding = {
             "template-id": template_id,
             "templateID": template_id,
             "matched-at": matched_at,
@@ -341,6 +363,17 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                 "remediation": remediation,
             },
         }
+        if cleaned_evidence:
+            finding["evidence"] = cleaned_evidence
+            if cleaned_evidence.get("request"):
+                finding["request"] = cleaned_evidence["request"]
+            if cleaned_evidence.get("response"):
+                finding["response"] = cleaned_evidence["response"]
+            matched_content = cleaned_evidence.get("matchedContent") or "\n".join(str(item) for item in extracted if item)
+            if matched_content:
+                finding["matched-content"] = matched_content
+                finding["matchedContent"] = matched_content
+        return finding
 
     def _dedupe_findings(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         origin_scoped_templates = {
@@ -376,6 +409,101 @@ class WebSecurityControlsProbeTool(ToolPlugin):
     def _finding_line(self, finding: Dict[str, Any]) -> str:
         info = finding.get("info") or {}
         return f"[{str(info.get('severity', 'info')).upper()}] {info.get('name')} - {finding.get('matched-at')}"
+
+
+def _page_evidence(page: Dict[str, Any], matcher: str) -> Dict[str, Any]:
+    request = str(page.get("request") or "")
+    response = str(page.get("response") or "")
+    status = page.get("status")
+    matched = f"matcher={matcher}\nstatus={status}\nurl={page.get('url')}"
+    return _clean_evidence(
+        {
+            "request": request,
+            "response": response,
+            "matchedContent": matched,
+            "status": status,
+            "url": page.get("url"),
+            "evidenceType": "http_response_headers",
+        }
+    )
+
+
+def _form_evidence(form: Dict[str, Any], action: str, method: str, fields: List[str]) -> Dict[str, Any]:
+    source_page = str(form.get("sourcePage") or action or "")
+    request = _format_request("GET", source_page, {})
+    response = _format_response(form.get("sourceStatus"), form.get("sourceHeaders") or {})
+    matched = "\n".join(
+        [
+            f"observed_form_method={method}",
+            f"observed_form_action={action}",
+            f"observed_form_fields={','.join(fields)[:240]}",
+        ]
+    )
+    return _clean_evidence(
+        {
+            "request": request,
+            "response": response,
+            "matchedContent": matched,
+            "sourcePage": source_page,
+            "formAction": action,
+            "formMethod": method,
+            "formFields": fields,
+            "evidenceType": "observed_form_markup",
+        }
+    )
+
+
+def _format_request(method: str, url: str, headers: Dict[str, str]) -> str:
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        host = parsed.netloc
+    except Exception:
+        path = url or "/"
+        host = ""
+    lines = [f"{str(method or 'GET').upper()} {path} HTTP/1.1"]
+    if host:
+        lines.append(f"Host: {host}")
+    redacted = redact_headers(headers or {})
+    for key, value in redacted.items():
+        if key.lower() == "host":
+            continue
+        lines.append(f"{key}: {_redact_text(str(value))}")
+    return "\n".join(lines)
+
+
+def _format_response(status: Any, headers: Dict[str, Any]) -> str:
+    reason = "OK" if int(status or 0) and int(status or 0) < 400 else ""
+    lines = [f"HTTP/1.1 {int(status or 0)} {reason}".rstrip()]
+    redacted = redact_headers({str(k): str(v) for k, v in (headers or {}).items()})
+    for key, value in redacted.items():
+        lines.append(f"{key}: {_redact_text(str(value))}")
+    return "\n".join(lines[:80])
+
+
+def _clean_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned: Dict[str, Any] = {}
+    for key, value in (evidence or {}).items():
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, str):
+            cleaned[key] = _redact_text(value)
+        elif isinstance(value, dict):
+            cleaned[key] = {str(k): _redact_text(str(v)) for k, v in value.items()}
+        elif isinstance(value, list):
+            cleaned[key] = [_redact_text(str(item)) for item in value]
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def _redact_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?i)(authorization|cookie|set-cookie|x-api-key)\s*:\s*[^\n\r]+", r"\1: [REDACTED]", text)
+    text = re.sub(r"(?i)(session|token|secret|password|passwd|pwd)=([^;,\s]+)", r"\1=[REDACTED]", text)
+    return text
 
 
 def get_tool():

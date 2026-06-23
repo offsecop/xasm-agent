@@ -30,25 +30,103 @@ from tools._agentic_exploration_common import (
 
 
 SAFE_METHODS = {"GET", "HEAD"}
-ID_PARAM_NAMES = {"id", "uid", "user", "userid", "user_id", "account", "accountid", "order", "orderid", "basket", "basketid", "cart", "cartid"}
+ID_PARAM_NAMES = {
+    "id",
+    "uid",
+    "user",
+    "userid",
+    "user_id",
+    "account",
+    "accountid",
+    "account_id",
+    "order",
+    "orderid",
+    "order_id",
+    "basket",
+    "basketid",
+    "cart",
+    "cartid",
+    "transaction",
+    "transactionid",
+    "transaction_id",
+    "payment",
+    "paymentid",
+    "payment_id",
+    "bill",
+    "billid",
+    "bill_id",
+    "biller",
+    "billerid",
+    "biller_id",
+    "card",
+    "cardid",
+    "card_id",
+    "merchant",
+    "merchantid",
+    "merchant_id",
+    "reservation",
+    "reservationid",
+    "reservation_id",
+    "reference",
+    "ref",
+}
 SENSITIVE_PATH_MARKERS = {
     "admin",
+    "api_key",
+    "apikey",
     "account",
     "accounts",
     "basket",
+    "bill",
+    "biller",
+    "billers",
+    "bills",
     "cart",
+    "card",
+    "cards",
+    "config",
+    "debug",
+    "diagnostic",
+    "diagnostics",
     "customer",
     "customers",
+    "internal",
     "invoice",
+    "iam",
+    "metadata",
+    "meta-data",
+    "merchant",
+    "merchants",
     "order",
     "orders",
+    "payment",
+    "payments",
     "profile",
+    "reservation",
+    "reservations",
+    "secret",
+    "secrets",
+    "settings",
+    "system-info",
     "token",
+    "transaction",
+    "transactions",
+    "transfer",
+    "transfers",
     "user",
     "users",
+    "virtual",
     "wallet",
 }
 SENSITIVE_BODY_MARKERS = {
+    "account_number",
+    "amount",
+    "accessKeyId",
+    "access_key_id",
+    "apiKey",
+    "api_key",
+    "aws_access_key_id",
+    "aws_secret_access_key",
     "email",
     "password",
     "role",
@@ -60,7 +138,14 @@ SENSITIVE_BODY_MARKERS = {
     "balance",
     "address",
     "phone",
-    "apiKey",
+    "merchant",
+    "pin",
+    "private_key",
+    "routing",
+    "secret_access_key",
+    "secret_key",
+    "session_token",
+    "transaction",
 }
 COMMON_READONLY_API_PATHS = [
     "/api",
@@ -72,7 +157,40 @@ COMMON_READONLY_API_PATHS = [
     "/api/me",
     "/api/profile",
     "/api/account",
+    "/api/accounts",
+    "/api/accounts/1",
+    "/api/check_balance?account_number=1001",
     "/api/orders",
+    "/api/transactions",
+    "/api/transactions/1",
+    "/api/bill-categories",
+    "/api/billers",
+    "/api/billers/1",
+    "/api/bills",
+    "/api/bills/1",
+    "/api/cards",
+    "/api/cards/1",
+    "/api/virtual-cards",
+    "/api/virtual-cards/1",
+    "/api/payments",
+    "/api/payments/1",
+    "/api/merchants",
+    "/api/merchants/1",
+    "/api/v1/merchants/me",
+    "/api/v1/merchants/1",
+    "/api/v1/payments",
+    "/api/v1/payments/1",
+    "/api/config",
+    "/api/internal/config",
+    "/api/internal/secret",
+    "/api/ai/system-info",
+    "/api/system-info",
+    "/internal/secret",
+    "/internal/config.json",
+    "/latest/meta-data/",
+    "/latest/meta-data/iam/security-credentials/",
+    "/latest/meta-data/iam/security-credentials/vulnbank-role",
+    "/sup3r_s3cr3t_admin",
     "/api/cart",
     "/api/basket",
     "/rest/user/whoami",
@@ -564,8 +682,17 @@ class ApiAccessControlProbeTool(ToolPlugin):
         return bool(re.search(r"/(?:api|rest|graphql|v\d+|rpc)(?:/|$)", urlparse(str(url)).path, re.I))
 
     def _sensitive_endpoint(self, url: str) -> bool:
-        parts = {part.lower() for part in re.split(r"[^A-Za-z0-9_]+", urlparse(url).path) if part}
-        return bool(parts & SENSITIVE_PATH_MARKERS)
+        path = urlparse(url).path.lower()
+        parts = {part.lower() for part in re.split(r"[^A-Za-z0-9_]+", path) if part}
+        if parts & SENSITIVE_PATH_MARKERS:
+            return True
+        return bool(
+            re.search(
+                r"/(?:latest/meta-data|meta-data|iam/security-credentials|system-info|internal|secrets?|debug|diagnostics?|config)(?:/|$)",
+                path,
+                re.I,
+            )
+        )
 
     def _sensitive_body_markers(self, body: str) -> List[str]:
         lowered = body.lower()
@@ -776,6 +903,16 @@ class ApiAccessControlProbeTool(ToolPlugin):
         }
         if evidence:
             finding["evidence"] = evidence
+            request = evidence.get("anonymousRequest") or evidence.get("request")
+            response = evidence.get("anonymousResponse") or evidence.get("response")
+            if request:
+                finding["request"] = request
+            if response:
+                finding["response"] = response
+            matched_content = "\n".join(str(item) for item in extracted[:12] if item)
+            if matched_content:
+                finding["matched-content"] = matched_content
+                finding["matchedContent"] = matched_content
         return finding
 
     def _dedupe_findings(self, findings: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:

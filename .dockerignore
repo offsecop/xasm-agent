@@ -1,0 +1,49 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs (root .gitignore already ignores /agent/venv, but build context
+# is computed independently — keep this in sync)
+venv/
+.venv/
+env/
+
+# VCS / editor
+.git/
+.gitignore
+.dockerignore
+.vscode/
+.idea/
+.DS_Store
+
+# Local secrets / state
+.env
+.env.*
+
+# Docs / audit-only files — not needed at runtime
+README.md
+*.md
+reports/
+
+# Tests + fixtures — not needed in the production image. The agents do not
+# run pytest at boot; keeping these out of the image reduces context size.
+tests/
+
+# Ad-hoc dev scripts that live next to the agent but are not part of the
+# production runtime path
+final_e2e_test.py
+test_agentic_candidate_coverage.py
+test_lfi_file_exposure_probe.py
+monitor_results.sh
+run_docker_agent.sh
+setup-agent.sh
+docker-compose.agent.yml
+
+# OS junk
+Thumbs.db

@@ -1,0 +1,45 @@
+# Single docker-compose agent config — Phase 3a consolidation.
+#
+# All 5 docker agent services (agent, agent2 … agent5) load THIS file and
+# differentiate themselves via env vars set per-service in `docker-compose.yml`:
+#
+#   AGENT_NAME             — display name (Agent-001 … Agent-005)
+#   AGENT_DESCRIPTION      — display description
+#   AGENT_CLIENT_ID        — tenant installer client id (overrides server.client_id)
+#   AGENT_CLIENT_SECRET    — tenant installer client secret (overrides server.client_secret)
+#   AGENT_INSTALLATION_UID — per-instance id; MUST be distinct per running
+#                            instance. Each distinct UID maps to its OWN Agent
+#                            row + currentLoad counter, so throughput scales
+#                            with instance count.
+#
+# Per-instance identity (WP4): there is NO static single API key. On boot each
+# instance self-enrolls via POST /agents/enroll/tenant (client creds +
+# installationUid) and receives its OWN installationUid-prefixed API key. The
+# local installer creds are seeded by backend/setup-agents.ts and match the
+# AGENT_CLIENT_ID / AGENT_CLIENT_SECRET in docker-compose.yml.
+#
+# Copy this file to `agent/config.docker.yaml` (gitignored) before running
+# `docker-compose up`. The default values below are sane for local dev.
+
+agent:
+  name: "Agent-001"  # Overridden by AGENT_NAME at runtime
+  description: "ASM Platform Agent (Docker)"  # Overridden by AGENT_DESCRIPTION
+  tags:
+    - internal
+    - scanner
+
+server:
+  api_url: "http://backend:3001/api"
+  # Tenant installer credentials. Leave empty here in docker-compose — they are
+  # supplied via AGENT_CLIENT_ID / AGENT_CLIENT_SECRET env vars per service. In
+  # cloud, these come from per-tenant installer creds (Secret Manager, WP7).
+  client_id: ""
+  client_secret: ""
+
+heartbeat_interval: 30
+poll_interval: 5
+
+# Job notifications arrive via Pub/Sub PUSH (POST /pubsub/push); no pull
+# subscription is created by the agent. project_id is informational only.
+pubsub:
+  project_id: "xasm-local"

@@ -12,6 +12,8 @@ from plugin_interface import ToolPlugin
 from typing import Dict, Any
 from urllib.parse import urlparse
 
+from lib.wrapper_helpers import resolve_targets as _resolve_targets
+
 
 SEVERITY_MAP = {
     "OK": None,       # Passing check, not a finding
@@ -77,8 +79,13 @@ class TestsslScanTool(ToolPlugin):
         job_id = parameters.get("_job_id", "unknown")
         agent = parameters.get("_agent")
 
-        # Resolve targets list
-        targets_list = self._resolve_targets(parameters)
+        # Resolve targets list. Strip whitespace defensively for the single-target
+        # branch (testssl is sensitive to host:port parsing of stray spaces).
+        targets_list = [
+            t.strip() if isinstance(t, str) else t
+            for t in _resolve_targets(parameters)
+        ]
+        targets_list = [t for t in targets_list if t]
         if not targets_list:
             return {"success": False, "error": "'target' or 'targets' parameter is required",
                     "output": {"findings": [], "total_checks": 0, "issues_found": 0,
@@ -345,23 +352,6 @@ class TestsslScanTool(ToolPlugin):
             return f"{target}:443", None
 
         return target, None
-
-    def _resolve_targets(self, parameters: Dict[str, Any]) -> list:
-        """Resolve target/targets parameter into a list."""
-        if 'targets' in parameters and parameters['targets']:
-            targets_param = parameters['targets']
-            if isinstance(targets_param, str):
-                try:
-                    return json.loads(targets_param)
-                except json.JSONDecodeError:
-                    return [targets_param]
-            elif isinstance(targets_param, list):
-                return targets_param
-            else:
-                return [str(targets_param)]
-        elif 'target' in parameters and parameters.get('target', '').strip():
-            return [parameters['target'].strip()]
-        return []
 
 
 def get_tool():

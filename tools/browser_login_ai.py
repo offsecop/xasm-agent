@@ -29,6 +29,73 @@ _SESSION_COOKIE_NAME_PREFIXES = (
     "_session", "_csrf", "remember", "rememberme",
 )
 
+LOGIN_PATH_HINTS = (
+    "/login",
+    "/log-in",
+    "/signin",
+    "/sign-in",
+    "/sign_in",
+    "/auth/login",
+    "/auth/sign-in",
+    "/auth/signin",
+    "/account/login",
+    "/user/login",
+    "/session/login",
+)
+
+REGISTER_PATH_HINTS = (
+    "/register",
+    "/signup",
+    "/sign-up",
+    "/sign_up",
+    "/account/register",
+    "/user/register",
+)
+
+
+def registration_fallback_allowed(login_instructions: Optional[str]) -> bool:
+    """Return true when the auth profile explicitly authorizes account creation."""
+    text = (login_instructions or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "register",
+            "registration",
+            "signup",
+            "sign up",
+            "create a new account",
+            "create account",
+            "account does not exist",
+        )
+    )
+
+
+def build_registration_candidate_urls(login_url: str, discovered_hrefs: Optional[List[str]] = None) -> List[str]:
+    """Build same-origin registration URLs, preferring links found on the page."""
+    parsed_login = urlparse(login_url)
+    login_host = parsed_login.netloc.lower()
+    candidates: List[str] = []
+
+    for href in discovered_hrefs or []:
+        if not href:
+            continue
+        candidate = urljoin(login_url, href)
+        parsed_candidate = urlparse(candidate)
+        if parsed_candidate.netloc.lower() == login_host:
+            candidates.append(candidate)
+
+    for path in REGISTER_PATH_HINTS:
+        candidates.append(urljoin(login_url, path))
+
+    seen = set()
+    deduped: List[str] = []
+    for candidate in candidates:
+        normalized = candidate.rstrip("/")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(candidate)
+    return deduped
+
 USERNAME_FALLBACK_STRATEGIES = [
     {"type": "css", "selector": "input#i0116"},
     {"type": "css", "selector": "input[name='loginfmt']"},
@@ -68,11 +135,19 @@ SUBMIT_FALLBACK_STRATEGIES = [
     {"type": "css", "selector": "button:has-text('Login')"},
     {"type": "css", "selector": "button:has-text('Continue')"},
     {"type": "css", "selector": "button:has-text('Next')"},
+    {"type": "css", "selector": "button:has-text('Create Account')"},
+    {"type": "css", "selector": "button:has-text('Register')"},
+    {"type": "css", "selector": "button:has-text('Sign up')"},
+    {"type": "css", "selector": "button:has-text('Sign Up')"},
     {"type": "css", "selector": "button:has-text('Entrar')"},
     {"type": "css", "selector": "button:has-text('Continuar')"},
     {"type": "css", "selector": "input[value='Next']"},
     {"type": "css", "selector": "input[value='Sign in']"},
     {"type": "css", "selector": "input[value='Verify']"},
+    {"type": "css", "selector": "input[value='Create Account']"},
+    {"type": "css", "selector": "input[value='Register']"},
+    {"type": "css", "selector": "input[value='Sign up']"},
+    {"type": "css", "selector": "input[value='Sign Up']"},
     {"type": "css", "selector": "input[value='Entrar']"},
     {"type": "css", "selector": "input[value='Continuar']"},
     {"type": "css", "selector": "button:has-text('Microsoft')"},
@@ -111,6 +186,30 @@ OTP_FALLBACK_STRATEGIES = [
     {"type": "css", "selector": "input[name*='otp' i]"},
     {"type": "css", "selector": "input[id*='code' i]"},
     {"type": "css", "selector": "input[name*='code' i]"},
+]
+
+OTP_FIELD_DISCOVERY_SELECTORS = [
+    "input#idTxtBx_SAOTCC_OTC",
+    "input[name='otc']",
+    "input[autocomplete='one-time-code']",
+    "input[inputmode='numeric']",
+    "input[inputmode='decimal']",
+    "input[type='tel']",
+    "input[type='number']",
+    "input[id*='otp' i]",
+    "input[name*='otp' i]",
+    "input[id*='code' i]",
+    "input[name*='code' i]",
+    "input[id*='mfa' i]",
+    "input[name*='mfa' i]",
+    "input[id*='2fa' i]",
+    "input[name*='2fa' i]",
+    "input[aria-label*='code' i]",
+    "input[aria-label*='código' i]",
+    "input[aria-label*='codigo' i]",
+    "input[placeholder*='code' i]",
+    "input[placeholder*='código' i]",
+    "input[placeholder*='codigo' i]",
 ]
 
 NUMBER_MATCHING_MARKERS = (
@@ -283,6 +382,64 @@ def filter_login_cookies(
     return out
 
 
+def looks_like_login_url(url: Optional[str]) -> bool:
+    """Best-effort guard against using a login page as the validation target."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        path = (parsed.path or "/").lower().rstrip("/")
+    except Exception:
+        return False
+    if path in ("", "/"):
+        return False
+    return any(path == hint or path.endswith(hint) for hint in LOGIN_PATH_HINTS)
+
+
+def normalize_protected_resource_url(
+    login_url: str,
+    protected_resource_url: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Avoid validating a captured session by reopening the login page itself.
+
+    Operators sometimes paste `/auth/sign-in` or an IdP login URL into the
+    protected-resource field. That makes every successful MFA flow look failed
+    because validation navigates straight back to a page with login inputs.
+    Prefer the login origin when it is a safer app landing page.
+    """
+    candidate = (protected_resource_url or "").strip() or None
+    if not candidate or not looks_like_login_url(candidate):
+        return candidate, None
+
+    try:
+        parsed_login = urlparse(login_url)
+        login_origin = (
+            f"{parsed_login.scheme}://{parsed_login.netloc}/"
+            if parsed_login.scheme and parsed_login.netloc
+            else None
+        )
+    except Exception:
+        login_origin = None
+
+    fallback = login_url.strip() if login_url and not looks_like_login_url(login_url) else login_origin
+    if fallback and fallback != candidate:
+        return (
+            fallback,
+            (
+                f"Protected resource URL '{candidate}' looks like a login page; "
+                f"using '{fallback}' for session validation instead."
+            ),
+        )
+
+    return (
+        None,
+        (
+            f"Protected resource URL '{candidate}' looks like a login page; "
+            "session validation will rely on post-login state instead."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # HTML extraction - pull out form-related elements to keep token count low
 # ---------------------------------------------------------------------------
@@ -351,6 +508,16 @@ async def fill_field(
             await locator.wait_for(state="visible", timeout=timeout_ms)
             await locator.click(timeout=timeout_ms)
             await locator.fill(value, timeout=timeout_ms)
+            try:
+                await locator.evaluate(
+                    """el => {
+                      el.dispatchEvent(new Event('input', { bubbles: true }));
+                      el.dispatchEvent(new Event('change', { bubbles: true }));
+                      el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }"""
+                )
+            except Exception:
+                pass
             print(f"[AI Login]   {field_name}: filled via '{stype}' strategy (attempt {i+1})")
             return True
         except Exception as exc:
@@ -392,6 +559,524 @@ async def click_element(
             print(f"[AI Login]   {element_name}: strategy '{stype}' failed - {exc.__class__.__name__}")
             continue
 
+    return False
+
+
+async def press_enter_on_field(
+    page,
+    strategies: list,
+    field_name: str,
+    timeout_ms: int = 1500,
+) -> bool:
+    """Focus the first visible field matching strategies and press Enter."""
+    for i, strat in enumerate(strategies):
+        stype = strat.get("type", "")
+        try:
+            if stype == "role":
+                locator = page.get_by_role(strat["role"], name=strat.get("name"))
+            elif stype == "label":
+                locator = page.get_by_label(strat["label"])
+            elif stype == "placeholder":
+                locator = page.get_by_placeholder(strat["placeholder"])
+            elif stype == "css":
+                locator = page.locator(strat["selector"])
+            elif stype == "test_id":
+                locator = page.get_by_test_id(strat["testId"])
+            else:
+                continue
+
+            locator = first_locator(locator)
+            await locator.wait_for(state="visible", timeout=timeout_ms)
+            await locator.focus(timeout=timeout_ms)
+            await locator.press("Enter", timeout=timeout_ms)
+            print(f"[AI Login]   {field_name}: submitted via Enter on '{stype}' strategy (attempt {i+1})")
+            return True
+        except Exception as exc:
+            print(f"[AI Login]   {field_name}: Enter strategy '{stype}' failed - {exc.__class__.__name__}")
+            continue
+
+    return False
+
+
+async def submit_nearest_form_for_field(page, strategies: list, field_name: str) -> bool:
+    """Submit the closest form around an OTP field when no visible button works.
+
+    Some SPA/IdP screens render custom controls that are difficult to locate by
+    accessible name, but the OTP input still belongs to a form. `requestSubmit`
+    triggers the page's normal submit handler without bypassing client logic.
+    """
+    script = """
+    (selectors) => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      };
+      const candidates = [];
+      for (const selector of selectors) {
+        try {
+          for (const el of document.querySelectorAll(selector)) {
+            if (isVisible(el)) candidates.push(el);
+          }
+        } catch (_) {}
+      }
+      if (!candidates.length) {
+        for (const el of document.querySelectorAll("input, textarea, [contenteditable='true']")) {
+          if (isVisible(el)) candidates.push(el);
+        }
+      }
+      for (const el of candidates) {
+        const form = el.closest && el.closest('form');
+        if (form) {
+          if (typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+          } else {
+            form.submit();
+          }
+          return { submitted: true, method: 'form' };
+        }
+      }
+      return { submitted: false };
+    }
+    """
+    selectors = [
+        strat.get("selector")
+        for strat in strategies
+        if strat.get("type") == "css" and strat.get("selector")
+    ]
+    try:
+        result = await page.evaluate(script, selectors)
+        if result and result.get("submitted"):
+            print(f"[AI Login]   {field_name}: submitted nearest form via DOM {result.get('method')}")
+            return True
+    except Exception as exc:
+        print(f"[AI Login]   {field_name}: DOM form submit failed - {exc.__class__.__name__}")
+    return False
+
+
+async def fill_credentials_and_submit(
+    page,
+    username: str,
+    password: str,
+    *,
+    submit_strategies: list,
+    action_label: str,
+    field_timeout_ms: int = 2500,
+) -> bool:
+    """Fill username/password and submit the closest auth form using page handlers."""
+    username_ok = await fill_field(
+        page,
+        USERNAME_FALLBACK_STRATEGIES,
+        username,
+        f"{action_label} username",
+        timeout_ms=field_timeout_ms,
+    )
+    password_ok = await fill_field(
+        page,
+        PASSWORD_FALLBACK_STRATEGIES,
+        password,
+        f"{action_label} password",
+        timeout_ms=field_timeout_ms,
+    )
+    if not (username_ok and password_ok):
+        return False
+
+    submitted = await click_element(
+        page,
+        submit_strategies,
+        f"{action_label} submit",
+        timeout_ms=field_timeout_ms,
+    )
+    if not submitted:
+        submitted = await press_enter_on_field(
+            page,
+            PASSWORD_FALLBACK_STRATEGIES,
+            f"{action_label} submit",
+            timeout_ms=1500,
+        )
+    if not submitted:
+        submitted = await submit_nearest_form_for_field(
+            page,
+            USERNAME_FALLBACK_STRATEGIES + PASSWORD_FALLBACK_STRATEGIES,
+            f"{action_label} submit",
+        )
+    return submitted
+
+
+async def discover_registration_hrefs(page) -> List[str]:
+    """Read likely registration/signup links from the current page."""
+    try:
+        hrefs = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('a[href], button[data-href], [role="link"][href]'))
+              .map((el) => ({
+                href: el.getAttribute('href') || el.getAttribute('data-href') || '',
+                text: (el.innerText || el.textContent || '').trim().toLowerCase()
+              }))
+              .filter((item) => /register|sign\\s*up|signup|create account/.test(`${item.href} ${item.text}`))
+              .map((item) => item.href)
+              .filter(Boolean)
+              .slice(0, 8)"""
+        )
+        return hrefs if isinstance(hrefs, list) else []
+    except Exception as exc:
+        print(f"[AI Login]   Registration link discovery failed - {exc.__class__.__name__}")
+        return []
+
+
+async def attempt_registration_then_login(
+    page,
+    *,
+    login_url: str,
+    username: str,
+    password: str,
+    login_instructions: Optional[str],
+    page_load_strategy: str,
+    timeout_ms: int,
+    post_submit_wait_ms: int,
+    submit_strategies: list,
+    agent,
+) -> bool:
+    """Create the seeded lab account, then retry login, when instructions allow it."""
+    if not registration_fallback_allowed(login_instructions):
+        return False
+
+    print("[AI Login]   Login failed; attempting instruction-authorized registration fallback")
+    if agent:
+        agent.report_progress(
+            current_operation="Login failed; attempting account registration fallback",
+            current_target=login_url,
+        )
+
+    discovered_hrefs = await discover_registration_hrefs(page)
+    for register_url in build_registration_candidate_urls(login_url, discovered_hrefs):
+        try:
+            print(f"[AI Login]   Trying registration URL: {register_url}")
+            await page.goto(register_url, wait_until=page_load_strategy, timeout=timeout_ms)
+            await asyncio.sleep(max(post_submit_wait_ms, 1000) / 1000)
+            registered = await fill_credentials_and_submit(
+                page,
+                username,
+                password,
+                submit_strategies=submit_strategies,
+                action_label="registration",
+            )
+            if not registered:
+                continue
+
+            try:
+                await page.wait_for_load_state(page_load_strategy, timeout=min(timeout_ms, 15000))
+            except Exception:
+                pass
+            await asyncio.sleep(max(post_submit_wait_ms, 2500) / 1000)
+
+            print("[AI Login]   Registration submitted; retrying login with same credentials")
+            await page.goto(login_url, wait_until=page_load_strategy, timeout=timeout_ms)
+            await asyncio.sleep(max(post_submit_wait_ms, 1000) / 1000)
+            logged_in = await fill_credentials_and_submit(
+                page,
+                username,
+                password,
+                submit_strategies=submit_strategies,
+                action_label="post-registration login",
+            )
+            if not logged_in:
+                continue
+
+            try:
+                await page.wait_for_load_state(page_load_strategy, timeout=min(timeout_ms, 15000))
+            except Exception:
+                pass
+            await asyncio.sleep(max(post_submit_wait_ms, 1000) / 1000)
+            return True
+        except Exception as exc:
+            print(f"[AI Login]   Registration fallback failed for {register_url}: {exc.__class__.__name__}")
+            continue
+
+    return False
+
+
+def otp_selectors_from_strategies(strategies: list) -> List[str]:
+    """Build a de-duplicated selector list for OTP discovery/fill operations."""
+    selectors: List[str] = []
+    for strat in strategies or []:
+        if strat.get("type") == "css" and strat.get("selector"):
+            selectors.append(strat["selector"])
+    selectors.extend(OTP_FIELD_DISCOVERY_SELECTORS)
+    seen = set()
+    deduped: List[str] = []
+    for selector in selectors:
+        if selector and selector not in seen:
+            deduped.append(selector)
+            seen.add(selector)
+    return deduped
+
+
+async def get_otp_value_summary(page, strategies: list) -> Dict[str, Any]:
+    """Inspect visible OTP-like fields and report whether a complete code is present.
+
+    Some IdPs render six separate one-character inputs. Treating the first
+    non-empty box as a complete OTP causes the login loop to resubmit the same
+    partial code repeatedly, so we count all visible OTP fields together.
+    """
+    script = """
+    (selectors) => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      };
+      const isUsableInput = (el) => {
+        if (!el || !isVisible(el) || el.disabled || el.readOnly) return false;
+        const tag = String(el.tagName || '').toLowerCase();
+        if (tag !== 'input' && tag !== 'textarea') return false;
+        const type = String(el.getAttribute('type') || '').toLowerCase();
+        return !['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(type);
+      };
+      const looksOtp = (el) => {
+        const attrs = [
+          el.id,
+          el.name,
+          el.getAttribute('autocomplete'),
+          el.getAttribute('inputmode'),
+          el.getAttribute('aria-label'),
+          el.getAttribute('placeholder'),
+          el.getAttribute('data-testid'),
+          el.getAttribute('data-test'),
+        ].map((v) => String(v || '').toLowerCase()).join(' ');
+        const type = String(el.getAttribute('type') || '').toLowerCase();
+        const maxLength = Number(el.getAttribute('maxlength') || el.maxLength || 0);
+        return (
+          attrs.includes('otp') ||
+          attrs.includes('one-time-code') ||
+          attrs.includes('mfa') ||
+          attrs.includes('2fa') ||
+          attrs.includes('verification') ||
+          attrs.includes('verificação') ||
+          attrs.includes('codigo') ||
+          attrs.includes('código') ||
+          attrs.includes('code') ||
+          attrs.includes('token') ||
+          attrs.includes('numeric') ||
+          type === 'tel' ||
+          type === 'number' ||
+          (maxLength > 0 && maxLength <= 8)
+        );
+      };
+      const seen = new Set();
+      const fields = [];
+      const add = (el) => {
+        if (!isUsableInput(el) || !looksOtp(el) || seen.has(el)) return;
+        seen.add(el);
+        const rect = el.getBoundingClientRect();
+        fields.push({
+          value: String(el.value || ''),
+          maxLength: Number(el.getAttribute('maxlength') || el.maxLength || 0),
+          top: rect.top,
+          left: rect.left,
+        });
+      };
+      for (const selector of selectors || []) {
+        try {
+          for (const el of document.querySelectorAll(selector)) add(el);
+        } catch (_) {}
+      }
+      for (const el of document.querySelectorAll('input, textarea')) add(el);
+      fields.sort((a, b) => (a.top - b.top) || (a.left - b.left));
+      const values = fields.map((field) => String(field.value || '').trim()).filter(Boolean);
+      const totalLength = values.reduce((sum, value) => sum + value.length, 0);
+      return {
+        fieldCount: fields.length,
+        filledCount: values.length,
+        totalLength,
+        maxLength: values.reduce((max, value) => Math.max(max, value.length), 0),
+        splitLike: fields.length > 1 && fields.some((field) => field.maxLength > 0 && field.maxLength <= 1),
+      };
+    }
+    """
+    try:
+        summary = await page.evaluate(script, otp_selectors_from_strategies(strategies))
+        return summary if isinstance(summary, dict) else {}
+    except Exception:
+        return {}
+
+
+def otp_summary_looks_complete(summary: Dict[str, Any], expected_length: int = 0) -> bool:
+    """Return true only when visible OTP fields contain a plausible full code."""
+    try:
+        total_length = int(summary.get("totalLength") or 0)
+        field_count = int(summary.get("fieldCount") or 0)
+    except Exception:
+        return False
+
+    if total_length <= 0:
+        return False
+
+    if expected_length >= 4:
+        return total_length >= min(expected_length, 8)
+
+    # Avoid treating a single split OTP digit as a complete code.
+    if field_count > 1:
+        return total_length >= 4
+
+    return total_length >= 4
+
+
+async def fill_split_otp_fields(
+    page,
+    value: str,
+    strategies: list,
+    field_name: str,
+) -> bool:
+    """Fill OTP values across multiple one-character inputs when present."""
+    code = re.sub(r"\s+", "", str(value or ""))
+    if len(code) < 2:
+        return False
+
+    script = """
+    ({ selectors, code }) => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      };
+      const isUsableInput = (el) => {
+        if (!el || !isVisible(el) || el.disabled || el.readOnly) return false;
+        const tag = String(el.tagName || '').toLowerCase();
+        if (tag !== 'input') return false;
+        const type = String(el.getAttribute('type') || '').toLowerCase();
+        return !['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(type);
+      };
+      const looksOtp = (el) => {
+        const attrs = [
+          el.id,
+          el.name,
+          el.getAttribute('autocomplete'),
+          el.getAttribute('inputmode'),
+          el.getAttribute('aria-label'),
+          el.getAttribute('placeholder'),
+          el.getAttribute('data-testid'),
+          el.getAttribute('data-test'),
+        ].map((v) => String(v || '').toLowerCase()).join(' ');
+        const type = String(el.getAttribute('type') || '').toLowerCase();
+        const maxLength = Number(el.getAttribute('maxlength') || el.maxLength || 0);
+        return (
+          attrs.includes('otp') ||
+          attrs.includes('one-time-code') ||
+          attrs.includes('mfa') ||
+          attrs.includes('2fa') ||
+          attrs.includes('verification') ||
+          attrs.includes('verificação') ||
+          attrs.includes('codigo') ||
+          attrs.includes('código') ||
+          attrs.includes('code') ||
+          attrs.includes('token') ||
+          attrs.includes('numeric') ||
+          type === 'tel' ||
+          type === 'number' ||
+          (maxLength > 0 && maxLength <= 8)
+        );
+      };
+      const seen = new Set();
+      const fields = [];
+      const add = (el) => {
+        if (!isUsableInput(el) || !looksOtp(el) || seen.has(el)) return;
+        seen.add(el);
+        const rect = el.getBoundingClientRect();
+        fields.push({ el, top: rect.top, left: rect.left, maxLength: Number(el.getAttribute('maxlength') || el.maxLength || 0) });
+      };
+      for (const selector of selectors || []) {
+        try {
+          for (const el of document.querySelectorAll(selector)) add(el);
+        } catch (_) {}
+      }
+      for (const el of document.querySelectorAll('input')) add(el);
+      fields.sort((a, b) => (a.top - b.top) || (a.left - b.left));
+      if (fields.length < 2) return { filled: false, fieldCount: fields.length, filledCount: 0 };
+
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      const dispatch = (el, val) => {
+        if (nativeSetter) {
+          nativeSetter.call(el, val);
+        } else {
+          el.value = val;
+        }
+        try {
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: val }));
+        } catch (_) {
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: val }));
+      };
+
+      let filledCount = 0;
+      for (let i = 0; i < fields.length && i < code.length; i += 1) {
+        dispatch(fields[i].el, code[i]);
+        filledCount += 1;
+      }
+      if (filledCount > 0) fields[Math.min(filledCount - 1, fields.length - 1)].el.focus();
+      return { filled: filledCount >= Math.min(code.length, fields.length), fieldCount: fields.length, filledCount };
+    }
+    """
+    try:
+        result = await page.evaluate(
+            script,
+            {
+                "selectors": otp_selectors_from_strategies(strategies),
+                "code": code,
+            },
+        )
+        if result and result.get("filled"):
+            print(
+                f"[AI Login]   {field_name}: filled split OTP fields "
+                f"({result.get('filledCount')}/{result.get('fieldCount')})"
+            )
+            return True
+    except Exception as exc:
+        print(f"[AI Login]   {field_name}: split OTP fill failed - {exc.__class__.__name__}")
+    return False
+
+
+async def fill_operator_otp(
+    page,
+    strategies: list,
+    operator_code: str,
+    field_name: str,
+    timeout_ms: int = 1500,
+) -> bool:
+    """Fill operator-provided OTP and verify the full code landed in the page."""
+    expected_length = len(re.sub(r"\s+", "", str(operator_code or "")))
+    summary = await get_otp_value_summary(page, strategies)
+    if int(summary.get("fieldCount") or 0) > 1:
+        await fill_split_otp_fields(page, operator_code, strategies, field_name)
+        summary = await get_otp_value_summary(page, strategies)
+        if otp_summary_looks_complete(summary, expected_length):
+            return True
+
+    normal_filled = await fill_field(
+        page,
+        strategies,
+        operator_code,
+        field_name,
+        timeout_ms=timeout_ms,
+    )
+    summary = await get_otp_value_summary(page, strategies)
+    if otp_summary_looks_complete(summary, expected_length):
+        return True
+
+    if normal_filled and int(summary.get("fieldCount") or 0) == 0:
+        # Some unusual locators cannot be introspected from querySelectorAll,
+        # but Playwright confirmed the field was filled.
+        return True
+
+    if normal_filled and expected_length >= 4:
+        print(
+            f"[AI Login]   {field_name}: incomplete OTP after fill "
+            f"({summary.get('totalLength', 0)}/{expected_length}); waiting for complete code"
+        )
     return False
 
 
@@ -685,6 +1370,8 @@ def _looks_like_auth_url(current_url: str, login_url: str, protected_resource_ur
     protected_host = _url_host(protected_resource_url)
     if not current_host:
         return True
+    if looks_like_login_url(current_url):
+        return True
     if protected_host and _domain_matches(current_host, protected_host):
         return False
     if login_host and _domain_matches(current_host, login_host):
@@ -705,6 +1392,107 @@ def _looks_like_auth_url(current_url: str, login_url: str, protected_resource_ur
             "identity",
         )
     )
+
+
+async def assess_current_page_session(
+    page,
+    protected_resource_url: Optional[str],
+    *,
+    login_url: str,
+) -> Dict[str, Any]:
+    """Assess whether the current browser page already proves an authenticated app session."""
+    current_url = page.url or ""
+    current_host = _url_host(current_url)
+    protected_host = _url_host(protected_resource_url)
+    login_host = _url_host(login_url)
+    page_inputs = await count_visible_login_inputs(page)
+    auth_inputs = await count_visible_auth_challenge_inputs(page)
+    same_protected_host = bool(
+        current_host
+        and protected_host
+        and _domain_matches(current_host, protected_host)
+    )
+    same_login_host = bool(
+        current_host
+        and login_host
+        and _domain_matches(current_host, login_host)
+    )
+    login_host_is_protected = bool(
+        login_host
+        and protected_host
+        and _domain_matches(login_host, protected_host)
+    )
+    external_login_host = same_login_host and not login_host_is_protected
+    auth_url = _looks_like_auth_url(
+        current_url,
+        login_url,
+        protected_resource_url or login_url,
+    )
+
+    valid = bool(
+        same_protected_host
+        and not external_login_host
+        and not auth_url
+        and auth_inputs == 0
+    )
+    return {
+        "valid": valid,
+        "current_url": current_url,
+        "visible_login_inputs": auth_inputs,
+        "visible_page_inputs": page_inputs,
+        "auth_url": auth_url,
+        "same_protected_host": same_protected_host,
+        "same_login_host": same_login_host,
+        "external_login_host": external_login_host,
+    }
+
+
+async def infer_post_submit_state_without_llm(
+    page,
+    *,
+    login_url: str,
+    protected_resource_url: Optional[str],
+    classify_error: Exception,
+) -> Optional[Dict[str, Any]]:
+    """Deterministically classify common MFA states when the LLM response is malformed."""
+    current_url = page.url or login_url
+    protected_url = protected_resource_url or login_url
+
+    number_challenge = await extract_number_matching_challenge(page)
+    if number_challenge.get("detected"):
+        return {
+            "status": "mfa",
+            "codeField": [],
+            "submitButton": SUBMIT_FALLBACK_STRATEGIES,
+            "numberMatchingCode": number_challenge.get("challengeCode"),
+            "authenticatorNumber": number_challenge.get("challengeCode"),
+            "message": (
+                "Deterministic number matching fallback after post-submit "
+                f"classification failed: {classify_error}"
+            ),
+        }
+
+    has_otp_field = await has_visible_fillable_field(
+        page,
+        OTP_FALLBACK_STRATEGIES,
+        timeout_ms=800,
+    )
+    auth_inputs = await count_visible_auth_challenge_inputs(page)
+    auth_url = _looks_like_auth_url(current_url, login_url, protected_url)
+
+    if has_otp_field or auth_inputs > 0 or auth_url:
+        return {
+            "status": "mfa",
+            "codeField": OTP_FALLBACK_STRATEGIES if has_otp_field or auth_inputs > 0 else [],
+            "submitButton": SUBMIT_FALLBACK_STRATEGIES,
+            "numberMatchingCode": None,
+            "message": (
+                "Deterministic MFA fallback after post-submit classification "
+                f"failed: {classify_error}"
+            ),
+        }
+
+    return None
 
 
 def _continue_chain_reaches_protected(
@@ -858,6 +1646,19 @@ async def validate_protected_resource_session(
     """
     if not protected_resource_url:
         return {"valid": True, "reason": "no protected resource configured"}
+
+    current_page_assessment = await assess_current_page_session(
+        page,
+        protected_resource_url,
+        login_url=login_url,
+    )
+    if current_page_assessment.get("valid"):
+        return {
+            **current_page_assessment,
+            "reason": "current browser page already reached protected app",
+            "validation_mode": "current_page",
+            "interstitial_actions": [],
+        }
 
     if agent:
         agent.report_progress(
@@ -1050,10 +1851,17 @@ async def ask_backend_relay(
                 ],
             }
         ],
-        "maxOutputTokens": 1500,
+        "maxOutputTokens": 2500,
     }
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout, headers={"X-API-Key": agent_api_key}) as session:
+    # WP6 — forward X-Job-Id so a bootstrap agent's relay spend is billed to the
+    # claimed job's tenant (re-key), not the agent's SYSTEM tenant.
+    try:
+        from lib.integration_credentials import _job_id_headers
+        job_headers = _job_id_headers()
+    except Exception:
+        job_headers = {}
+    async with aiohttp.ClientSession(timeout=timeout, headers={"X-API-Key": agent_api_key, **job_headers}) as session:
         async with session.post(relay_url, json=body, headers={"Content-Type": "application/json"}) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -1068,7 +1876,7 @@ async def ask_claude(client, screenshot_b64: str, text_prompt: str) -> dict:
     response = await asyncio.to_thread(
         client.messages.create,
         model="claude-sonnet-4-20250514",
-        max_tokens=1500,
+        max_tokens=2500,
         messages=[{
             "role": "user",
             "content": [
@@ -1143,7 +1951,7 @@ async def ask_gemini(
         ],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 1500,
+            "maxOutputTokens": 2500,
             "responseMimeType": "application/json",
         },
     }
@@ -1242,6 +2050,33 @@ async def ask_llm(
 # ---------------------------------------------------------------------------
 
 DEBUG_SCREENSHOT_DIR = Path("/tmp/ai_login_debug")
+
+# --- Tenant-isolation hardening (V1): AI-login session artifacts ---------------
+# The headers/cookies/secrets files below carry a tenant's LIVE session credentials
+# and are consumed by a later scan job (dirsearch/katana/nuclei) on the SAME agent.
+# On a shared bootstrap pool that interleaves tenants, leaving them in /tmp for the
+# instance lifetime leaks Tenant A's cookies onto disk while Tenant B's jobs run.
+# Mitigation: a dedicated 0700 dir, 0600 files, and an opportunistic TTL sweep that
+# bounds residue to LOGIN_ARTIFACT_TTL_S (default 1h — generous vs the minutes a
+# login→scan chain actually takes) instead of the instance lifetime.
+LOGIN_ARTIFACT_DIR = Path(os.environ.get("AI_LOGIN_ARTIFACT_DIR", "/tmp/xasm-login-artifacts"))
+LOGIN_ARTIFACT_TTL_S = int(os.environ.get("AI_LOGIN_ARTIFACT_TTL_S", "3600"))
+
+
+def _sweep_stale_login_artifacts() -> None:
+    """Delete login-artifact files older than the TTL. Best-effort; never raises."""
+    try:
+        if not LOGIN_ARTIFACT_DIR.exists():
+            return
+        cutoff = time.time() - LOGIN_ARTIFACT_TTL_S
+        for f in LOGIN_ARTIFACT_DIR.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 async def save_debug_screenshot(page, step: int, description: str, enabled: bool = False) -> Optional[str]:
@@ -1348,7 +2183,19 @@ class BrowserLoginAiTool(ToolPlugin):
         login_instructions = parameters.get('loginInstructions')
         headless = parameters.get('headless', True)
         timeout_seconds = parameters.get('timeout_seconds', 120)
-        protected_resource_url = parameters.get('protectedResourceUrl')
+        original_protected_resource_url = parameters.get('protectedResourceUrl')
+        protected_resource_url, protected_resource_note = normalize_protected_resource_url(
+            login_url,
+            original_protected_resource_url,
+        )
+        if protected_resource_note:
+            print(f"[AI Login] {protected_resource_note}")
+            parameters = {
+                **parameters,
+                'protectedResourceUrl': protected_resource_url,
+                'originalProtectedResourceUrl': original_protected_resource_url,
+                'protectedResourceUrlNote': protected_resource_note,
+            }
         agent = parameters.get('_agent')
 
         print(f"[AI Login] Starting execution for: {login_url}")
@@ -1406,7 +2253,11 @@ class BrowserLoginAiTool(ToolPlugin):
                     'status': 'FAILED',
                     'error': error,
                     'session_valid': False,
-                    'login_method': 'ai'
+                    'login_method': 'ai',
+                    'protected_resource_url': protected_resource_url,
+                    'original_protected_resource_url': original_protected_resource_url,
+                    'protected_resource_url_note': protected_resource_note,
+                    'protected_resource_validation': login_result.get('protected_resource_validation'),
                 }
 
             # Report progress
@@ -1482,6 +2333,8 @@ class BrowserLoginAiTool(ToolPlugin):
                     for c in filtered_cookies
                 ],
                 'protected_resource_url': protected_resource_url,
+                'original_protected_resource_url': original_protected_resource_url,
+                'protected_resource_url_note': protected_resource_note,
                 'protected_resource_validation': login_result.get('protected_resource_validation'),
                 'execution_time_seconds': login_result.get('execution_time', 0),
                 'ai_actions_count': login_result.get('actions_count', 0)
@@ -1582,7 +2435,14 @@ class BrowserLoginAiTool(ToolPlugin):
             if agent:
                 try:
                     import aiohttp
-                    async with aiohttp.ClientSession(headers={'X-API-Key': agent.api_key}) as session:
+                    # WP6 — X-Job-Id lets a bootstrap agent resolve the tenant LLM
+                    # config from the claimed job's tenant (re-key).
+                    try:
+                        from lib.integration_credentials import _job_id_headers
+                        cfg_job_headers = _job_id_headers()
+                    except Exception:
+                        cfg_job_headers = {}
+                    async with aiohttp.ClientSession(headers={'X-API-Key': agent.api_key, **cfg_job_headers}) as session:
                         async with session.get(f"{agent.api_url}/agents/config", timeout=aiohttp.ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 config_data = await resp.json()
@@ -1943,6 +2803,7 @@ class BrowserLoginAiTool(ToolPlugin):
                     # Step 7+: Multi-step MFA loop
                     mfa_round = 0
                     step_num = 7
+                    registration_fallback_attempted = False
 
                     while mfa_round < mfa_max_rounds:
                         mfa_round += 1
@@ -1964,14 +2825,35 @@ class BrowserLoginAiTool(ToolPlugin):
                         try:
                             post_result = await _ask(post_b64, post_prompt)
                         except Exception as classify_error:
+                            post_result = await infer_post_submit_state_without_llm(
+                                page,
+                                login_url=login_url,
+                                protected_resource_url=protected_resource_url,
+                                classify_error=classify_error,
+                            )
+                            if post_result:
+                                print(
+                                    "[AI Login]   Post-submit page classification failed; "
+                                    "continuing with deterministic browser-state fallback: "
+                                    f"{classify_error}"
+                                )
+                            elif protected_resource_url:
+                                print(
+                                    "[AI Login]   Post-submit page classification failed; "
+                                    "no auth challenge detected, deferring to protected resource validation: "
+                                    f"{classify_error}"
+                                )
+                                break
+                            else:
+                                raise
+                        if post_result is None:
                             if protected_resource_url:
                                 print(
                                     "[AI Login]   Post-submit page classification failed; "
                                     "deferring to protected resource validation: "
-                                    f"{classify_error}"
                                 )
                                 break
-                            raise
+                            raise RuntimeError("Post-submit page classification returned no result")
                         status = post_result.get("status", "unknown")
                         print(f"[AI Login]   Page classification: {status}")
                         actions_count += 1
@@ -1984,6 +2866,29 @@ class BrowserLoginAiTool(ToolPlugin):
                             error_msg = post_result.get("message", "Login error detected by AI")
                             print(f"[AI Login]   Login error: {error_msg}")
                             await save_debug_screenshot(page, step_num, "login_error", debug_screenshots)
+                            if not registration_fallback_attempted:
+                                registration_fallback_attempted = True
+                                recovered = await attempt_registration_then_login(
+                                    page,
+                                    login_url=login_url,
+                                    username=username,
+                                    password=password,
+                                    login_instructions=login_instructions,
+                                    page_load_strategy=page_load_strategy,
+                                    timeout_ms=timeout_seconds * 1000,
+                                    post_submit_wait_ms=post_submit_wait_ms,
+                                    submit_strategies=submit_strategies,
+                                    agent=agent,
+                                )
+                                if recovered:
+                                    await save_debug_screenshot(
+                                        page,
+                                        step_num,
+                                        "post_registration_login",
+                                        debug_screenshots,
+                                    )
+                                    step_num += 1
+                                    continue
                             return {
                                 'success': False,
                                 'error': f'Login error: {error_msg}',
@@ -2171,7 +3076,7 @@ class BrowserLoginAiTool(ToolPlugin):
                                                 current_operation="Operator MFA code received; filling verification field",
                                                 current_target=page.url or login_url,
                                             )
-                                        otp_filled = await fill_field(
+                                        otp_filled = await fill_operator_otp(
                                             page,
                                             code_strategies,
                                             operator_code,
@@ -2181,33 +3086,25 @@ class BrowserLoginAiTool(ToolPlugin):
                                         if otp_filled:
                                             break
 
-                                for strat in code_strategies:
-                                    try:
-                                        if strat.get("type") == "css":
-                                            val = await page.evaluate(
-                                                f'document.querySelector("{strat["selector"]}")?.value || ""'
-                                            )
-                                        else:
-                                            if strat.get("type") == "role":
-                                                loc = page.get_by_role(strat["role"], name=strat.get("name"))
-                                            elif strat.get("type") == "label":
-                                                loc = page.get_by_label(strat["label"])
-                                            elif strat.get("type") == "placeholder":
-                                                loc = page.get_by_placeholder(strat["placeholder"])
-                                            else:
-                                                continue
-                                            val = await loc.input_value(timeout=2000)
-
-                                        if val and val.strip():
-                                            print(f"[AI Login]   OTP detected after {elapsed+1}s (value length: {len(val.strip())})")
-                                            otp_filled = True
-                                            break
-                                    except Exception:
-                                        continue
+                                otp_summary = await get_otp_value_summary(page, code_strategies)
+                                if otp_summary_looks_complete(otp_summary):
+                                    print(
+                                        f"[AI Login]   OTP detected after {elapsed+1}s "
+                                        f"(total value length: {otp_summary.get('totalLength', 0)}, "
+                                        f"fields: {otp_summary.get('filledCount', 0)}/{otp_summary.get('fieldCount', 0)})"
+                                    )
+                                    otp_filled = True
                                 if otp_filled:
                                     break
                                 if elapsed % 10 == 9:
-                                    print(f"[AI Login]   Still waiting for OTP/operator action... ({elapsed+1}s)")
+                                    if int(otp_summary.get("totalLength") or 0) > 0:
+                                        print(
+                                            f"[AI Login]   Partial OTP detected "
+                                            f"({otp_summary.get('totalLength', 0)} chars across "
+                                            f"{otp_summary.get('filledCount', 0)} field(s)); waiting for complete code..."
+                                        )
+                                    else:
+                                        print(f"[AI Login]   Still waiting for OTP/operator action... ({elapsed+1}s)")
                                 await asyncio.sleep(1)
 
                             if not otp_filled:
@@ -2274,19 +3171,65 @@ class BrowserLoginAiTool(ToolPlugin):
                             step_num += 1
                             continue
 
-                        # Click the MFA submit/continue button
-                        print(f"[AI Login]   Clicking MFA submit/continue (round {mfa_round})")
-                        ok = await click_element(
-                            page,
-                            mfa_submit_strategies,
-                            "mfa_submit",
-                            timeout_ms=1500,
-                        )
+                        # Submit OTP forms quickly. Some IdPs expose the submit
+                        # action only through the field/form handler, and a long
+                        # button-selector scan can burn most of the MFA timeout.
+                        ok = False
+                        if has_otp_field and otp_filled:
+                            print(f"[AI Login]   Submitting OTP via Enter/form fallback first (round {mfa_round})")
+                            if agent:
+                                agent.report_progress(
+                                    current_operation="OTP filled; submitting verification form",
+                                    current_target=page.url or login_url,
+                                )
+                            ok = await press_enter_on_field(
+                                page,
+                                code_strategies,
+                                "mfa_submit",
+                                timeout_ms=800,
+                            )
+                            if not ok:
+                                ok = await submit_nearest_form_for_field(
+                                    page,
+                                    code_strategies,
+                                    "mfa_submit",
+                                )
+
+                        # Click the MFA submit/continue button when direct field
+                        # submit did not work or this is a non-OTP MFA page.
+                        if not ok:
+                            print(f"[AI Login]   Clicking MFA submit/continue (round {mfa_round})")
+                            ok = await click_element(
+                                page,
+                                mfa_submit_strategies,
+                                "mfa_submit",
+                                timeout_ms=1200,
+                            )
                         if not ok:
                             print("[AI Login]   WARNING: Could not click MFA submit button")
                             await save_debug_screenshot(page, step_num, f"mfa_round{mfa_round}_submit_failed", debug_screenshots)
                             if has_otp_field:
-                                break
+                                if agent:
+                                    agent.report_progress(
+                                        current_operation="MFA submit button not found; trying Enter/form fallback",
+                                        current_target=page.url or login_url,
+                                    )
+                                ok = await press_enter_on_field(
+                                    page,
+                                    code_strategies,
+                                    "mfa_submit",
+                                    timeout_ms=1500,
+                                )
+                                if not ok:
+                                    ok = await submit_nearest_form_for_field(
+                                        page,
+                                        code_strategies,
+                                        "mfa_submit",
+                                    )
+                                if not ok:
+                                    print("[AI Login]   WARNING: MFA fallback submit failed")
+                                    break
+                                actions_count += 1
                         else:
                             actions_count += 1
 
@@ -2311,6 +3254,9 @@ class BrowserLoginAiTool(ToolPlugin):
                         settle_ms=max(initial_render_wait_ms, 1000),
                         agent=agent,
                     )
+                    if parameters.get('protectedResourceUrlNote'):
+                        protected_validation['protected_resource_url_note'] = parameters.get('protectedResourceUrlNote')
+                        protected_validation['original_protected_resource_url'] = parameters.get('originalProtectedResourceUrl')
                     if not protected_validation.get("valid"):
                         error = protected_validation.get("reason") or "protected resource validation failed"
                         print(f"[AI Login] Protected resource validation FAILED: {error}")
@@ -2360,15 +3306,20 @@ class BrowserLoginAiTool(ToolPlugin):
         storage_state: dict
     ) -> Dict[str, str]:
         """Generate output files for Katana and Nuclei"""
-        # Generate unique output paths based on timestamp
-        timestamp = int(time.time())
-        headers_file = f'/tmp/ai_login_headers_{timestamp}.txt'
-        cookies_file = f'/tmp/ai_login_cookies_{timestamp}.json'
-        secrets_file = f'/tmp/ai_login_secrets_{timestamp}.yaml'
-
-        # Ensure directories exist
-        for file_path in [headers_file, cookies_file, secrets_file]:
-            Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        # V1 hardening: dedicated 0700 dir + TTL sweep so a tenant's live session
+        # credentials don't linger in shared /tmp, and a per-call random suffix so
+        # two concurrent logins on a shared pool can't collide on a same-second
+        # timestamp and read each other's file.
+        _sweep_stale_login_artifacts()
+        LOGIN_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(LOGIN_ARTIFACT_DIR, 0o700)
+        except OSError:
+            pass
+        token = f'{int(time.time())}_{os.urandom(4).hex()}'
+        headers_file = str(LOGIN_ARTIFACT_DIR / f'ai_login_headers_{token}.txt')
+        cookies_file = str(LOGIN_ARTIFACT_DIR / f'ai_login_cookies_{token}.json')
+        secrets_file = str(LOGIN_ARTIFACT_DIR / f'ai_login_secrets_{token}.yaml')
 
         # Generate headers.txt for Katana (single Cookie header with all cookies)
         cookie_values = '; '.join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
@@ -2398,6 +3349,13 @@ class BrowserLoginAiTool(ToolPlugin):
         # Save cookies JSON for reference
         with open(cookies_file, 'w') as f:
             json.dump(cookies, f, indent=2)
+
+        # Restrict to owner-only — these hold live session credentials.
+        for fp in (headers_file, cookies_file, secrets_file):
+            try:
+                os.chmod(fp, 0o600)
+            except OSError:
+                pass
 
         return {
             'headers_file': headers_file,

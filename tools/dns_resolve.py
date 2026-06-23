@@ -243,7 +243,13 @@ class DNSResolveTool(ToolPlugin):
         }
 
     def _resolve_targets(self, parameters: Dict[str, Any]) -> list:
-        """Resolve target/targets parameter into a list."""
+        """Resolve target/targets parameter into a list.
+
+        Intentionally diverges from `lib.wrapper_helpers.resolve_targets`: this
+        tool accepts `target`, `hostname`, `host`, and `domain` keys (the canonical
+        helper only accepts `target`), and applies `_normalize_hostname` to every
+        result. Kept local for that reason — do not consolidate.
+        """
         if 'targets' in parameters and parameters['targets']:
             targets_param = parameters['targets']
             if isinstance(targets_param, str):

@@ -220,7 +220,12 @@ class NucleiFullScanTool(ToolPlugin):
                 common_extra_args.extend(["-exclude-targets", exclude_file])
                 print(f"[Nuclei Full] Excluding {len(exclusion_url_patterns)} URL patterns")
 
-            # Rate limiting from config (overrides defaults)
+            # Rate limiting from config (overrides defaults). Intentionally left at
+            # the conservative tuned values — do NOT raise the rate to speed up the
+            # scan: a higher req/s against a slow/rate-limited target causes
+            # template timeouts = MISSED findings (scan-quality regression). Speed
+            # is not worth any coverage/output risk here. Per-scan rate_limit_config
+            # may override for targets known to tolerate more.
             rl_val = "50"
             c_val = "10"
             bs_val = "10"

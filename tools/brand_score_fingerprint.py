@@ -13,9 +13,59 @@ from plugin_interface import ToolPlugin
 from typing import Dict, Any, List, Optional, Set
 
 
-def _color_frequency_vector(colors: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Build a color->frequency dict from dominant color list."""
-    return {c['hex']: c.get('frequency', 0) for c in colors}
+def _as_list(value: Any) -> list:
+    """Null-coerce a fingerprint signal field to a list.
+
+    Legacy fingerprints (pre `|| []` ingestion coercion) persist signal
+    columns as NULL — `fingerprint.get('logoHashes', [])` returns None for
+    those, bypassing the default. Every signal read must funnel through this.
+    """
+    return value if isinstance(value, list) else []
+
+
+def _as_dict(value: Any) -> dict:
+    """Null-coerce a fingerprint signal field to a dict (see _as_list)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _color_frequency_vector(colors: Any) -> Dict[str, float]:
+    """Build a color->frequency dict from dominant color list.
+
+    Hardened: tolerates None (legacy NULL column), non-list values, and
+    malformed entries (non-dict / missing 'hex').
+    """
+    vector: Dict[str, float] = {}
+    for c in _as_list(colors):
+        if isinstance(c, dict) and c.get('hex'):
+            vector[c['hex']] = c.get('frequency', 0) or 0
+    return vector
+
+
+def _collect_reference_image_hashes(fingerprint: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Reference image hashes, falling back to the nested fingerprintVector."""
+    refs = _as_list(fingerprint.get('referenceImageHashes'))
+    if not refs:
+        refs = _as_list(_as_dict(fingerprint.get('fingerprintVector')).get('referenceImageHashes'))
+    return [r for r in refs if isinstance(r, dict) and r.get('hash')]
+
+
+def _fingerprint_has_usable_signals(fingerprint: Any) -> bool:
+    """True when the fingerprint carries at least one comparable signal.
+
+    A signal-less fingerprint (the poisoned all-NULL legacy shape) can never
+    produce a meaningful score — scoring it would only burn a chromium
+    session. Checked BEFORE the browser launches.
+    """
+    fp = _as_dict(fingerprint)
+    return bool(
+        _as_list(fp.get('dominantColors'))
+        or _as_list(fp.get('logoHashes'))
+        or _as_list(fp.get('fontFamilies'))
+        or _as_list(fp.get('textPatterns'))
+        or _as_dict(fp.get('layoutPatterns'))
+        or fp.get('faviconHash')
+        or _collect_reference_image_hashes(fp)
+    )
 
 
 def _cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float:
@@ -109,7 +159,7 @@ def _looks_like_parked_page(texts: List[str]) -> bool:
 
 def _parse_color_hex(color_str: str) -> Optional[str]:
     """Convert an rgb/rgba CSS color string to hex."""
-    if not color_str:
+    if not color_str or not isinstance(color_str, str):
         return None
     m = re.match(r'rgba?\((\d+),\s*(\d+),\s*(\d+)', color_str)
     if m:
@@ -222,6 +272,27 @@ class BrandScoreFingerprintTool(ToolPlugin):
                 }
             }
 
+        # Pre-chromium guard (flood-control plan §1): a fingerprint with NO
+        # usable signals (legacy all-NULL columns) can never score — fail
+        # structurally BEFORE burning a browser session.
+        if not _fingerprint_has_usable_signals(fingerprint):
+            return {
+                'success': False,
+                'error': (
+                    'fingerprint has no usable signals (all signal fields null/empty) '
+                    '— refusing to launch browser; regenerate the brand fingerprint'
+                ),
+                'output': {
+                    'compositeScore': 0, 'colorScore': 0, 'logoScore': 0,
+                    'fontScore': 0, 'textScore': 0, 'layoutScore': 0, 'faviconScore': 0,
+                    'skipReason': 'empty_fingerprint',
+                    'brandMonitorId': brand_monitor_id,
+                    'typosquatDomainId': typosquat_domain_id,
+                    'targetUrl': target_url,
+                    'tool': 'brand', 'scan_type': 'score_fingerprint',
+                }
+            }
+
         if agent:
             agent.report_progress(
                 current_operation=f"Scoring {target_url} against brand fingerprint",
@@ -274,7 +345,7 @@ class BrandScoreFingerprintTool(ToolPlugin):
             }
 
         # Build target color frequency from raw CSS colors
-        target_colors_raw = target_identity.get('colors', [])
+        target_colors_raw = _as_list(target_identity.get('colors'))
         target_hex_colors: list = []
         for c in target_colors_raw:
             hx = _parse_color_hex(c)
@@ -285,14 +356,22 @@ class BrandScoreFingerprintTool(ToolPlugin):
         total_t = sum(target_color_counter.values()) or 1
         target_color_freq = {h: c / total_t for h, c in target_color_counter.items()}
 
-        brand_color_freq = _color_frequency_vector(fingerprint.get('dominantColors', []))
+        brand_color_freq = _color_frequency_vector(fingerprint.get('dominantColors'))
 
         # 1. Color score (weight 0.25)
         color_score = _cosine_similarity(brand_color_freq, target_color_freq)
 
         # 2. Logo score (weight 0.25)
-        brand_logos = fingerprint.get('logoHashes', [])
-        target_logos = target_identity.get('logos', [])
+        # NULL-coerce + drop malformed entries (non-dict / missing hash) so a
+        # legacy fingerprint can never raise on bl['hash'].
+        brand_logos = [
+            l for l in _as_list(fingerprint.get('logoHashes'))
+            if isinstance(l, dict) and l.get('hash')
+        ]
+        target_logos = [
+            l for l in _as_list(target_identity.get('logos'))
+            if isinstance(l, dict) and l.get('hash')
+        ]
         logo_score = 0.0
         if brand_logos and target_logos:
             best_sim = 0.0
@@ -304,18 +383,22 @@ class BrandScoreFingerprintTool(ToolPlugin):
             logo_score = best_sim
 
         # 3. Font score (weight 0.10)
-        brand_fonts = set(f.lower() for f in fingerprint.get('fontFamilies', []))
-        target_fonts = set(f.lower() for f in target_identity.get('fonts', []))
+        brand_fonts = set(
+            f.lower() for f in _as_list(fingerprint.get('fontFamilies')) if isinstance(f, str)
+        )
+        target_fonts = set(
+            f.lower() for f in _as_list(target_identity.get('fonts')) if isinstance(f, str)
+        )
         font_score = _jaccard_similarity(brand_fonts, target_fonts)
 
         # 4. Text score (weight 0.20)
-        brand_texts = fingerprint.get('textPatterns', [])
-        target_texts = target_identity.get('texts', [])
+        brand_texts = [t for t in _as_list(fingerprint.get('textPatterns')) if isinstance(t, str)]
+        target_texts = [t for t in _as_list(target_identity.get('texts')) if isinstance(t, str)]
         text_score = _ngram_overlap(brand_texts, target_texts)
 
         # 5. Layout score (weight 0.10)
-        brand_layout = fingerprint.get('layoutPatterns', {})
-        target_layout = target_identity.get('layout', {})
+        brand_layout = _as_dict(fingerprint.get('layoutPatterns'))
+        target_layout = _as_dict(target_identity.get('layout'))
         layout_score_val = _layout_score(brand_layout, target_layout)
 
         # 6. Favicon score (weight 0.10)
@@ -326,17 +409,12 @@ class BrandScoreFingerprintTool(ToolPlugin):
             favicon_score = _hamming_distance_normalized(brand_favicon, target_favicon)
 
         # 7. Reference image score (manual uploaded screenshots/logos)
-        reference_image_hashes = fingerprint.get('referenceImageHashes')
-        if not reference_image_hashes and isinstance(fingerprint.get('fingerprintVector'), dict):
-            reference_image_hashes = fingerprint.get('fingerprintVector', {}).get('referenceImageHashes', [])
+        reference_image_hashes = _collect_reference_image_hashes(fingerprint)
 
         reference_image_score = 0.0
         if target_page_hash and reference_image_hashes:
             for ref in reference_image_hashes:
-                ref_hash = ref.get('hash') if isinstance(ref, dict) else None
-                if not ref_hash:
-                    continue
-                sim = _hamming_distance_normalized(ref_hash, target_page_hash)
+                sim = _hamming_distance_normalized(ref['hash'], target_page_hash)
                 if sim > reference_image_score:
                     reference_image_score = sim
 

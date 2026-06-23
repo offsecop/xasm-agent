@@ -4,14 +4,16 @@ Extracts brand visual identity (colors, logos, fonts, layout, text patterns)
 from reference URLs to build a brand fingerprint for typosquat comparison.
 """
 
-import asyncio
 import io
 import json
+import logging
 import os
 import re
 from collections import Counter
 from plugin_interface import ToolPlugin
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 async def extract_page_identity(page, url: str) -> Dict[str, Any]:
@@ -373,7 +375,9 @@ class BrandFingerprintIdentityTool(ToolPlugin):
         if agent:
             agent.report_progress(
                 current_operation=f"Extracting brand identity from {len(reference_urls)} URL(s)",
-                current_target=reference_urls[0],
+                # Asset-only bootstrap path has NO reference URLs — indexing [0]
+                # raised IndexError and left the fingerprint stuck GENERATING.
+                current_target=reference_urls[0] if reference_urls else 'reference-assets',
                 items_processed=0,
                 total_items=len(reference_urls),
             )
@@ -381,58 +385,61 @@ class BrandFingerprintIdentityTool(ToolPlugin):
         identities: List[Dict[str, Any]] = []
         errors: List[str] = []
 
-        try:
-            from playwright.async_api import async_playwright
+        # Asset-only path needs no browser — skip the chromium launch entirely
+        # when there are no reference URLs to visit.
+        if reference_urls:
+            try:
+                from playwright.async_api import async_playwright
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-                context = await browser.new_context(
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                )
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                    context = await browser.new_context(
+                        viewport={'width': 1920, 'height': 1080},
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    )
 
-                for idx, url in enumerate(reference_urls):
-                    try:
-                        page = await context.new_page()
-                        identity = await extract_page_identity(page, url)
-                        await page.close()
+                    for idx, url in enumerate(reference_urls):
+                        try:
+                            page = await context.new_page()
+                            identity = await extract_page_identity(page, url)
+                            await page.close()
 
-                        if identity.get('error'):
-                            errors.append(f"{url}: {identity['error']}")
-                            print(f"[BrandFingerprint] Error for {url}: {identity['error']}")
-                        else:
-                            identities.append(identity)
+                            if identity.get('error'):
+                                errors.append(f"{url}: {identity['error']}")
+                                print(f"[BrandFingerprint] Error for {url}: {identity['error']}")
+                            else:
+                                identities.append(identity)
 
-                        if agent:
-                            agent.report_progress(
-                                current_operation="Extracting brand identity",
-                                current_target=url,
-                                items_processed=idx + 1,
-                                total_items=len(reference_urls),
-                            )
-                            agent.append_output(
-                                f"[BrandFingerprint] Processed {url}: "
-                                f"{len(identity.get('colors', []))} colors, "
-                                f"{len(identity.get('logos', []))} logos, "
-                                f"{len(identity.get('fonts', []))} fonts"
-                            )
-                    except Exception as e:
-                        errors.append(f"{url}: {str(e)[:200]}")
-                        print(f"[BrandFingerprint] Failed for {url}: {e}")
+                            if agent:
+                                agent.report_progress(
+                                    current_operation="Extracting brand identity",
+                                    current_target=url,
+                                    items_processed=idx + 1,
+                                    total_items=len(reference_urls),
+                                )
+                                agent.append_output(
+                                    f"[BrandFingerprint] Processed {url}: "
+                                    f"{len(identity.get('colors', []))} colors, "
+                                    f"{len(identity.get('logos', []))} logos, "
+                                    f"{len(identity.get('fonts', []))} fonts"
+                                )
+                        except Exception as e:
+                            errors.append(f"{url}: {str(e)[:200]}")
+                            print(f"[BrandFingerprint] Failed for {url}: {e}")
 
-                await browser.close()
-        except Exception as e:
-            return {
-                'success': False,
-                'error': f'Playwright browser launch failed: {str(e)[:300]}',
-                'output': {
-                    'fingerprint': None,
-                    'referenceUrlsProcessed': 0,
-                    'brandMonitorId': brand_monitor_id,
-                    'tool': 'brand',
-                    'scan_type': 'fingerprint_identity',
+                    await browser.close()
+            except Exception as e:
+                return {
+                    'success': False,
+                    'error': f'Playwright browser launch failed: {str(e)[:300]}',
+                    'output': {
+                        'fingerprint': None,
+                        'referenceUrlsProcessed': 0,
+                        'brandMonitorId': brand_monitor_id,
+                        'tool': 'brand',
+                        'scan_type': 'fingerprint_identity',
+                    }
                 }
-            }
 
         if not identities and not reference_assets:
             return {
@@ -507,7 +514,7 @@ class BrandFingerprintIdentityTool(ToolPlugin):
         if agent:
             agent.report_progress(
                 current_operation="Brand fingerprint extraction completed",
-                current_target=reference_urls[0],
+                current_target=reference_urls[0] if reference_urls else 'reference-assets',
                 items_processed=len(reference_urls),
                 total_items=len(reference_urls),
             )

@@ -27,7 +27,7 @@ To restart all agents after code changes:
 docker-compose restart agent agent2 agent3 agent4 agent5
 ```
 
-Agent configuration for Docker lives in the per-container `config.agent*.yaml` files, and `config.yaml.example` remains the standalone template.
+Agent configuration for Docker lives in a single shared `config.docker.yaml` (template at `config.docker.yaml.example`) that all 5 containers mount. Per-instance identity (WP4) is established at boot: each container self-enrolls via `POST /agents/enroll/tenant` using the tenant installer creds (`AGENT_CLIENT_ID` / `AGENT_CLIENT_SECRET`) plus its own `AGENT_INSTALLATION_UID` (distinct per service in `docker-compose.yml`), and receives its OWN Agent row + API key — so each running instance has its own `currentLoad` counter and throughput scales with instance count. There is no static per-agent API key. The standalone (non-docker) workflow continues to use `config.yaml.example`.
 
 Dark-web monitoring also supports Tor-routed onion sources through the internal `tor-proxy` service. See [docs/darkweb-onion-monitoring.md](../docs/darkweb-onion-monitoring.md) for the source catalog format and runtime knobs.
 
@@ -93,7 +93,7 @@ class MyCustomTool(ToolPlugin):
         return {"result": "success"}
 ```
 
-4. Add tool to `config.yaml` (standalone) or the relevant `config.agent*.yaml` file for Docker:
+4. Add tool to `config.yaml` (standalone) or to the shared `config.docker.yaml` for Docker (all 5 agents pick it up automatically):
 ```yaml
 tools:
   - name: "custom:my_scanner"
@@ -121,8 +121,9 @@ Key files:
 - `agent_core_rest.py` -- Core agent logic, REST polling, job execution
 - `plugin_interface.py` -- Base class for all tool plugins
 - `plugin_loader.py` -- Tool discovery and loading system
-- `config.agent*.yaml` -- Docker agent configuration files
-- `config.yaml.example` -- Standalone configuration template
+- `config.docker.yaml` -- Shared docker agent configuration (mounted into all 5 containers; per-instance identity via `AGENT_CLIENT_ID`/`AGENT_CLIENT_SECRET` + `AGENT_INSTALLATION_UID` self-enrollment)
+- `config.docker.yaml.example` -- Template for the above
+- `config.yaml.example` -- Standalone (non-docker) configuration template
 - `tools/` -- All scanning tool implementations (62 tools)
 
 ## AI Login Tool (`agent/tools/browser_login_ai.py`)

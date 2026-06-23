@@ -7,8 +7,13 @@ agent:
   
 server:
   api_url: "http://localhost:3001/api"
-  ws_url: "ws://localhost:3001/agent-ws"
-  api_key: "your-agent-api-key-here"
+  # Per-instance enrollment (no static api_key): each instance enrolls via
+  # POST /agents/enroll/tenant with the tenant's client credentials + its own
+  # installationUid, and receives its own per-instance key at boot.
+  client_id: "your-tenant-agent-client-id"
+  client_secret: "your-tenant-agent-client-secret"
+  # AGENT_INSTALLATION_UID env (optional): a stable per-container id; otherwise
+  # the agent derives one (K_REVISION + uuid) so each instance gets its own row.
 
 tools:
   - name: "system:dns_resolve"

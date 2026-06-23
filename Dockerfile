@@ -214,11 +214,19 @@ print('Patched _getActiveTab in mcp-bridge.js for headless mode')"
 RUN mkdir -p /root/.origami-mcp && \
     echo -n "xasm-origami-bridge-token" > /root/.origami-mcp/ws-token
 
-# Install whois and numpy for brand monitoring enrichment and screenshot entropy
+# Install whois and numpy for brand monitoring enrichment and screenshot entropy.
 RUN apt-get update && apt-get install -y whois python3-numpy && rm -rf /var/lib/apt/lists/*
 
 # Copy agent code
 COPY . .
 
-# Run agent via entrypoint (updates nuclei templates on startup)
+# Run agent via entrypoint (updates nuclei templates on startup).
+# PID-1 init / zombie reaping is provided by docker-compose `init: true`
+# (docker-init as PID 1). Browser tools (Playwright chromium in screenshot /
+# fingerprint / scoring jobs) leave exited chrome trees orphaned to PID 1, and
+# without an init they accumulate as zombies until the kernel thread/PID limit
+# is hit. The image previously also shipped a tini ENTRYPOINT, but under
+# `init: true` tini was never PID 1 and only logged a "not running as PID 1"
+# warning — so it was removed. Non-compose deployments (e.g. Cloud Run) must
+# supply their own init equivalent if zombie reaping matters there.
 CMD ["./entrypoint.sh"]

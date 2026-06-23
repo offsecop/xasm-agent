@@ -103,7 +103,7 @@ class DecisionPlanNextTool(ToolPlugin):
                         return merged
             return merged
 
-        forms = merge_items([["forms"], ["browser", "forms"], ["surfaceSnapshot", "forms"]], 120)
+        forms = merge_items([["forms"], ["browser", "forms"], ["surfaceGraph", "forms"], ["surfaceSnapshot", "forms"]], 120)
         api_endpoints = merge_items(
             [
                 ["apiEndpoints"],
@@ -111,34 +111,35 @@ class DecisionPlanNextTool(ToolPlugin):
                 ["api", "apiEndpoints"],
                 ["browserTraffic", "apiEndpoints"],
                 ["traffic", "apiEndpoints"],
+                ["surfaceGraph", "apiEndpoints"],
                 ["surfaceSnapshot", "apiEndpoints"],
             ],
             300,
         )
         xhr_requests = merge_items(
-            [["xhrRequests"], ["browserTraffic", "xhrRequests"], ["traffic", "xhrRequests"], ["surfaceSnapshot", "xhrRequests"]],
+            [["xhrRequests"], ["browserTraffic", "xhrRequests"], ["traffic", "xhrRequests"], ["surfaceGraph", "xhrRequests"], ["surfaceSnapshot", "xhrRequests"]],
             200,
         )
         parameterized_urls = merge_items(
-            [["parameterizedUrls"], ["browserTraffic", "parameterizedUrls"], ["surfaceSnapshot", "parameterizedUrls"]],
+            [["parameterizedUrls"], ["browserTraffic", "parameterizedUrls"], ["surfaceGraph", "parameterizedUrls"], ["surfaceSnapshot", "parameterizedUrls"]],
             220,
         )
         interesting_parameters = merge_items(
-            [["interestingParameters"], ["param", "interestingParameters"], ["surfaceSnapshot", "interestingParameters"]],
+            [["interestingParameters"], ["param", "interestingParameters"], ["surfaceGraph", "interestingParameters"], ["surfaceSnapshot", "interestingParameters"]],
             180,
         )
         hypotheses = merge_items(
             [["hypotheses"], ["js", "hypotheses"], ["surfaceGraph", "hypotheses"], ["surfaceSnapshot", "hypotheses"]],
             240,
         )
-        libraries = merge_items([["libraries"], ["sca", "libraries"], ["surfaceSnapshot", "libraries"]], 160)
-        cves = merge_items([["cves"], ["sca", "cves"], ["surfaceSnapshot", "cves"]], 180)
+        libraries = merge_items([["libraries"], ["sca", "libraries"], ["surfaceGraph", "libraries"], ["surfaceSnapshot", "libraries"]], 160)
+        cves = merge_items([["cves"], ["sca", "cves"], ["surfaceGraph", "cves"], ["surfaceSnapshot", "cves"]], 180)
         graphql = merge_items(
             [["graphql"], ["graphqlHints"], ["api", "graphql"], ["surfaceGraph", "graphql"], ["surfaceSnapshot", "graphql"]],
             80,
         )
         openapi_specs = merge_items(
-            [["openapiSpecs"], ["api", "openapiSpecs"], ["surfaceSnapshot", "openapiSpecs"]],
+            [["openapiSpecs"], ["api", "openapiSpecs"], ["surfaceGraph", "openapiSpecs"], ["surfaceSnapshot", "openapiSpecs"]],
             80,
         )
         exploitation_candidates = merge_items(
@@ -166,7 +167,15 @@ class DecisionPlanNextTool(ToolPlugin):
                 "reflected_xss": "client_side_dangerous_sink",
                 "idor_bola": "idor_candidate",
                 "auth_bypass_or_login_sqli": "auth_bypass_candidate",
+                "auth_recovery_flow": "auth_recovery_candidate",
+                "business_logic_api": "business_logic_candidate",
+                "business_logic_parameter": "business_logic_candidate",
                 "missing_csrf_token": "missing_csrf_token",
+                "merchant_api_candidate": "business_logic_candidate",
+                "mass_assignment_candidate": "mass_assignment_candidate",
+                "openapi_write_operation": "state_changing_api_candidate",
+                "payment_amount_candidate": "business_logic_candidate",
+                "state_changing_api": "state_changing_api_candidate",
                 "state_changing_form": "state_changing_api_candidate",
                 "sensitive_surface": "sensitive_client_route",
             }
@@ -184,7 +193,7 @@ class DecisionPlanNextTool(ToolPlugin):
             if isinstance(candidate, dict):
                 candidate_type = candidate.get("type") or candidate.get("category")
                 if candidate_type:
-                    category_set.add(str(candidate_type))
+                    category_set.update(normalized_categories({"type": candidate_type}))
         hypothesis_categories = sorted(
             category_set
         )
@@ -355,6 +364,43 @@ class DecisionPlanNextTool(ToolPlugin):
                     "risk": "MEDIUM",
                 }
             )
+        if categories & {"business_logic_candidate", "mass_assignment_candidate", "auth_recovery_candidate"}:
+            actions.append(
+                {
+                    "priority": 3.45,
+                    "tool": "api:access_control_probe",
+                    "target": target,
+                    "reason": "business-critical banking/merchant/auth surfaces were observed; validate anonymous/authenticated access and object ownership before broad scanning",
+                    "hypothesis": "business APIs may expose sensitive objects or allow weak authorization boundaries",
+                    "evidenceExpected": "business endpoint request/response evidence with anonymous/authenticated comparison",
+                    "risk": "HIGH",
+                }
+            )
+            actions.append(
+                {
+                    "priority": 3.85,
+                    "tool": "vuln:chain_probe",
+                    "target": target,
+                    "reason": "business parameters need chained tampering checks such as amount, role, status, account, merchant, payment, and transaction identifiers",
+                    "hypothesis": "business-flow parameters may be exploitable only when tested together, not by single scanners",
+                    "evidenceExpected": "tamper attempt request/response proof or explicit no-proof result",
+                    "risk": "HIGH",
+                }
+            )
+        if categories & {"business_logic_candidate", "mass_assignment_candidate", "auth_recovery_candidate"} and (
+            high_risk_allowed or "param:exploit_probe" in recommended
+        ):
+            actions.append(
+                {
+                    "priority": 3.88,
+                    "tool": "param:exploit_probe",
+                    "target": target,
+                    "reason": "business/auth recovery parameters were observed; run bounded parameter abuse probes with request/response evidence",
+                    "hypothesis": "amount, account, reset, session, and privilege parameters may accept unsafe values",
+                    "evidenceExpected": "payload-specific request/response proof",
+                    "risk": "HIGH",
+                }
+            )
         if categories & {"file_path_candidate"} or "lfi:file_exposure_probe" in recommended:
             actions.append(
                 {
@@ -407,6 +453,7 @@ class DecisionPlanNextTool(ToolPlugin):
             summary.get("defaultCredentialHints")
             or summary.get("loginForms")
             or "exploit:chain" in recommended
+            or categories & {"business_logic_candidate", "mass_assignment_candidate", "auth_recovery_candidate"}
         ):
             actions.append(
                 {
@@ -616,11 +663,11 @@ class DecisionPlanNextTool(ToolPlugin):
                 continue
             seen_tools.add(tool)
             deduped.append(action)
-            if len(deduped) >= 10:
+            if len(deduped) >= 12:
                 break
         return deduped
 
-    def _top_exploitation_candidates(self, candidates: List[Any], limit: int = 8) -> List[Dict[str, Any]]:
+    def _top_exploitation_candidates(self, candidates: List[Any], limit: int = 12) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         risk_weight = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
         for candidate in candidates:
@@ -798,6 +845,22 @@ class DecisionPlanNextTool(ToolPlugin):
                     "chain": "vulnerable JS dependency -> runtime route correlation -> exploitability triage",
                     "signal": f"{len(cves)} CVE/GHSA signal(s)",
                     "nextTool": "cve:runtime_probe",
+                }
+            )
+        if any(h.get("category") in {"business_logic_api", "business_logic_candidate", "business_logic_parameter", "payment_amount_candidate", "mass_assignment_candidate"} for h in hypotheses):
+            candidates.append(
+                {
+                    "chain": "business route -> auth/object delta -> parameter tampering validation",
+                    "signal": "business logic candidate",
+                    "nextTool": "vuln:chain_probe",
+                }
+            )
+        if any(h.get("category") in {"auth_recovery_candidate", "auth_recovery_flow"} for h in hypotheses):
+            candidates.append(
+                {
+                    "chain": "auth recovery/session route -> reset/session abuse checks -> access-control validation",
+                    "signal": "auth recovery candidate",
+                    "nextTool": "param:exploit_probe",
                 }
             )
         for hypothesis in hypotheses:
