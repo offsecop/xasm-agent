@@ -376,6 +376,7 @@ class KatanaCrawlTool(ToolPlugin):
 
             # Build return value
             result = {
+                'success': True,
                 'target': target,
                 'endpoints': endpoints,
                 'urls': urls,  # Flat array for workflow chaining
@@ -388,8 +389,14 @@ class KatanaCrawlTool(ToolPlugin):
             if was_killed and len(endpoints) > 0:
                 result['warning'] = f'Process was killed (return code -9) but {len(endpoints)} endpoints were successfully parsed from captured output. Results may be incomplete.'
 
-            # BUG-264: Return list for consistency with multi-target format
-            return [result]
+            # #600 — return a DICT (NOT a list). Every consumer of katana output
+            # expects a dict with top-level urls/endpoints: workflow chaining
+            # ({{json stepN.output.urls}}), ingestion processKatanaOutput
+            # (reads output.urls/output.endpoints), and the backend
+            # normalizeToolOutputShape. The prior BUG-264 list shape was wrapped
+            # into `error` by normalizeToolOutputShape, dropping output.urls and
+            # breaking both the DAST handoff and katana asset ingestion.
+            return result
         except FileNotFoundError:
             return {
                 'error': 'Katana not installed. Install with: go install github.com/projectdiscovery/katana/cmd/katana@latest',
@@ -414,8 +421,15 @@ class KatanaCrawlTool(ToolPlugin):
         cookie: str,
         agent,
         parameters: Dict[str, Any]
-    ) -> list:
-        """Crawl multiple targets and return a list of per-target results"""
+    ) -> dict:
+        """Crawl multiple targets and return an aggregated dict.
+
+        #600 — returns a DICT with top-level deduped urls/endpoints (so workflow
+        chaining {{json stepN.output.urls}}, ingestion, and the backend
+        normalizeToolOutputShape all see output.urls), keeping the per-target
+        breakdown under `perTarget`. Previously returned a bare list, which the
+        backend wrapped into `error`, dropping output.urls.
+        """
         if agent:
             agent.report_progress(
                 current_operation=f"Starting Katana crawl on {len(targets_list)} targets",
@@ -527,11 +541,40 @@ class KatanaCrawlTool(ToolPlugin):
                 if agent:
                     agent.append_output(f"  [Katana] {target}: {str(e)}")
 
-        if agent:
-            total_endpoints = sum(r.get('totalEndpoints', 0) for r in results)
-            agent.append_output(f"[Katana] Total: {total_endpoints} endpoints from {len(targets_list)} targets")
+        # #600 — aggregate per-target results into a DICT with top-level
+        # deduped urls/endpoints so downstream chaining + ingestion +
+        # normalizeToolOutputShape all see output.urls. `perTarget` keeps the
+        # per-target breakdown; per-target errors are surfaced without dropping
+        # the aggregated data.
+        all_urls = []
+        seen_urls = set()
+        all_endpoints = []
+        per_target_errors = []
+        for r in results:
+            for u in (r.get('urls') or []):
+                if u not in seen_urls:
+                    seen_urls.add(u)
+                    all_urls.append(u)
+            all_endpoints.extend(r.get('endpoints') or [])
+            if r.get('error'):
+                per_target_errors.append(r['error'])
 
-        return results
+        if agent:
+            agent.append_output(
+                f"[Katana] Total: {len(all_endpoints)} endpoints from {len(targets_list)} targets"
+            )
+
+        aggregated = {
+            'success': True,
+            'targets': targets_list,
+            'urls': all_urls,
+            'endpoints': all_endpoints,
+            'totalEndpoints': len(all_endpoints),
+            'perTarget': results,
+        }
+        if per_target_errors:
+            aggregated['partialErrors'] = per_target_errors
+        return aggregated
 
 
 def get_tool():

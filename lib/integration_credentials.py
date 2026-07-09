@@ -625,9 +625,13 @@ async def reconcile_call(
     backend; this helper fires and ignores 200.
 
     Failure to reconcile is LOGGED but not raised — we have already made
-    the provider call. The lease will be aged out by the backend's
-    rolling-window logic eventually, so the worst case is over-counting
-    a single call against the cap.
+    the provider call. If the reconcile POST is lost (or this process is
+    killed before it fires), the backend reaper
+    `ProviderQuotaService.expireAbandonedLeases` force-closes the still-open
+    lease on its ~15-minute TTL (success=false, errorCode='lease_abandoned'),
+    so an abandoned lease no longer bleeds paid-vendor quota nor blocks fast
+    job reclaim. Worst case is over-counting a single call against the cap
+    until that reaper tick.
 
     Args:
         provider_key: same provider key passed to checkout (used only in

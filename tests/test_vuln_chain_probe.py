@@ -1070,5 +1070,38 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GET /latest/meta-data", finding["request"])
 
 
+class TestAuthRecoveryExposureSignal916(unittest.TestCase):
+    """#916 — the auth-recovery matcher must not raise a HIGH on a 401 auth gate."""
+
+    def setUp(self):
+        self.tool = VulnChainProbeTool()
+
+    def test_vercel_protected_401_gate_is_not_reset_material(self):
+        # The real FP: a Vercel "Protected deployment" 401 whose body contains
+        # error.code:"401" — an HTTP status, not an OTP/token.
+        result = {
+            "status": 401,
+            "text": '{"error":{"message":"Protected deployment","code":"401"},'
+                    '"protection":{"password_enabled":true,"vercel_auth_enabled":false}}',
+        }
+        self.assertIsNone(self.tool._auth_recovery_exposure_signal(result))
+
+    def test_http_status_as_code_value_at_200_is_not_material(self):
+        result = {"status": 200, "text": '{"status":"ok","code":"404"}'}
+        self.assertIsNone(self.tool._auth_recovery_exposure_signal(result))
+
+    def test_real_reset_token_is_flagged(self):
+        result = {"status": 200, "text": '{"reset_token":"a1b2c3d4e5f6g7h8"}'}
+        self.assertEqual(self.tool._auth_recovery_exposure_signal(result), "secret_exposure")
+
+    def test_real_numeric_otp_is_flagged(self):
+        result = {"status": 200, "text": '{"code":"482915"}'}  # 6-digit OTP, not an HTTP status
+        self.assertEqual(self.tool._auth_recovery_exposure_signal(result), "secret_exposure")
+
+    def test_403_gate_is_not_material(self):
+        result = {"status": 403, "text": '{"message":"forbidden","code":"403"}'}
+        self.assertIsNone(self.tool._auth_recovery_exposure_signal(result))
+
+
 if __name__ == "__main__":
     unittest.main()

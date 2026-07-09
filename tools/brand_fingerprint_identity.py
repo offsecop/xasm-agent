@@ -11,7 +11,7 @@ import os
 import re
 from collections import Counter
 from plugin_interface import ToolPlugin
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,11 @@ async def extract_page_identity(page, url: str) -> Dict[str, Any]:
         'layout': {},
         'texts': [],
         'favicon': None,
+        # FAV-6 — None = no favicon attempted; True = fetched OK; False =
+        # unreachable (403 BOT_WALLED / error). The scorer excludes the favicon
+        # term + renormalizes when False, so a bot-walled favicon does not score
+        # 0 and dilute the composite toward 'clean'.
+        'faviconReachable': None,
         'error': None,
     }
 
@@ -89,7 +94,12 @@ async def extract_page_identity(page, url: str) -> Dict[str, Any]:
         }""")
 
         for logo_info in (logo_elements or []):
-            logo_hash = await _download_and_hash(page, logo_info['src'])
+            logo_hash, reachable = await _download_and_hash(page, logo_info['src'])
+            is_favicon = logo_info['type'] == 'favicon'
+            # FAV-6 — record favicon reachability (first favicon element seen);
+            # False (bot-walled/403) is distinct from None (no favicon found).
+            if is_favicon and result.get('faviconReachable') is None:
+                result['faviconReachable'] = reachable
             if logo_hash:
                 entry = {
                     'hash': logo_hash,
@@ -97,7 +107,7 @@ async def extract_page_identity(page, url: str) -> Dict[str, Any]:
                     'url': logo_info['src'],
                 }
                 result['logos'].append(entry)
-                if logo_info['type'] == 'favicon' and not result['favicon']:
+                if is_favicon and not result['favicon']:
                     result['favicon'] = logo_hash
     except Exception as e:
         print(f"[BrandFingerprint] Logo extraction failed for {url}: {e}")
@@ -151,21 +161,52 @@ async def extract_page_identity(page, url: str) -> Dict[str, Any]:
     return result
 
 
-async def _download_and_hash(page, src: str) -> Optional[str]:
-    """Download an image from src URL and compute its perceptual hash."""
+async def _download_and_hash(page, src: str) -> Tuple[Optional[str], bool]:
+    """Download an image from src and compute its perceptual hash.
+
+    Returns (phash | None, reachable). FAV-6: `reachable` is False on a non-200
+    (e.g. 403 BOT_WALLED) or a network error, so the caller can distinguish a
+    bot-walled favicon from a genuinely-absent one. FAV-4: for a multi-resolution
+    .ico, PIL's default frame choice is non-deterministic across versions, so two
+    byte-identical icons could phash differently — select the LARGEST frame
+    deterministically before hashing so identical icons converge.
+    """
+    try:
+        resp = await page.context.request.get(src, timeout=10000)
+        if resp.status != 200:
+            return None, False  # unreachable / bot-walled — NOT 'absent'
+        body = await resp.body()
+        return _phash_image_bytes(body), True
+    except Exception as e:
+        print(f"[BrandFingerprint] Hash failed for {src}: {e}")
+        return None, False
+
+
+def _phash_image_bytes(body: bytes) -> Optional[str]:
+    """Perceptual hash of raw image bytes. FAV-4: for a multi-resolution .ico,
+    deterministically select the LARGEST frame before hashing so the same icon
+    stored with different frame sets converges (PIL's default frame choice is
+    version-dependent)."""
     try:
         import imagehash
         from PIL import Image
 
-        resp = await page.context.request.get(src, timeout=10000)
-        if resp.status != 200:
-            return None
-        body = await resp.body()
         img = Image.open(io.BytesIO(body))
-        phash = imagehash.phash(img)
-        return str(phash)
+        if (img.format or '').upper() == 'ICO':
+            try:
+                sizes = img.ico.sizes()  # type: ignore[attr-defined]
+                if sizes:
+                    # Deterministically select the LARGEST frame BY AREA.
+                    # `img.ico.getimage(size)` is the PIL API for ICO frame
+                    # selection (assigning img.size is a no-op); max() must use an
+                    # area key so a 48x16 frame never beats a 32x32 one.
+                    best = max(sizes, key=lambda s: s[0] * s[1])
+                    img = img.ico.getimage(best)  # type: ignore[attr-defined]
+            except Exception:
+                pass  # fall back to PIL's default frame
+        return str(imagehash.phash(img))
     except Exception as e:
-        print(f"[BrandFingerprint] Hash failed for {src}: {e}")
+        print(f"[BrandFingerprint] phash failed: {e}")
         return None
 
 
@@ -390,9 +431,10 @@ class BrandFingerprintIdentityTool(ToolPlugin):
         if reference_urls:
             try:
                 from playwright.async_api import async_playwright
+                from lib.process_reaper import close_browser_safe
 
                 async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                    browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
                     context = await browser.new_context(
                         viewport={'width': 1920, 'height': 1080},
                         user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -427,7 +469,7 @@ class BrandFingerprintIdentityTool(ToolPlugin):
                             errors.append(f"{url}: {str(e)[:200]}")
                             print(f"[BrandFingerprint] Failed for {url}: {e}")
 
-                    await browser.close()
+                    await close_browser_safe(browser)
             except Exception as e:
                 return {
                     'success': False,

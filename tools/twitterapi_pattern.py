@@ -116,16 +116,21 @@ def _compose_query(
             + ' filter:blue_verified'
         )
     if pattern_id == 'C.1':
+        # #377 — exclude the brand's OWN handle so the brand tweeting about a
+        # breach does not self-incriminate as a HIGH leak claimant (the backend
+        # author-exclusion gate is the authoritative guard; this trims at source).
         return (
             f'({brand} OR @{handle}) '
             f'(breach OR breached OR "data breach" OR leaked OR dump OR pwned OR hacked OR "0day") '
-            f'-filter:retweets lang:{lang}'
+            f'-from:{handle} -filter:retweets lang:{lang}'
         )
     if pattern_id == 'C.2':
+        # #377 — same own-handle exclusion as C.1.
         return (
             f'({brand} OR @{handle}) '
             f'(url:pastebin.com OR url:rentry.co OR url:ghostbin OR url:doxbin '
-            f'OR url:justpaste.it OR url:dpaste.com OR url:hastebin.com) -filter:retweets'
+            f'OR url:justpaste.it OR url:dpaste.com OR url:hastebin.com) '
+            f'-from:{handle} -filter:retweets'
         )
     if pattern_id == 'D.1':
         return (
@@ -134,10 +139,16 @@ def _compose_query(
             f'OR airdrop OR "100x" OR double) -from:{handle} -filter:retweets lang:{lang}'
         )
     if pattern_id == 'D.2':
+        # #881 — the bare "+1" operator was REMOVED: Twitter tokenizes it to match
+        # ANY tweet containing `1` (e.g. a French complaint "Pas même 1%"), which
+        # flooded SOCIAL_IMPERSONATION with ordinary negative mentions. A real
+        # support-scam phone number is detected by the ingestion-side scam-marker
+        # gate via the phone regex `\+1[\s-]?\(?\d{3}` on the post text, not by a
+        # search operator. The remaining literal markers still scope the query.
         return (
             f'to:{handle} -from:{handle} '
             f'("DM us" OR "DM me" OR "DM our team" OR "verify" OR "secure your account" '
-            f'OR "chat support" OR "WhatsApp" OR "Telegram" OR "+1" OR url:t.me OR url:wa.me)'
+            f'OR "chat support" OR "WhatsApp" OR "Telegram" OR url:t.me OR url:wa.me)'
         )
     raise ValueError(f'unknown pattern_id={pattern_id!r}')
 

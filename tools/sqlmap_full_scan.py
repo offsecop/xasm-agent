@@ -162,6 +162,13 @@ class SqlmapFullScanTool(ToolPlugin):
                 # Apply exclusion filtering
                 if exclusion_url_patterns:
                     targets = filter_excluded_urls(targets, exclusion_url_patterns, "SQLMap Full")
+                # Heavy scanner: cap chained target count so a crawler's full URL list doesn't
+                # blow past sqlmap's scan timeout (full scan is even heavier than detection).
+                # Single-target (-u) mode stays uncapped; override via maxTargets.
+                max_targets = parameters.get("maxTargets", 3)
+                if len(targets) > max_targets:
+                    print(f"[SQLMap Full] Capping {len(targets)} targets to maxTargets={max_targets} (avoid scan timeout)")
+                    targets = targets[:max_targets]
                 target_count = len(targets)
                 target_file = f"{output_dir}/targets_{timestamp}.txt"
                 with open(target_file, 'w') as f:
@@ -258,7 +265,11 @@ class SqlmapFullScanTool(ToolPlugin):
             if parameters.get("testForms", True):
                 cmd.append("--forms")
             
-            crawl_depth = parameters.get("crawlDepth", 2)
+            # Multi-target (`-m` list) mode means the URLs were already discovered upstream
+            # (e.g. chained from a crawler). Re-crawling EACH of N URLs with --crawl makes
+            # sqlmap fan out to N×(crawl) requests and hit the scan timeout. --crawl only
+            # makes sense for a single seed target (`-u`), so disable it in list mode.
+            crawl_depth = 0 if targets else parameters.get("crawlDepth", 2)
             if crawl_depth > 0:
                 cmd.append(f"--crawl={crawl_depth}")
             

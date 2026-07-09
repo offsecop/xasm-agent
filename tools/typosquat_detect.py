@@ -5,16 +5,14 @@ look-alike domains that may be used for phishing or brand abuse.
 """
 
 import asyncio
-import html
-import json
 import logging
 import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 # Ensure agent/ is on sys.path so `from lib.integration_credentials import ...`
 # works when the plugin is loaded via spec_from_file_location.
@@ -23,27 +21,25 @@ if _parent_dir not in sys.path:
     sys.path.append(_parent_dir)
 
 from plugin_interface import ToolPlugin
-from lib.integration_credentials import (  # noqa: E402
-    checkout_provider,
-    reconcile_call,
-    QuotaExceededError,
-    IntegrationCredentialsError,
-)
+from lib.dns_async import resolve_records  # noqa: E402
+from lib.token_rarity import is_common_token  # noqa: E402
+from lib.typosquat_enrich_helpers import TyposquatEnrichmentMixin  # noqa: E402
 
-# RDAP-primary domain-age capture. asyncwhois (v1.1.12, pure-python / ARM-safe —
-# unlike the cryptography 48.x SIGILL case) wraps whodap RDAP with a port-43
-# WHOIS fallback in one async client. RDAP exposes the registration date as a
-# clean ISO `events[].eventAction=="registration".eventDate`, which sidesteps the
-# port-43 first-match-`created:` artifact (e.g. the CIRA `.ca` 1987 banner line).
-# Imported guardedly so the tool still loads if the dependency is briefly absent
-# during a partial agent rebuild (a requirements bump needs rebuild+recreate of
-# all 5 agents, not just a restart).
+# PERM-3 — PSL-backed eTLD+1 split (replaces the hardcoded 13-entry double-TLD
+# list that mis-split unlisted ccTLDs, losing the +12 brand-identity bonus).
+# `suffix_list_urls=()` forces the bundled snapshot (no network at runtime / in
+# tests). Guarded so the tool still loads if the dep is briefly absent during a
+# partial agent rebuild — falls back to the last-label split.
 try:
-    import asyncwhois  # noqa: E402
-    from asyncwhois.parse import TLDBaseKeys as _AwKeys  # noqa: E402
+    import tldextract  # noqa: E402
+    _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 except Exception:  # pragma: no cover - import-time resilience only
-    asyncwhois = None
-    _AwKeys = None
+    _TLD_EXTRACT = None
+
+# PERM-5 — generation NO-OP floor. A 1-3 char brand label generates a junk,
+# high-collision corpus (mirrors the social path's short-token discipline in
+# wrapper_helpers); skip permutation generation for labels shorter than this.
+MIN_BRAND_LABEL_LEN = 4
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +99,54 @@ _COMBOSQUAT_RISK_KEYWORDS: frozenset = frozenset({
     'update', 'signin', 'sso',
 })
 
+# Keyboard-adjacency (fat-finger) layouts — G1.
+#
+# Keyboard-mechanical errors are the empirically DOMINANT registered typo class
+# (NDSS 2015, KU Leuven; WTMC 2019 "A Smörgåsbord of Typos" found 28,943
+# registered typo domains targeting non-US layouts), yet we generated none.
+# Each layout is defined as physical rows with a half-key horizontal stagger;
+# adjacency (incl. diagonals) is derived from the grid so a new layout is one
+# data entry, not a hand-maintained neighbour map (urlinsane ships ~40 layouts).
+_KEYBOARD_GRIDS: Dict[str, List[Tuple[int, str]]] = {
+    # (row_offset_in_half_keys, keys_left_to_right)
+    'qwerty': [(0, '1234567890'), (1, 'qwertyuiop'), (2, 'asdfghjkl'), (3, 'zxcvbnm')],
+    'azerty': [(0, '1234567890'), (1, 'azertyuiop'), (2, 'qsdfghjklm'), (3, 'wxcvbn')],
+    'qwertz': [(0, '1234567890'), (1, 'qwertzuiop'), (2, 'asdfghjkl'), (3, 'yxcvbnm')],
+}
+
+
+def _build_adjacency(grid: List[Tuple[int, str]]) -> Dict[str, List[str]]:
+    """Derive a per-key physical-neighbour map from a staggered keyboard grid.
+
+    Keys are placed on a grid where each key spans 2 horizontal units and each
+    row is offset by its half-key stagger. Two keys are neighbours when they are
+    on the same row one key apart (col diff 2) or on an adjacent row within one
+    half-key column (col diff <= 1) — i.e. left/right + the four diagonals.
+    """
+    positions: Dict[str, Tuple[int, int]] = {}
+    for row_idx, (offset, keys) in enumerate(grid):
+        for col_idx, ch in enumerate(keys):
+            positions[ch] = (row_idx, offset + col_idx * 2)
+    adjacency: Dict[str, List[str]] = {}
+    for ch, (r, c) in positions.items():
+        neighbours = []
+        for other, (r2, c2) in positions.items():
+            if other == ch:
+                continue
+            dr, dc = abs(r - r2), abs(c - c2)
+            if (dr == 0 and dc == 2) or (dr == 1 and dc <= 1):
+                neighbours.append(other)
+        adjacency[ch] = sorted(neighbours)
+    return adjacency
+
+
+# Precompute adjacency maps once per layout.
+KEYBOARD_ADJACENCY: Dict[str, Dict[str, List[str]]] = {
+    name: _build_adjacency(grid) for name, grid in _KEYBOARD_GRIDS.items()
+}
+DEFAULT_KEYBOARD_LAYOUTS = ['qwerty']
+
+
 # Combosquatting keywords (common phishing/brand-abuse terms)
 COMBOSQUATTING_KEYWORDS = [
     'login', 'secure', 'account', 'verify', 'update', 'signin', 'support',
@@ -115,11 +159,68 @@ COMBOSQUATTING_KEYWORDS = [
 ]
 
 
-class TyposquatDetectTool(ToolPlugin):
+# -- G2-ext (#451) expanded-coverage data tables ---------------------------------
+
+# Homophone whole-word swaps (soundsquatting beyond the small SOUND_PAIRS set).
+# Applied as substring substitutions; bidirectional pairs are listed both ways.
+HOMOPHONES = {
+    'for': 'four', 'four': 'for', 'to': 'two', 'two': 'to', 'too': 'two',
+    'ate': 'eight', 'eight': 'ate', 'won': 'one', 'one': 'won',
+    'be': 'bee', 'bee': 'be', 'sea': 'see', 'see': 'sea', 'buy': 'by',
+    'by': 'buy', 'no': 'know', 'know': 'no', 'right': 'write', 'write': 'right',
+    'their': 'there', 'there': 'their', 'your': 'youre', 'mail': 'male',
+}
+
+# Common-misspelling substring rules (a curated, registration-practical subset
+# of the Wikipedia common-misspellings corpus — domain labels are short, so
+# substring rules generalize better than a word-level dictionary).
+MISSPELLING_RULES = [
+    ('ie', 'ei'), ('ei', 'ie'), ('ance', 'ence'), ('ence', 'ance'),
+    ('able', 'ible'), ('ible', 'able'), ('cc', 'c'), ('ss', 's'),
+    ('ll', 'l'), ('mm', 'm'), ('nn', 'n'), ('tt', 't'),
+    ('our', 'or'), ('or', 'our'), ('ize', 'ise'), ('ise', 'ize'),
+    ('yze', 'yse'), ('ph', 'f'),
+]
+
+# Cardinal number-word <-> digit swaps (both directions).
+CARDINAL_MAP = {
+    'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+    'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+    'ten': '10',
+}
+
+# Ordinal word <-> short-form swaps (both directions).
+ORDINAL_MAP = {
+    'first': '1st', 'second': '2nd', 'third': '3rd', 'fourth': '4th',
+    'fifth': '5th', 'sixth': '6th', 'seventh': '7th', 'eighth': '8th',
+    'ninth': '9th', 'tenth': '10th',
+}
+
+# ccTLD second-level alternatives for the wrong-SLD technique (.co.uk -> .org.uk).
+# Keyed on the public-suffix top label; only multi-label suffixes apply.
+CCTLD_SECOND_LEVELS = {
+    'uk': ['co', 'org', 'me', 'net', 'ltd', 'plc'],
+    'au': ['com', 'net', 'org', 'id'],
+    'nz': ['co', 'org', 'net', 'ac'],
+    'za': ['co', 'org', 'net', 'web'],
+    'br': ['com', 'net', 'org'],
+    'jp': ['co', 'or', 'ne', 'ac'],
+    'in': ['co', 'net', 'org', 'firm'],
+}
+
+
+class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
     """
-    Detects potential typosquatting domains by generating permutations of a
-    target domain using 11 different algorithms and checking DNS registration,
-    web presence, and SSL certificates. Produces risk-scored results.
+    DISCOVERY-ONLY typosquat detector: generates domain permutations using the
+    23 permutation algorithms, resolves DNS (A/AAAA/NS/MX) to determine
+    registration, and structurally risk-scores each candidate. Emits one
+    discovery row per candidate.
+
+    Per-registered-domain ENRICHMENT (HTTP/SSL/RDAP→WHOIS/threat-feeds/email-auth)
+    is NOT done here — it runs in the decoupled `typosquat:enrich` queue (#1049).
+    This tool still mixes in `TyposquatEnrichmentMixin` because `_dns_probe`
+    reuses the mixin's `_mx_lookup`; the heavy enrichment methods are dormant on
+    this path and live for `typosquat:enrich`.
     """
 
     @property
@@ -129,9 +230,9 @@ class TyposquatDetectTool(ToolPlugin):
     @property
     def description(self) -> str:
         return (
-            "Detect typosquatting domains by generating permutations using 13 algorithms "
-            "(homoglyph, transposition, omission, doubling, hyphen insertion, TLD swap, "
-            "subdomain prepend, bitsquatting, vowel swap, addition, combosquatting, "
+            "Detect typosquatting domains by generating permutations using 23 algorithms "
+            "(homoglyph, keyboard adjacency, transposition, omission, doubling, hyphen insertion, "
+            "TLD swap, subdomain prepend, bitsquatting, vowel swap, addition, combosquatting, "
             "soundsquatting, punycode/IDN) and "
             "checking DNS registration, web presence, and SSL certificates. Returns risk-scored results."
         )
@@ -155,9 +256,11 @@ class TyposquatDetectTool(ToolPlugin):
                     "items": {"type": "string"},
                     "description": (
                         "Which permutation techniques to use. Options: homoglyph, "
-                        "transposition, omission, doubling, hyphen, tld_swap, subdomain, "
-                        "bitsquatting, vowel_swap, addition, combosquatting, soundsquatting, "
-                        "punycode_idn. Default: all"
+                        "keyboard_adjacency, transposition, omission, doubling, hyphen, tld_swap, "
+                        "subdomain, bitsquatting, vowel_swap, addition, combosquatting, "
+                        "soundsquatting, punycode_idn, homophone, misspelling, plural, "
+                        "cardinal_swap, ordinal_swap, dot_omission, dot_hyphen, wrong_sld, "
+                        "multi_edit. Default: all"
                     )
                 },
                 "checkDns": {
@@ -176,13 +279,18 @@ class TyposquatDetectTool(ToolPlugin):
                 },
                 "entropyLevel": {
                     "type": "string",
-                    "description": "Preset entropy level: LOW (homoglyph + TLD swap only), MEDIUM (+ transposition, omission, subdomain), HIGH (all 13 techniques), CUSTOM (use enabledTechniques)",
+                    "description": "Preset entropy level: LOW (homoglyph + TLD swap only), MEDIUM (+ transposition, omission, subdomain), HIGH (all 23 techniques), CUSTOM (use enabledTechniques)",
                     "default": "HIGH"
                 },
                 "enabledTechniques": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Explicit list of techniques to use (overrides entropyLevel). Options: homoglyph, transposition, omission, doubling, hyphen_insertion, tld_swap, subdomain_prepend, bitsquatting, vowel_swap, addition, combosquatting, soundsquatting, punycode_idn"
+                    "description": "Explicit list of techniques to use (overrides entropyLevel). Options: homoglyph, keyboard_adjacency, transposition, omission, doubling, hyphen_insertion, tld_swap, subdomain_prepend, bitsquatting, vowel_swap, addition, combosquatting, soundsquatting, punycode_idn, homophone, misspelling, plural, cardinal_swap, ordinal_swap, dot_omission, dot_hyphen, wrong_sld, multi_edit"
+                },
+                "keyboardLayouts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Locale keyboard layouts for the keyboard_adjacency (fat-finger) technique: qwerty (US, default), azerty (FR), qwertz (DE). Accepts a list or comma string; invalid entries are ignored and fall back to qwerty."
                 },
                 "maxEditDistance": {
                     "type": "integer",
@@ -214,21 +322,22 @@ class TyposquatDetectTool(ToolPlugin):
 
     @staticmethod
     def _split_domain(domain: str) -> Tuple[str, str]:
-        """Split a domain into name and TLD parts.
+        """Split a domain into registrable-name and public-suffix parts.
 
-        Handles multi-part TLDs like .co.uk. Returns (name, tld) where tld
-        includes the leading dot (e.g., '.com').
+        Handles multi-part TLDs (.co.uk, .ne.jp) via the PSL. Returns (name, tld)
+        where tld includes the leading dot (e.g., '.com'). NOTE: a subdomain is
+        dropped (www.brand.com -> ('brand', '.com')) — intended for brand-monitor
+        apex inputs; callers needing the full sub-label must not rely on this.
         """
         domain = domain.lower().strip().rstrip('.')
-        known_double_tlds = [
-            '.co.uk', '.co.jp', '.co.in', '.co.kr', '.co.nz',
-            '.com.au', '.com.br', '.com.cn', '.com.mx', '.com.sg',
-            '.org.uk', '.net.uk', '.ac.uk',
-        ]
-        for dtld in known_double_tlds:
-            if domain.endswith(dtld):
-                name = domain[:-len(dtld)]
-                return (name, dtld)
+        # PERM-3 — PSL-backed split: the registrable label + the full public
+        # suffix (eTLD), so multi-label ccTLDs (.ne.jp, .com.sg, .co.uk) split
+        # correctly and the brand-identity bonus fires on the real brand label.
+        if _TLD_EXTRACT is not None:
+            ext = _TLD_EXTRACT(domain)
+            if ext.domain and ext.suffix:
+                return (ext.domain, '.' + ext.suffix)
+        # Fallback (dep absent, or no recognised suffix): last-label split.
         parts = domain.rsplit('.', 1)
         if len(parts) == 2:
             return (parts[0], '.' + parts[1])
@@ -255,6 +364,39 @@ class TyposquatDetectTool(ToolPlugin):
                 if self._is_valid_label(candidate):
                     results.append((candidate + tld, 'HOMOGLYPH'))
                 idx += 1
+        return results
+
+    def _keyboard_adjacency(
+        self, name: str, tld: str, layouts: Optional[List[str]] = None
+    ) -> List[Tuple[str, str]]:
+        """Fat-finger fuzzer — substitute and insert physically adjacent keys (G1).
+
+        For each character, emit (a) substitutions with each physically adjacent
+        key and (b) an insertion of each adjacent key after that character. Runs
+        across the requested locale layouts (default US-QWERTY) so EU-targeted
+        typos (German QWERTZ, French AZERTY) are generated for those clients.
+        Honours _is_valid_label; the joint max_variations budget is enforced by
+        the caller.
+        """
+        selected = layouts or DEFAULT_KEYBOARD_LAYOUTS
+        results: List[Tuple[str, str]] = []
+        local_seen: Set[str] = set()
+        for layout in selected:
+            adjacency = KEYBOARD_ADJACENCY.get(layout)
+            if not adjacency:
+                continue
+            for i, ch in enumerate(name):
+                for neighbour in adjacency.get(ch, []):
+                    # Substitution: replace ch with an adjacent key.
+                    sub = name[:i] + neighbour + name[i + 1:]
+                    if sub != name and sub not in local_seen and self._is_valid_label(sub):
+                        local_seen.add(sub)
+                        results.append((sub + tld, 'KEYBOARD_ADJACENCY'))
+                    # Insertion: add an adjacent key right after ch (mis-hit two keys).
+                    ins = name[:i + 1] + neighbour + name[i + 1:]
+                    if ins not in local_seen and self._is_valid_label(ins):
+                        local_seen.add(ins)
+                        results.append((ins + tld, 'KEYBOARD_ADJACENCY'))
         return results
 
     def _transposition(self, name: str, tld: str) -> List[Tuple[str, str]]:
@@ -379,6 +521,164 @@ class TyposquatDetectTool(ToolPlugin):
                 if candidate != name and self._is_valid_label(candidate):
                     results.append((candidate + tld, 'SOUNDSQUATTING'))
                 idx += 1
+        return results
+
+    def _homophone(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """Whole-word homophone swaps (soundsquatting beyond SOUND_PAIRS, G2-ext)."""
+        results: List[Tuple[str, str]] = []
+        for orig, repl in HOMOPHONES.items():
+            idx = 0
+            while True:
+                idx = name.find(orig, idx)
+                if idx == -1:
+                    break
+                candidate = name[:idx] + repl + name[idx + len(orig):]
+                if candidate != name and self._is_valid_label(candidate):
+                    results.append((candidate + tld, 'SOUNDSQUATTING'))
+                idx += 1
+        return results
+
+    def _misspelling_dict(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """Common-misspelling substring substitutions (G2-ext)."""
+        results: List[Tuple[str, str]] = []
+        for orig, repl in MISSPELLING_RULES:
+            idx = 0
+            while True:
+                idx = name.find(orig, idx)
+                if idx == -1:
+                    break
+                candidate = name[:idx] + repl + name[idx + len(orig):]
+                if candidate != name and self._is_valid_label(candidate):
+                    results.append((candidate + tld, 'MISSPELLING'))
+                idx += 1
+        return results
+
+    def _plural(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """Plural/singular toggle. Adding a char -> ADDITION; removing -> OMISSION."""
+        results: List[Tuple[str, str]] = []
+        if name.endswith('s') and len(name) > 1:
+            singular = name[:-1]
+            if self._is_valid_label(singular):
+                results.append((singular + tld, 'OMISSION'))
+        else:
+            plural = name + 's'
+            if self._is_valid_label(plural):
+                results.append((plural + tld, 'ADDITION'))
+            # English y -> ies pluralization (company -> companies).
+            if name.endswith('y') and len(name) > 1:
+                ies = name[:-1] + 'ies'
+                if self._is_valid_label(ies):
+                    results.append((ies + tld, 'ADDITION'))
+        return results
+
+    def _cardinal_swap(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """Cardinal number-word <-> digit swaps (one<->1), G2-ext."""
+        return self._token_swaps(name, tld, CARDINAL_MAP, 'CARDINAL_SWAP')
+
+    def _ordinal_swap(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """Ordinal word <-> short-form swaps (first<->1st), G2-ext."""
+        return self._token_swaps(name, tld, ORDINAL_MAP, 'ORDINAL_SWAP')
+
+    def _token_swaps(
+        self, name: str, tld: str, mapping: Dict[str, str], label: str
+    ) -> List[Tuple[str, str]]:
+        """Bidirectional substring swaps from a word<->token map (helper)."""
+        results: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        # Build both directions: word->token and token->word.
+        pairs = list(mapping.items()) + [(v, k) for k, v in mapping.items()]
+        # Longest source first so multi-char tokens win over their substrings.
+        for orig, repl in sorted(pairs, key=lambda p: -len(p[0])):
+            idx = 0
+            while True:
+                idx = name.find(orig, idx)
+                if idx == -1:
+                    break
+                candidate = name[:idx] + repl + name[idx + len(orig):]
+                if candidate != name and candidate not in seen and self._is_valid_label(candidate):
+                    seen.add(candidate)
+                    results.append((candidate + tld, label))
+                idx += 1
+        return results
+
+    def _dot_omission(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """Omit the separating dot — fold a leading 'www' into the SLD (G2-ext).
+
+        Classified SUBDOMAIN_PREPEND (brand-containing prepend without separator).
+        """
+        results: List[Tuple[str, str]] = []
+        candidate = 'www' + name
+        if self._is_valid_label(candidate):
+            results.append((candidate + tld, 'SUBDOMAIN_PREPEND'))
+        return results
+
+    def _dot_hyphen(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """Dot<->hyphen substitution within the label (G2-ext).
+
+        A hyphenated brand collapses (my-brand -> mybrand) or its hyphen becomes a
+        sub-label dot (my-brand -> my.brand); a non-hyphenated brand inserts a
+        hyphen at each boundary (covered by _hyphen_insertion, so here we only act
+        on names that already carry a hyphen). Classified HYPHEN_INSERTION.
+        """
+        results: List[Tuple[str, str]] = []
+        if '-' in name:
+            collapsed = name.replace('-', '')
+            if collapsed and self._is_valid_label(collapsed):
+                results.append((collapsed + tld, 'HYPHEN_INSERTION'))
+            dotted = name.replace('-', '.')
+            # dotted creates a sub-label; valid as a full host even if the SLD
+            # label itself isn't (each part must be a valid label).
+            if all(self._is_valid_label(p) for p in dotted.split('.') if p):
+                results.append((dotted + tld, 'HYPHEN_INSERTION'))
+        return results
+
+    def _wrong_sld(self, name: str, tld: str) -> List[Tuple[str, str]]:
+        """ccTLD wrong second-level-domain swap (.co.uk -> .org.uk), G2-ext.
+
+        Only applies to multi-label public suffixes; classified TLD_SWAP.
+        """
+        results: List[Tuple[str, str]] = []
+        suffix = tld.lstrip('.')
+        labels = suffix.split('.')
+        if len(labels) < 2:
+            return results  # single-label TLD has no second level to vary
+        second, top = labels[0], labels[-1]
+        for alt in CCTLD_SECOND_LEVELS.get(top, []):
+            if alt == second:
+                continue
+            new_tld = '.' + alt + '.' + top
+            results.append((name + new_tld, 'TLD_SWAP'))
+        return results
+
+    def _multi_edit(
+        self, name: str, tld: str, max_candidates: int = 60
+    ) -> List[Tuple[str, str]]:
+        """Bounded 2-edit combo: omission + an adjacent transposition (G2-ext).
+
+        Two simultaneous single edits catch lookalikes a 1-edit generator misses.
+        HARD-capped (max_candidates) to avoid the combinatorial explosion.
+        """
+        results: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        # First edit: each single-char omission. Second edit: an adjacent
+        # transposition on the result. Bounded by max_candidates.
+        for i in range(len(name)):
+            if len(results) >= max_candidates:
+                break
+            first = name[:i] + name[i + 1:]
+            if len(first) < 2:
+                continue
+            for j in range(len(first) - 1):
+                candidate = first[:j] + first[j + 1] + first[j] + first[j + 2:]
+                if (
+                    candidate != name
+                    and candidate not in seen
+                    and self._is_valid_label(candidate)
+                ):
+                    seen.add(candidate)
+                    results.append((candidate + tld, 'MULTI_EDIT'))
+                    if len(results) >= max_candidates:
+                        break
         return results
 
     def _punycode_idn(self, name: str, tld: str) -> List[Tuple[str, str]]:
@@ -512,55 +812,16 @@ class TyposquatDetectTool(ToolPlugin):
     # -- DNS / HTTP / SSL checks -----------------------------------------------
 
     async def _dig_records(self, domain: str, rrtype: str) -> Tuple[List[str], str]:
-        """Query one DNS record type and return ``(records, header_status)``.
+        """Query one DNS record type and return ``(records, status)``.
 
-        ``header_status`` is the rcode from dig's ``->>HEADER<<-`` line
-        (``NOERROR`` / ``NXDOMAIN`` / ``SERVFAIL`` / ``REFUSED`` / ...), or
-        ``TIMEOUT`` if the lookup itself failed. The status lets the caller tell
-        a genuine NXDOMAIN (name does not exist → unregistered) apart from a
-        SERVFAIL/timeout (resolver couldn't answer → registration UNKNOWN, do
-        NOT force ``is_registered=False``).
+        In-process async resolution (dnspython) — NO ``dig`` subprocess. Status
+        is the legacy rcode contract (``NOERROR`` / ``NXDOMAIN`` / ``SERVFAIL`` /
+        ``TIMEOUT``) so the caller can tell a genuine NXDOMAIN (name does not
+        exist → unregistered) from a SERVFAIL/timeout (resolver couldn't answer →
+        registration UNKNOWN, do NOT force ``is_registered=False``). UDP-first
+        with a TCP fallback for UDP-blocked resolvers — see ``lib.dns_async``.
         """
-        rrtype_u = rrtype.upper()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'dig', '+noall', '+answer', '+comment',
-                '+time=3', '+tries=1', domain, rrtype_u,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
-            text = stdout.decode('utf-8', errors='replace')
-            status = 'UNKNOWN'
-            records: List[str] = []
-            for line in text.split('\n'):
-                stripped = line.strip()
-                if '->>HEADER<<-' in stripped:
-                    m = re.search(r'status:\s*([A-Z]+)', stripped)
-                    if m:
-                        status = m.group(1)
-                    continue
-                if not stripped or stripped.startswith(';'):
-                    continue
-                # Answer line: "name  ttl  IN  <TYPE>  <rdata...>". Only keep
-                # rows whose type matches the query (skips CNAME chain rows).
-                parts = stripped.split()
-                if len(parts) >= 5 and parts[3].upper() == rrtype_u:
-                    rdata = parts[4]
-                    if rrtype_u == 'A':
-                        # Validate IPv4: exactly 4 octets in range.
-                        octets = rdata.split('.')
-                        if len(octets) == 4 and all(
-                            o.isdigit() and 0 <= int(o) <= 255 for o in octets
-                        ):
-                            records.append(rdata)
-                    elif rrtype_u == 'NS':
-                        records.append(rdata.rstrip('.').lower())
-                    else:
-                        records.append(rdata)
-            return records, status
-        except (asyncio.TimeoutError, Exception):
-            return [], 'TIMEOUT'
+        return await resolve_records(domain, rrtype)
 
     async def _dns_probe(self, domain: str) -> Dict[str, Any]:
         """Determine registration from A / AAAA / NS / MX records.
@@ -615,636 +876,6 @@ class TyposquatDetectTool(ToolPlugin):
             'registration_unknown': registration_unknown,
         }
 
-    async def _check_http(self, domain: str) -> Dict[str, Any]:
-        """Check if domain serves web content with redirect chain tracking.
-
-        Returns dict with: has_content, status_code, redirect_chain, final_url.
-        Follows Location headers manually up to 10 hops.
-        """
-        result = {
-            'has_content': False,
-            'status_code': 0,
-            'redirect_chain': [],
-            'final_url': f'http://{domain}',
-        }
-        current_url = f'http://{domain}'
-        max_hops = 10
-
-        try:
-            for hop in range(max_hops):
-                proc = await asyncio.create_subprocess_exec(
-                    'curl', '-sI',
-                    '--connect-timeout', '3', '--max-time', '5',
-                    '-o', '-',
-                    current_url,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
-                headers_text = stdout.decode('utf-8', errors='replace')
-
-                # Parse status code from first line
-                status_code = 0
-                location = None
-                for line in headers_text.split('\n'):
-                    line = line.strip()
-                    if line.upper().startswith('HTTP/') and ' ' in line:
-                        parts = line.split(None, 2)
-                        if len(parts) >= 2 and parts[1].isdigit():
-                            status_code = int(parts[1])
-                    elif line.lower().startswith('location:'):
-                        location = line.split(':', 1)[1].strip()
-
-                result['redirect_chain'].append({
-                    'url': current_url,
-                    'status_code': status_code,
-                })
-
-                # If not a redirect, stop
-                if status_code < 300 or status_code >= 400 or not location:
-                    result['has_content'] = 200 <= status_code <= 399
-                    result['status_code'] = status_code
-                    result['final_url'] = current_url
-                    break
-
-                # Resolve relative Location URLs (e.g. "/home") against the
-                # current URL so we never fabricate a bogus host like
-                # "http://home/". urljoin handles absolute, root-relative, and
-                # path-relative redirects correctly.
-                location = urljoin(current_url, location)
-
-                current_url = location
-            else:
-                # Exhausted max hops
-                result['status_code'] = status_code
-                result['final_url'] = current_url
-
-        except (asyncio.TimeoutError, Exception):
-            pass
-
-        return result
-
-    async def _check_ssl(self, domain: str) -> bool:
-        """Check if domain has an SSL certificate on port 443."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'timeout', '3', 'openssl', 's_client',
-                '-connect', f'{domain}:443', '-servername', domain,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE,
-            )
-            # Send empty input so openssl doesn't hang
-            await asyncio.wait_for(proc.communicate(input=b''), timeout=5)
-            return proc.returncode == 0
-        except (asyncio.TimeoutError, Exception):
-            return False
-
-    @staticmethod
-    def _normalize_whois_field(value: Optional[str]) -> Optional[str]:
-        """Normalize a WHOIS field value, returning None for privacy-redacted values."""
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            return None
-        redaction_patterns = [
-            "redacted for privacy",
-            "data protected",
-            "gdpr masked",
-            "not disclosed",
-            "registration private",
-            "contact privacy",
-            "whoisguard protected",
-            "identity protection",
-            "perfect privacy",
-            "domains by proxy",
-            "privacy service provided",
-            "statutory masking enabled",
-            "redacted",
-            "not applicable",
-            "data redacted",
-        ]
-        value_lower = value.lower()
-        for pattern in redaction_patterns:
-            if pattern in value_lower:
-                return None
-        return value
-
-    async def _whois_lookup(self, domain: str, _retry: bool = True) -> Dict[str, Any]:
-        """Lookup WHOIS data for a domain. Retries once on timeout.
-
-        On a genuine lookup FAILURE (timeout after retry, or an exception) the
-        returned dict carries ``whois_failed: True`` so the backend can PRESERVE
-        previously-persisted WHOIS data instead of clobbering it with nulls. A
-        successful lookup that simply has no registrar (e.g. a privacy-redacted
-        or sparse TLD) returns ``whois_failed: False`` — that empty IS authentic
-        and may be written.
-        """
-        empty = {'registrar': None, 'created': None, 'expires': None, 'nameservers': [],
-                 'registrant_email': None, 'registrant_org': None, 'registrant_name': None,
-                 'registrant_country': None, 'whois_failed': True}
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'whois', domain,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            text = stdout.decode('utf-8', errors='replace')
-
-            registrar = None
-            created = None
-            expires = None
-            nameservers = []
-            registrant_email = None
-            registrant_org = None
-            registrant_name = None
-            registrant_country = None
-
-            for line in text.split('\n'):
-                line_lower = line.lower().strip()
-                if not registrar and ('registrar:' in line_lower or 'registrar name:' in line_lower):
-                    registrar = line.split(':', 1)[1].strip()
-                if not created and ('creation date:' in line_lower or 'created:' in line_lower or 'registered on:' in line_lower):
-                    created = line.split(':', 1)[1].strip()
-                if not expires and ('expir' in line_lower and 'date' in line_lower):
-                    expires = line.split(':', 1)[1].strip()
-                if 'name server:' in line_lower or 'nserver:' in line_lower:
-                    ns = line.split(':', 1)[1].strip().lower()
-                    if ns and ns not in nameservers:
-                        nameservers.append(ns)
-                if not registrant_email and (line_lower.startswith('registrant email:') or line_lower.startswith('registrant contact email:')):
-                    registrant_email = self._normalize_whois_field(line.split(':', 1)[1])
-                if not registrant_org and (line_lower.startswith('registrant organization:') or line_lower.startswith('registrant org:') or line_lower.startswith('org-name:')):
-                    registrant_org = self._normalize_whois_field(line.split(':', 1)[1])
-                if not registrant_name and line_lower.startswith('registrant name:') and 'org' not in line_lower:
-                    registrant_name = self._normalize_whois_field(line.split(':', 1)[1])
-                if not registrant_country and line_lower.startswith('registrant country:'):
-                    registrant_country = self._normalize_whois_field(line.split(':', 1)[1])
-
-            result = {
-                'registrar': registrar,
-                'created': created,
-                'expires': expires,
-                'nameservers': nameservers[:4],
-                'registrant_email': registrant_email,
-                'registrant_org': registrant_org,
-                'registrant_name': registrant_name,
-                'registrant_country': registrant_country,
-                'whois_failed': False,
-            }
-            logger.info(f"[Typosquat] WHOIS {domain}: registrar={registrar}, created={created}, ns={len(nameservers)}, output_len={len(text)}")
-            return result
-        except asyncio.TimeoutError:
-            if _retry:
-                logger.warning(f"[Typosquat] WHOIS timeout for {domain}, retrying...")
-                await asyncio.sleep(2)
-                return await self._whois_lookup(domain, _retry=False)
-            logger.warning(f"[Typosquat] WHOIS timeout for {domain} after retry, skipping")
-            return empty
-        except Exception as e:
-            logger.warning(f"[Typosquat] WHOIS error for {domain}: {e}")
-            return empty
-
-    @staticmethod
-    def _to_iso(value: Any) -> Optional[str]:
-        """Normalize an asyncwhois date (datetime / list / str) to clean ISO.
-
-        Emits ``%Y-%m-%dT%H:%M:%SZ`` so the value matches the first format the
-        scorer (`_score_result`) and the backend `parseWhoisDate` already accept.
-        """
-        if value is None:
-            return None
-        if isinstance(value, (list, tuple)):
-            value = next((v for v in value if v is not None), None)
-            if value is None:
-                return None
-        if isinstance(value, datetime):
-            return value.strftime('%Y-%m-%dT%H:%M:%SZ')
-        text = str(value).strip()
-        return text or None
-
-    async def _rdap_throttle(self) -> None:
-        """SECONDARY in-process token-bucket smoother for RDAP/WHOIS calls.
-
-        Not the primary limiter (that is the cross-process checkout); this just
-        paces bursts within a single container so a large registered-domain
-        batch does not hammer registry RDAP endpoints from one agent at once.
-        """
-        async with self._rdap_lock:
-            now = time.monotonic()
-            elapsed = now - self._rdap_last_refill
-            self._rdap_last_refill = now
-            self._rdap_tokens = min(
-                self._RDAP_BUCKET_CAPACITY,
-                self._rdap_tokens + elapsed * self._RDAP_REFILL_PER_SEC,
-            )
-            if self._rdap_tokens < 1.0:
-                wait = (1.0 - self._rdap_tokens) / self._RDAP_REFILL_PER_SEC
-                await asyncio.sleep(wait)
-                self._rdap_tokens = 0.0
-            else:
-                self._rdap_tokens -= 1.0
-
-    async def _rdap_created(self, domain: str) -> Optional[str]:
-        """RDAP-primary registration-date lookup → clean ISO string or None.
-
-        Reads RDAP `events[].eventAction=="registration".eventDate` (asyncwhois
-        surfaces it as the parsed ``CREATED`` key) which is a clean ISO date and
-        bypasses the port-43 first-match `created:` artifact. Returns None for
-        ccTLDs lacking RDAP (no IANA bootstrap entry) — the caller then falls
-        back to the existing hardened port-43 `_whois_lookup` `created`.
-
-        Rate-limited through the cross-process ProviderQuotaService seam
-        (synthetic 'RDAP' provider). If the backend has no RDAP provider row
-        (keyless provider), checkout raises IntegrationCredentialsError and we
-        proceed best-effort under the local smoother only. A QuotaExceededError
-        (tenant cap hit) skips the lookup so we never breach a configured cap.
-        """
-        if asyncwhois is None:
-            return None
-
-        lease: Optional[str] = None
-        try:
-            checkout = await checkout_provider('RDAP', requested_units=1)
-            lease = checkout.get('leaseToken')
-        except QuotaExceededError:
-            # Respect a configured cap — skip the lookup (port-43 fallback still
-            # runs in _whois_lookup, so we are not blind on age).
-            return None
-        except IntegrationCredentialsError:
-            # No 'RDAP' provider configured (keyless) or transient backend error
-            # — fall through to a best-effort lookup paced by the local smoother.
-            lease = None
-        except Exception:
-            lease = None
-
-        await self._rdap_throttle()
-
-        created_iso: Optional[str] = None
-        success = False
-        try:
-            _query, parsed = await asyncwhois.aio_rdap(domain)
-            if parsed:
-                created = None
-                if _AwKeys is not None:
-                    created = parsed.get(_AwKeys.CREATED)
-                if created is None:
-                    created = parsed.get('created')
-                created_iso = self._to_iso(created)
-            success = created_iso is not None
-        except Exception as e:
-            # ccTLD without RDAP, network error, parse miss — fall back silently.
-            logger.debug(f"[Typosquat] RDAP age lookup failed for {domain}: {e}")
-        finally:
-            if lease:
-                try:
-                    await reconcile_call(
-                        'RDAP', lease, units=1, success=success,
-                        error_code=None if success else 'rdap_no_date',
-                    )
-                except Exception:
-                    pass
-
-        return created_iso
-
-    async def _mx_lookup(self, domain: str) -> List[str]:
-        """Lookup MX records for a domain."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'dig', 'MX', '+short', domain,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode('utf-8', errors='replace').strip()
-            mx_records = []
-            for line in text.split('\n'):
-                line = line.strip()
-                if line and ' ' in line:
-                    # MX format: "10 mail.example.com."
-                    parts = line.split(None, 1)
-                    if len(parts) == 2:
-                        mx_records.append(parts[1].rstrip('.'))
-            return mx_records[:5]
-        except (asyncio.TimeoutError, Exception):
-            return []
-
-    async def _get_page_title(self, domain: str) -> Optional[str]:
-        """Fetch page title via curl."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'curl', '-sL', '--connect-timeout', '3', '--max-time', '5',
-                '-o', '-', f'http://{domain}',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
-            html_text = stdout.decode('utf-8', errors='replace')
-            match = re.search(r'<title[^>]*>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
-            if match:
-                return html.unescape(match.group(1).strip())[:255]
-        except (asyncio.TimeoutError, Exception):
-            pass
-        return None
-
-    # SECONDARY RDAP/WHOIS smoother (see __init__): ~3 lookups/sec sustained,
-    # burst up to 5. This is NOT the primary limiter — the cross-process
-    # ProviderQuotaService checkout is (CLAUDE.md: the 5 agents do not coordinate
-    # in-process). This only paces bursts inside one container.
-    _RDAP_REFILL_PER_SEC = 3.0
-    _RDAP_BUCKET_CAPACITY = 5.0
-
-    def __init__(self):
-        super().__init__()
-        # PhishTank rate limiter: 10 req/min (free tier)
-        # Lock-based to prevent race conditions across concurrent executions
-        self._pt_lock = asyncio.Lock()
-        self._pt_last_reset = 0.0
-        self._pt_count = 0
-
-        # OpenPhish feed cache with lock and TTL (3600s = 1 hour, matches feed update interval)
-        self._openphish_lock = asyncio.Lock()
-        self._openphish_cache: Optional[Set[str]] = None
-        self._openphish_cache_time = 0.0
-
-        # VirusTotal rate limiter: 4 req/min (free tier)
-        # Lock-based to prevent race conditions across concurrent executions
-        self._vt_lock = asyncio.Lock()
-        self._vt_last_reset = 0.0
-        self._vt_count = 0
-
-        # RDAP/WHOIS age-capture rate limiting. The PRIMARY limiter is the
-        # cross-process ProviderQuotaService seam (checkout_provider('RDAP')) so
-        # all 5 agent containers coordinate per CLAUDE.md — a bare in-process
-        # semaphore does NOT coordinate across containers. The token bucket
-        # below is only a SECONDARY in-process smoother for bursts within one
-        # container, and the sole limiter when the backend has no 'RDAP' provider
-        # row configured (keyless → checkout raises and we fall through to
-        # local-only best-effort smoothing).
-        self._rdap_lock = asyncio.Lock()
-        self._rdap_tokens = float(self._RDAP_BUCKET_CAPACITY)
-        self._rdap_last_refill = time.monotonic()
-
-    async def _check_virustotal(self, domain: str) -> Optional[Dict[str, Any]]:
-        """Check domain reputation via VirusTotal API v3.
-
-        Returns detection stats dict or None if VT_API_KEY is not set or on error.
-        Rate-limited to 4 requests per minute (free tier).
-
-        TODO(T2.7 — tracked in roadmaps/core-platform.md "Split agent/tools/
-        typosquat_detect.py" entry): Migrate to ProviderQuotaService.checkout
-        once VIRUSTOTAL is added to the IntegrationProvider enum. The in-process
-        asyncio.Lock below only synchronizes inside ONE agent container; with
-        5 agents the effective rate is 20/min, not 4/min — risking a VT ban.
-        Deferred from the 2026-05-19 cleanup pass because (a) the enum addition
-        + Prisma migration falls under the locked "large refactors land as
-        separate PRs" decision, and (b) wiring checkout() without an Integration
-        row makes the call fail-closed for tenants that haven't configured a VT
-        key — a behavior change, not a cleanup. The roadmap entry covers both.
-        """
-        api_key = os.environ.get('VT_API_KEY')
-        if not api_key:
-            return None
-
-        # Rate limiting: 4 requests per 60 seconds (lock-based for concurrency safety)
-        async with self._vt_lock:
-            now = time.time()
-            if now - self._vt_last_reset >= 60:
-                self._vt_last_reset = now
-                self._vt_count = 0
-            if self._vt_count >= 4:
-                wait_time = 60 - (now - self._vt_last_reset)
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-                self._vt_last_reset = time.time()
-                self._vt_count = 0
-            self._vt_count += 1
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'curl', '-s', '--connect-timeout', '5', '--max-time', '10',
-                '-H', f'x-apikey: {api_key}',
-                f'https://www.virustotal.com/api/v3/domains/{domain}',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            data = json.loads(stdout.decode('utf-8', errors='replace'))
-            attrs = data.get('data', {}).get('attributes', {})
-            stats = attrs.get('last_analysis_stats', {})
-            malicious = stats.get('malicious', 0)
-            suspicious = stats.get('suspicious', 0)
-            harmless = stats.get('harmless', 0)
-            undetected = stats.get('undetected', 0)
-            total = malicious + suspicious + harmless + undetected
-            result = {
-                'malicious': malicious,
-                'suspicious': suspicious,
-                'total': total,
-            }
-            logger.info(f"[Typosquat] VT {domain}: malicious={malicious}, suspicious={suspicious}, total={total}")
-            return result
-        except (asyncio.TimeoutError, json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[Typosquat] VT error for {domain}: {e}")
-            return None
-
-    async def _check_phishtank(self, domain: str) -> bool:
-        """Check if domain is in PhishTank database.
-
-        Uses PhishTank API (POST checkurl). Requires PHISHTANK_API_KEY env var.
-        Rate-limited to 10 requests per minute (free tier).
-        Returns True if domain is a verified phish, False otherwise.
-
-        TODO(T2.7 — tracked in roadmaps/core-platform.md "Split agent/tools/
-        typosquat_detect.py" entry): Migrate to ProviderQuotaService.checkout
-        once PHISHTANK is added to the IntegrationProvider enum. Same
-        cross-container rate-limit problem as VirusTotal above (5 agents ×
-        10/min = effective 50/min, free tier limit is 10/min). Deferred from
-        the 2026-05-19 cleanup pass per the same reasoning as VirusTotal above.
-        """
-        api_key = os.environ.get('PHISHTANK_API_KEY')
-        if not api_key:
-            return False
-
-        # Rate limiting: 10 requests per 60 seconds (lock-based for concurrency safety)
-        async with self._pt_lock:
-            now = time.time()
-            if now - self._pt_last_reset >= 60:
-                self._pt_last_reset = now
-                self._pt_count = 0
-            if self._pt_count >= 10:
-                wait_time = 60 - (now - self._pt_last_reset)
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-                self._pt_last_reset = time.time()
-                self._pt_count = 0
-            self._pt_count += 1
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'curl', '-s', '--connect-timeout', '5', '--max-time', '10',
-                '-X', 'POST',
-                '-d', f'url=http://{domain}&format=json&app_key={api_key}',
-                'http://checkurl.phishtank.com/checkurl/',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            data = json.loads(stdout.decode('utf-8', errors='replace'))
-            results = data.get('results', {})
-            in_database = results.get('in_database', False)
-            verified = results.get('verified', False)
-            if in_database and verified:
-                logger.warning(f"[Typosquat] PhishTank MATCH: {domain} is a verified phish")
-                return True
-            return False
-        except (asyncio.TimeoutError, json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[Typosquat] PhishTank error for {domain}: {e}")
-            return False
-
-    async def _load_openphish_feed(self) -> Set[str]:
-        """Download OpenPhish feed and cache it with TTL.
-
-        Feed URL: https://openphish.com/feed.txt (updated hourly).
-        Cache TTL: 3600 seconds (1 hour).
-        Uses asyncio.Lock to prevent concurrent fetch races.
-        Returns set of URLs from the feed.
-        """
-        now = time.time()
-        # Fast path: cache is valid (no lock needed for read — worst case we re-fetch once)
-        if self._openphish_cache is not None and (now - self._openphish_cache_time) < 3600:
-            return self._openphish_cache
-
-        async with self._openphish_lock:
-            # Re-check inside lock (another coroutine may have populated it)
-            now = time.time()
-            if self._openphish_cache is not None and (now - self._openphish_cache_time) < 3600:
-                return self._openphish_cache
-
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    'curl', '-s', '--connect-timeout', '5', '--max-time', '15',
-                    'https://openphish.com/feed.txt',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-                text = stdout.decode('utf-8', errors='replace').strip()
-                urls = set()
-                for line in text.split('\n'):
-                    line = line.strip()
-                    if line:
-                        urls.add(line)
-                self._openphish_cache = urls
-                self._openphish_cache_time = time.time()
-                logger.info(f"[Typosquat] OpenPhish feed loaded: {len(urls)} URLs")
-                return urls
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning(f"[Typosquat] OpenPhish feed error: {e}")
-                self._openphish_cache = set()
-                self._openphish_cache_time = time.time()
-                return self._openphish_cache
-
-    async def _check_openphish(self, domain: str) -> bool:
-        """Check if domain appears in any URL in the OpenPhish feed.
-
-        Returns True if domain is found in feed, False otherwise.
-        """
-        feed = await self._load_openphish_feed()
-        if not feed:
-            return False
-
-        domain_lower = domain.lower()
-        for url in feed:
-            if domain_lower in url.lower():
-                logger.warning(f"[Typosquat] OpenPhish MATCH: {domain} found in feed")
-                return True
-        return False
-
-    async def _check_spf(self, domain: str) -> Dict[str, Any]:
-        """Check SPF record for a domain via dig TXT.
-
-        Returns dict with: has_spf, spf_record, spf_policy.
-        """
-        result = {'has_spf': False, 'spf_record': None, 'spf_policy': None}
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'dig', 'TXT', '+short', domain,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode('utf-8', errors='replace').strip()
-            for line in text.split('\n'):
-                line = line.strip().strip('"')
-                if 'v=spf1' in line.lower():
-                    result['has_spf'] = True
-                    result['spf_record'] = line
-                    # Extract policy qualifier
-                    for policy in ['-all', '~all', '+all', '?all']:
-                        if policy in line.lower():
-                            result['spf_policy'] = policy
-                            break
-                    break
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"[Typosquat] SPF check error for {domain}: {e}")
-        return result
-
-    async def _check_dmarc(self, domain: str) -> Dict[str, Any]:
-        """Check DMARC record for a domain via dig TXT _dmarc.{domain}.
-
-        Returns dict with: has_dmarc, dmarc_record, dmarc_policy.
-        """
-        result = {'has_dmarc': False, 'dmarc_record': None, 'dmarc_policy': None}
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'dig', 'TXT', '+short', f'_dmarc.{domain}',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode('utf-8', errors='replace').strip()
-            for line in text.split('\n'):
-                line = line.strip().strip('"')
-                if 'v=dmarc1' in line.lower():
-                    result['has_dmarc'] = True
-                    result['dmarc_record'] = line
-                    # Extract policy (p=none|quarantine|reject)
-                    match = re.search(r'p\s*=\s*(none|quarantine|reject)', line, re.IGNORECASE)
-                    if match:
-                        result['dmarc_policy'] = match.group(1).lower()
-                    break
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"[Typosquat] DMARC check error for {domain}: {e}")
-        return result
-
-    async def _check_dkim(self, domain: str) -> Dict[str, Any]:
-        """Check DKIM records for a domain by trying common selectors.
-
-        Tries selectors: default, google, selector1, selector2, k1.
-        Returns dict with: has_dkim, dkim_selector.
-        """
-        result: Dict[str, Any] = {'has_dkim': False, 'dkim_selector': None}
-        selectors = ['default', 'google', 'selector1', 'selector2', 'k1']
-        for selector in selectors:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    'dig', 'TXT', '+short', f'{selector}._domainkey.{domain}',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                text = stdout.decode('utf-8', errors='replace').strip()
-                if text and 'v=dkim1' in text.lower():
-                    result['has_dkim'] = True
-                    result['dkim_selector'] = selector
-                    break
-            except (asyncio.TimeoutError, Exception):
-                continue
-        return result
-
     def _score_result(
         self,
         original: str,
@@ -1293,15 +924,24 @@ class TyposquatDetectTool(ToolPlugin):
             score += 5
 
         # Brand-label identity: candidate's 2LD label exactly equals the brand's
-        # 2LD label (e.g. tetradg.io vs tetradg.com — a TLD swap of the exact
+        # 2LD label (e.g. brand.io vs brand.com — a TLD swap of the exact
         # brand name). Full-domain Levenshtein under-weights these vs unrelated
         # 1-char-off near-misses, so award a strong, distance-independent bonus
         # so an exact-name impersonation on another TLD outranks a coincidental
         # near-miss. Additive and cap-coherent with the band thresholds.
+        #
+        # Phase 4 (P1-4 #825) — TOKEN-RARITY DAMPENER. For a COMMON-WORD brand
+        # (an ordinary dictionary word — `is_common_token`, wordfreq Zipf
+        # across en/es/fr/pt/de/it) an exact name match collides with the
+        # ordinary use of the word (unrelated businesses that simply own the
+        # word on another TLD), so the identity bonus is dampened to +6. A RARE
+        # (coined) brand keeps the full +12 — the same match is highly specific
+        # there. Fail-open: a missing wordfreq reads RARE (full bonus).
         candidate_name, tld = self._split_domain(candidate)
         brand_name, _ = self._split_domain(original)
+        brand_is_common = bool(brand_name) and is_common_token(brand_name)
         if brand_name and candidate_name == brand_name:
-            score += 12
+            score += 6 if brand_is_common else 12
 
         # Combosquat / brand-containment signal: the candidate SLD contains the
         # brand token as a STANDALONE word (split on hyphens/dots), NOT a mere
@@ -1309,14 +949,28 @@ class TyposquatDetectTool(ToolPlugin):
         # Only fires when there are additional tokens (len > 1), confirming a
         # combosquat "brand-prefix + attack-suffix" pattern rather than an exact
         # TLD-swap already handled by the brand_label_identity check above.
+        #
+        # Phase 4 (P1-4 #825) — rarity-aware containment. A COMMON brand word
+        # standing alone next to a NEUTRAL token ("mode-hub", "sol-garden") is
+        # the dictionary-collision shape, not impersonation — dampened to +6.
+        # The SECOND ANCHOR (a risk/attack-suffix keyword co-occurring in the
+        # SLD) restores the full +20 (+10 amplifier): "mode-login" is an attack
+        # shape regardless of how common "mode" is. RARE brand tokens keep the
+        # full +20 unconditionally (containment of a coined name IS the signal).
         if brand_name and len(brand_name) >= 4:
             _sld_tokens = [t for t in candidate_name.replace('.', '-').split('-') if t]
             if len(_sld_tokens) > 1 and brand_name in _sld_tokens:
-                score += 20
-                # Risk-keyword amplifier: brand token co-occurs with a known
+                # Risk-keyword anchor: brand token co-occurs with a known
                 # phishing/attack-suffix token → clear impersonation intent
-                if any(tok in _COMBOSQUAT_RISK_KEYWORDS for tok in _sld_tokens):
-                    score += 10
+                _has_risk_kw = any(
+                    tok in _COMBOSQUAT_RISK_KEYWORDS for tok in _sld_tokens
+                )
+                if brand_is_common and not _has_risk_kw:
+                    score += 6
+                else:
+                    score += 20
+                    if _has_risk_kw:
+                        score += 10
 
         # Suspicious TLD
         if tld in SUSPICIOUS_TLDS:
@@ -1412,18 +1066,27 @@ class TyposquatDetectTool(ToolPlugin):
         if mx_records and len(mx_records) > 0 and email_security:
             spf = email_security.get('spf', {})
             dmarc = email_security.get('dmarc', {})
-            # Has MX + no SPF: email spoofing possible
-            if not spf.get('has_spf', False):
-                score += 5
-            # Has MX + SPF +all: allows any sender
-            elif spf.get('spf_policy') == '+all':
-                score += 8
-            # Has MX + no DMARC
-            if not dmarc.get('has_dmarc', False):
-                score += 3
-            # Has MX + DMARC p=none (monitoring only)
-            elif dmarc.get('dmarc_policy') == 'none':
-                score += 2
+            # POST-1 — skip the "missing posture" weights when the lane is UNSWEPT
+            # (blind resolver / dig timeout); a non-answer must not inflate risk as
+            # if the record were confirmed absent.
+            if not spf.get('spf_unswept', False):
+                # Has MX + no SPF: email spoofing possible
+                if not spf.get('has_spf', False):
+                    score += 5
+                # Has MX + SPF +all: allows any sender
+                elif spf.get('spf_policy') == '+all':
+                    score += 8
+                # POST-2 — neutral (?all) / soft-fail (~all): effectively permits
+                # spoofing, previously scored as zero email-posture risk.
+                elif spf.get('spf_policy') in ('?all', '~all'):
+                    score += 5
+            if not dmarc.get('dmarc_unswept', False):
+                # Has MX + no DMARC
+                if not dmarc.get('has_dmarc', False):
+                    score += 3
+                # Has MX + DMARC p=none (monitoring only)
+                elif dmarc.get('dmarc_policy') == 'none':
+                    score += 2
 
         # Hard cap: CRITICAL is reserved for AI-confirmed phishing only
         score = min(score, 75)
@@ -1449,7 +1112,9 @@ class TyposquatDetectTool(ToolPlugin):
         # engines); recall for those is carried by the backend T4 re-promote, so we
         # do NOT reference them here. Unknown registration age leaves is_fresh_90
         # False → treated as NOT fresh (fail-closed). The gate applies to ALL
-        # brands regardless of token rarity (rare-vs-common is Phase 4).
+        # brands regardless of token rarity — the Phase 4 rarity dampener
+        # (P1-4 #825) acts EARLIER, on the identity/containment bonuses above,
+        # so a common-word brand rarely reaches this gate on structure alone.
         hard_intel = (
             (bool(vt_detections) and vt_detections.get('malicious', 0) > 0)
             or phishtank_match
@@ -1503,6 +1168,16 @@ class TyposquatDetectTool(ToolPlugin):
         enabled_techniques = parameters.get('enabledTechniques')
         max_edit_distance = parameters.get('maxEditDistance', 5)
         custom_tlds = parameters.get('customTlds')
+        # G1 — locale-aware keyboard layouts for the fat-finger fuzzer. Accept a
+        # list or comma string; normalize + validate against known layouts; an
+        # empty/invalid selection falls back to US-QWERTY.
+        kbd_raw = parameters.get('keyboardLayouts')
+        if isinstance(kbd_raw, str):
+            kbd_raw = [s for s in re.split(r'[,\s]+', kbd_raw) if s]
+        keyboard_layouts = [
+            layout for layout in (l.lower().strip() for l in (kbd_raw or []))
+            if layout in KEYBOARD_ADJACENCY
+        ] or DEFAULT_KEYBOARD_LAYOUTS
 
         # Build list of domains to check (accept domain, domains, or targets)
         domain_list: List[str] = []
@@ -1525,17 +1200,22 @@ class TyposquatDetectTool(ToolPlugin):
             'LOW': ['homoglyph', 'tld_swap'],
             'MEDIUM': ['homoglyph', 'tld_swap', 'transposition', 'omission', 'subdomain'],
             'HIGH': [
-                'homoglyph', 'transposition', 'omission', 'doubling', 'hyphen',
+                'homoglyph', 'keyboard_adjacency', 'transposition', 'omission', 'doubling', 'hyphen',
                 'tld_swap', 'subdomain', 'bitsquatting', 'vowel_swap', 'addition',
                 'combosquatting', 'soundsquatting', 'punycode_idn',
+                # G2-ext (#451) expanded coverage
+                'homophone', 'misspelling', 'plural', 'cardinal_swap', 'ordinal_swap',
+                'dot_omission', 'dot_hyphen', 'wrong_sld', 'multi_edit',
             ],
         }
 
         # Determine techniques to use (priority: enabledTechniques > techniques > entropyLevel)
         all_techniques = [
-            'homoglyph', 'transposition', 'omission', 'doubling', 'hyphen',
+            'homoglyph', 'keyboard_adjacency', 'transposition', 'omission', 'doubling', 'hyphen',
             'tld_swap', 'subdomain', 'bitsquatting', 'vowel_swap', 'addition',
             'combosquatting', 'soundsquatting', 'punycode_idn',
+            'homophone', 'misspelling', 'plural', 'cardinal_swap', 'ordinal_swap',
+            'dot_omission', 'dot_hyphen', 'wrong_sld', 'multi_edit',
         ]
 
         # Also accept full-form names and map to short forms
@@ -1544,6 +1224,13 @@ class TyposquatDetectTool(ToolPlugin):
             'subdomain_prepend': 'subdomain',
             'punycode': 'punycode_idn',
             'idn': 'punycode_idn',
+            # G2-ext aliases
+            'misspelling_dict': 'misspelling',
+            'homophones': 'homophone',
+            'cardinal': 'cardinal_swap',
+            'ordinal': 'ordinal_swap',
+            'plural_singular': 'plural',
+            'multiedit': 'multi_edit',
         }
 
         if enabled_techniques:
@@ -1558,6 +1245,7 @@ class TyposquatDetectTool(ToolPlugin):
 
         technique_map = {
             'homoglyph': self._homoglyph,
+            'keyboard_adjacency': lambda name, tld: self._keyboard_adjacency(name, tld, keyboard_layouts),
             'transposition': self._transposition,
             'omission': self._omission,
             'doubling': self._doubling,
@@ -1570,6 +1258,16 @@ class TyposquatDetectTool(ToolPlugin):
             'combosquatting': self._combosquatting,
             'soundsquatting': self._soundsquatting,
             'punycode_idn': self._punycode_idn,
+            # G2-ext (#451) expanded coverage
+            'homophone': self._homophone,
+            'misspelling': self._misspelling_dict,
+            'plural': self._plural,
+            'cardinal_swap': self._cardinal_swap,
+            'ordinal_swap': self._ordinal_swap,
+            'dot_omission': self._dot_omission,
+            'dot_hyphen': self._dot_hyphen,
+            'wrong_sld': self._wrong_sld,
+            'multi_edit': self._multi_edit,
         }
 
         try:
@@ -1589,33 +1287,108 @@ class TyposquatDetectTool(ToolPlugin):
             # (domain_string, technique_name)
             variations: List[Tuple[str, str]] = []
 
+            # Resolve eligible domains once. PERM-5 — min-brand-len NO-OP: a 1-3
+            # char brand label produces a junk, high-collision corpus (every short
+            # permutation resolves to unrelated registered domains), so skip
+            # generation for it (mirrors the social short-token discipline; the
+            # brand is still covered by exact-match + social monitoring).
+            eligible: List[Tuple[str, str, str]] = []
             for d in domain_list:
                 name, tld = self._split_domain(d)
-                # Don't include the original domain itself
-                seen.add(d)
+                seen.add(d)  # don't include the original domain itself
+                if len(name) < MIN_BRAND_LABEL_LEN:
+                    logger.info(
+                        f"[Typosquat] NO-OP generation for short brand label "
+                        f"'{name}' (<{MIN_BRAND_LABEL_LEN} chars) — junk-corpus guard"
+                    )
+                    continue
+                eligible.append((d, name, tld))
+
+            # PERM-1/9 — brand-containment techniques run on a SEPARATE pass that
+            # BYPASSES the max_variations budget, so the credential-phish/BEC lures
+            # (brand-login / secure-brand / brand-verify) are ALWAYS produced and
+            # reach DNS. Previously they were doubly lost: starved by the budget
+            # (they sit late in the technique order) AND dropped by the edit-
+            # distance filter. Bounded by a generous safety cap.
+            EXEMPT_TECH_NAMES = {'combosquatting', 'subdomain'}
+            EXEMPT_SAFETY_CAP = max(max_variations * 2, 1000)
+            for d, name, tld in eligible:
                 for tech_name in selected:
+                    if tech_name not in EXEMPT_TECH_NAMES:
+                        continue
                     fn = technique_map.get(tech_name)
                     if not fn:
                         continue
-                    candidates = fn(name, tld)
-                    for candidate_domain, technique_label in candidates:
+                    for candidate_domain, technique_label in fn(name, tld):
                         if candidate_domain not in seen:
                             seen.add(candidate_domain)
                             variations.append((candidate_domain, technique_label))
-                            if len(variations) >= max_variations:
-                                break
-                    if len(variations) >= max_variations:
+                    if len(variations) >= EXEMPT_SAFETY_CAP:
                         break
-                if len(variations) >= max_variations:
+                if len(variations) >= EXEMPT_SAFETY_CAP:
                     break
 
-            # Apply maxEditDistance filter
+            # Budgeted-typo pass — the classic character-level techniques
+            # (homoglyph / transposition / omission / keyboard-adjacency / …).
+            # #1048: give these their OWN budget of `max_variations`, counted
+            # independently of the exempt lures already produced above. Counting
+            # jointly meant that once the exempt pass (~238 lures) exceeded
+            # `max_variations`, this pass broke before generating a single typo —
+            # so a low `max_variations` (default 50) silently starved the
+            # highest-recall detection classes to ZERO. Now total candidates =
+            # exempt lures (bounded by EXEMPT_SAFETY_CAP) + up to `max_variations`
+            # typos, and lowering `max_variations` can never zero the typo set.
+            exempt_count = len(variations)
+            for d, name, tld in eligible:
+                if (len(variations) - exempt_count) >= max_variations:
+                    break
+                for tech_name in selected:
+                    if tech_name in EXEMPT_TECH_NAMES:
+                        continue
+                    fn = technique_map.get(tech_name)
+                    if not fn:
+                        continue
+                    for candidate_domain, technique_label in fn(name, tld):
+                        if candidate_domain not in seen:
+                            seen.add(candidate_domain)
+                            variations.append((candidate_domain, technique_label))
+                            if (len(variations) - exempt_count) >= max_variations:
+                                break
+                    if (len(variations) - exempt_count) >= max_variations:
+                        break
+
+            # Apply maxEditDistance filter.
+            # PERM-1/9 — EXEMPT brand-containment techniques (COMBOSQUATTING,
+            # SUBDOMAIN_PREPEND). They append/prepend whole tokens, so the
+            # full-domain edit distance is large by construction (questrade-login
+            # = 6, secure-questrade = 7) and the default max of 5 dropped them
+            # BEFORE DNS — the resolver never saw the registered brand-login /
+            # secure-brand / brand-verify credential-phish/BEC lure class. These
+            # techniques are inherently brand-relevant (the brand is a standalone
+            # token), so they bypass the lexical-distance filter entirely.
+            EDIT_DISTANCE_EXEMPT = {'COMBOSQUATTING', 'SUBDOMAIN_PREPEND'}
             if max_edit_distance and max_edit_distance > 0:
                 original_count = len(variations)
                 filtered = []
                 for var_domain, technique in variations:
-                    # Compute edit distance against the closest original domain
-                    min_dist = min(self._levenshtein(d, var_domain) for d in domain_list)
+                    if technique in EDIT_DISTANCE_EXEMPT:
+                        filtered.append((var_domain, technique))
+                        continue
+                    # #576 — length pre-filter (provably output-identical). Edit
+                    # distance is bounded below by the length difference
+                    # (damerau(a,b) >= |len(a)-len(b)|), so if the SMALLEST length
+                    # gap to any original domain already exceeds maxEditDistance,
+                    # the Damerau distance cannot satisfy the threshold — reject
+                    # WITHOUT running the O(L²) matrix. This skips the expensive DP
+                    # for the length-impossible majority of a ~1500-candidate corpus.
+                    min_len_diff = min(abs(len(d) - len(var_domain)) for d in domain_list)
+                    if min_len_diff > max_edit_distance:
+                        continue
+                    # Compute edit distance against the closest original domain.
+                    # Damerau (transposition = 1) to match the scorer's distance
+                    # metric (_score_result uses _damerau_levenshtein) so a tight
+                    # maxEditDistance doesn't pre-drop near-misses the scorer keeps.
+                    min_dist = min(self._damerau_levenshtein(d, var_domain) for d in domain_list)
                     if min_dist <= max_edit_distance:
                         filtered.append((var_domain, technique))
                 if len(filtered) < original_count:
@@ -1632,9 +1405,24 @@ class TyposquatDetectTool(ToolPlugin):
                     total_items=len(variations),
                 )
 
-            # -- Step 2: DNS resolution ----------------------------------------
+            # -- Step 2: DNS probe + structural scoring (DISCOVERY-ONLY) -------
+            # #1049 — this tool is now discovery-only. It resolves DNS to
+            # establish registration and structurally risk-scores each candidate
+            # from DNS/structural signals alone. Per-registered-domain enrichment
+            # (HTTP/SSL/WHOIS/RDAP/threat-feeds/email-auth) has moved to the
+            # decoupled `typosquat:enrich` queue — doing it here would
+            # double-enrich. Enrichment-derived severity (fresh-registration,
+            # live-page, hard-intel) is filled in async by that queue; discovery
+            # carries structural severity only ("structure now, age fills in").
             results: List[Dict[str, Any]] = []
             registered_domains: List[str] = []
+
+            # Brand keywords from the primary domain name (structural scoring input).
+            primary_name, _ = self._split_domain(primary_domain)
+            brand_keywords = [primary_name]
+            # Also add parts split by hyphens (e.g. "my-brand" -> ["my-brand", "my", "brand"])
+            if '-' in primary_name:
+                brand_keywords.extend(p for p in primary_name.split('-') if len(p) >= 3)
 
             if check_dns and variations:
                 if agent:
@@ -1648,8 +1436,8 @@ class TyposquatDetectTool(ToolPlugin):
                 # Batch DNS probes, 20 concurrent. Each probe resolves A / AAAA /
                 # NS / MX so registration = (A OR AAAA OR NS OR MX), and reports a
                 # rcode so NXDOMAIN (unregistered) is distinguished from
-                # SERVFAIL/timeout (unknown). The MX from the probe is reused in
-                # Step 3 (no second MX lookup for registered domains).
+                # SERVFAIL/timeout (unknown). MX from the probe feeds structural
+                # scoring (email-capable signal) and is carried on the row.
                 batch_size = 20
                 empty_probe = {
                     'a': [], 'aaaa': [], 'ns': [], 'mx': [],
@@ -1666,22 +1454,32 @@ class TyposquatDetectTool(ToolPlugin):
                         else:
                             all_probes.append(r)
 
-                # MX records captured during the registration probe, reused in
-                # Step 3 so registered domains are not MX-looked-up twice.
-                probe_mx: Dict[str, List[str]] = {}
-
-                # Build initial results with DNS data
+                # Build discovery rows: DNS registration facts + structural score.
                 for idx, (var_domain, technique) in enumerate(variations):
                     probe = all_probes[idx] if idx < len(all_probes) else empty_probe
                     ips = probe.get('a', [])
                     is_registered = probe.get('is_registered', False)
                     if is_registered:
                         registered_domains.append(var_domain)
-                    if probe.get('mx'):
-                        probe_mx[var_domain] = probe['mx']
+                    # Filter empty/blank MX entries so the stored list (and the
+                    # frontend Email chip) never sees a falsy MX implying mail
+                    # capability. MX is a DISCOVERY signal (from the probe), not
+                    # enrichment.
+                    mx = [m for m in (probe.get('mx') or []) if m and m.strip()]
                     dist = self._damerau_levenshtein(primary_domain, var_domain)
                     max_len = max(len(primary_domain), len(var_domain))
                     similarity = round(1.0 - (dist / max_len), 2) if max_len > 0 else 0.0
+                    # Structural score from DNS/structural signals only. Enrichment
+                    # inputs (has_web/has_ssl/page_title/whois/VT/feeds/email-auth)
+                    # are absent → they degrade gracefully to no-bonus in
+                    # _score_result, and the HIGH gate caps structure-only at
+                    # MEDIUM (49) until the enrich queue supplies a positive signal.
+                    score, level = self._score_result(
+                        primary_domain, var_domain,
+                        is_registered, False, False,
+                        mx_records=mx,
+                        brand_keywords=brand_keywords,
+                    )
                     results.append({
                         'domain': var_domain,
                         'technique': technique,
@@ -1692,13 +1490,11 @@ class TyposquatDetectTool(ToolPlugin):
                         'registration_unknown': probe.get('registration_unknown', False),
                         'resolved_ips': ips,
                         'resolved_ipv6': probe.get('aaaa', []),
-                        'has_web_content': False,
-                        'has_ssl_cert': False,
-                        'http_status_code': 0,
-                        'risk_score': 0,
-                        'risk_level': 'INFO',
+                        'nameservers': probe.get('ns', []),
+                        'mx_records': mx,
+                        'risk_score': score,
+                        'risk_level': level,
                         'similarity': similarity,
-                        'page_title': None,
                     })
 
                 logger.info(f"[Typosquat] DNS resolution complete: {len(registered_domains)}/{len(variations)} registered")
@@ -1710,184 +1506,8 @@ class TyposquatDetectTool(ToolPlugin):
                         items_processed=len(variations),
                         total_items=len(variations),
                     )
-
-                # -- Step 3: Score registered domains --------------------------
-                if registered_domains:
-                    if agent:
-                        agent.report_progress(
-                            current_operation=f"Scoring {len(registered_domains)} registered domains...",
-                            current_target=primary_domain,
-                            items_processed=0,
-                            total_items=len(registered_domains),
-                        )
-
-                    # Extract brand keywords from primary domain name
-                    primary_name, _ = self._split_domain(primary_domain)
-                    brand_keywords = [primary_name]
-                    # Also add parts split by hyphens (e.g., "my-brand" -> ["my-brand", "my", "brand"])
-                    if '-' in primary_name:
-                        brand_keywords.extend(p for p in primary_name.split('-') if len(p) >= 3)
-
-                    # HTTP, SSL, MX, page title, VT, PhishTank, OpenPhish, SPF, DMARC, DKIM checks
-                    # WHOIS runs in smaller batches (5) to avoid rate limiting/timeouts
-                    http_results: Dict[str, Dict[str, Any]] = {}
-                    ssl_results: Dict[str, bool] = {}
-                    whois_results: Dict[str, Dict[str, Any]] = {}
-                    mx_results: Dict[str, List[str]] = {}
-                    title_results: Dict[str, Optional[str]] = {}
-                    vt_results: Dict[str, Optional[Dict[str, Any]]] = {}
-                    pt_results: Dict[str, bool] = {}
-                    op_results: Dict[str, bool] = {}
-                    spf_results: Dict[str, Dict[str, Any]] = {}
-                    dmarc_results: Dict[str, Dict[str, Any]] = {}
-                    dkim_results: Dict[str, Dict[str, Any]] = {}
-
-                    # Pre-load OpenPhish feed (cached for entire scan)
-                    await self._load_openphish_feed()
-
-                    # Phase 1: HTTP, SSL, MX, title, VT, PhishTank, OpenPhish, SPF, DMARC, DKIM (batch 20)
-                    for i in range(0, len(registered_domains), batch_size):
-                        batch = registered_domains[i:i + batch_size]
-                        http_tasks = [self._check_http(d) for d in batch]
-                        ssl_tasks = [self._check_ssl(d) for d in batch]
-                        title_tasks = [self._get_page_title(d) for d in batch]
-                        vt_tasks = [self._check_virustotal(d) for d in batch]
-                        pt_tasks = [self._check_phishtank(d) for d in batch]
-                        op_tasks = [self._check_openphish(d) for d in batch]
-                        spf_tasks = [self._check_spf(d) for d in batch]
-                        dmarc_tasks = [self._check_dmarc(d) for d in batch]
-                        dkim_tasks = [self._check_dkim(d) for d in batch]
-                        http_batch = await asyncio.gather(*http_tasks, return_exceptions=True)
-                        ssl_batch = await asyncio.gather(*ssl_tasks, return_exceptions=True)
-                        title_batch = await asyncio.gather(*title_tasks, return_exceptions=True)
-                        vt_batch = await asyncio.gather(*vt_tasks, return_exceptions=True)
-                        pt_batch = await asyncio.gather(*pt_tasks, return_exceptions=True)
-                        op_batch = await asyncio.gather(*op_tasks, return_exceptions=True)
-                        spf_batch = await asyncio.gather(*spf_tasks, return_exceptions=True)
-                        dmarc_batch = await asyncio.gather(*dmarc_tasks, return_exceptions=True)
-                        dkim_batch = await asyncio.gather(*dkim_tasks, return_exceptions=True)
-                        for j, d in enumerate(batch):
-                            hr = http_batch[j]
-                            sr = ssl_batch[j]
-                            tr = title_batch[j]
-                            vr = vt_batch[j]
-                            pr = pt_batch[j]
-                            opr = op_batch[j]
-                            spfr = spf_batch[j]
-                            dmr = dmarc_batch[j]
-                            dkr = dkim_batch[j]
-                            http_results[d] = hr if not isinstance(hr, Exception) else {'has_content': False, 'status_code': 0, 'redirect_chain': [], 'final_url': f'http://{d}'}
-                            ssl_results[d] = sr if not isinstance(sr, Exception) else False
-                            # MX was already resolved during the Step-2 registration
-                            # probe — reuse it (no second lookup).
-                            mx_results[d] = probe_mx.get(d, [])
-                            title_results[d] = tr if not isinstance(tr, Exception) else None
-                            vt_results[d] = vr if not isinstance(vr, Exception) else None
-                            pt_results[d] = pr if not isinstance(pr, Exception) else False
-                            op_results[d] = opr if not isinstance(opr, Exception) else False
-                            spf_results[d] = spfr if not isinstance(spfr, Exception) else {'has_spf': False, 'spf_record': None, 'spf_policy': None}
-                            dmarc_results[d] = dmr if not isinstance(dmr, Exception) else {'has_dmarc': False, 'dmarc_record': None, 'dmarc_policy': None}
-                            dkim_results[d] = dkr if not isinstance(dkr, Exception) else {'has_dkim': False, 'dkim_selector': None}
-
-                    # Phase 2: WHOIS + RDAP age (slow TCP, batch 5 to avoid rate
-                    # limiting). RDAP is the PRIMARY source for the registration
-                    # date (clean ISO from events[].eventAction=="registration"),
-                    # falling back to the hardened port-43 `created` for ccTLDs
-                    # without RDAP. The backend's field-level merge (`pref`) reads
-                    # `whois_created` directly, so the RDAP override lands without
-                    # disturbing the `whois_failed` preserve-prior contract.
-                    whois_batch_size = 5
-                    for i in range(0, len(registered_domains), whois_batch_size):
-                        batch = registered_domains[i:i + whois_batch_size]
-                        whois_tasks = [self._whois_lookup(d) for d in batch]
-                        rdap_tasks = [self._rdap_created(d) for d in batch]
-                        whois_batch = await asyncio.gather(*whois_tasks, return_exceptions=True)
-                        rdap_batch = await asyncio.gather(*rdap_tasks, return_exceptions=True)
-                        for j, d in enumerate(batch):
-                            wr = whois_batch[j]
-                            # An exception here is a hard WHOIS failure — mark it
-                            # so the backend preserves prior data (WP-3) instead
-                            # of overwriting persisted registrar/created with null.
-                            wr = wr if not isinstance(wr, Exception) else {'registrar': None, 'created': None, 'expires': None, 'nameservers': [], 'whois_failed': True}
-                            rd = rdap_batch[j]
-                            rdap_created = rd if (rd and not isinstance(rd, Exception)) else None
-                            if rdap_created:
-                                # Prefer the clean RDAP ISO date over the port-43
-                                # `created` (bypasses the first-match `created:`
-                                # artifact, e.g. CIRA .ca).
-                                wr = {**wr, 'created': rdap_created}
-                            whois_results[d] = wr
-
-                    # Update results with HTTP/SSL/VT/PhishTank/OpenPhish/email security data and scoring
-                    for r in results:
-                        if r['is_registered']:
-                            d = r['domain']
-                            http_data = http_results.get(d, {'has_content': False, 'status_code': 0, 'redirect_chain': [], 'final_url': f'http://{d}'})
-                            has_web = http_data['has_content']
-                            http_code = http_data['status_code']
-                            has_ssl = ssl_results.get(d, False)
-                            whois = whois_results.get(d, {})
-                            # Filter empty/blank MX entries so the stored list
-                            # (and the frontend Email chip) never sees a falsy
-                            # MX that would imply mail capability.
-                            mx = [m for m in (mx_results.get(d, []) or []) if m and m.strip()]
-                            title = title_results.get(d)
-                            vt = vt_results.get(d)
-                            pt_match = pt_results.get(d, False)
-                            op_match = op_results.get(d, False)
-                            spf = spf_results.get(d, {'has_spf': False, 'spf_record': None, 'spf_policy': None})
-                            dmarc = dmarc_results.get(d, {'has_dmarc': False, 'dmarc_record': None, 'dmarc_policy': None})
-                            dkim = dkim_results.get(d, {'has_dkim': False, 'dkim_selector': None})
-                            email_sec = {'spf': spf, 'dmarc': dmarc, 'dkim': dkim}
-                            r['has_web_content'] = has_web
-                            r['has_ssl_cert'] = has_ssl
-                            r['http_status_code'] = http_code
-                            r['redirect_chain'] = http_data['redirect_chain']
-                            r['final_url'] = http_data['final_url']
-                            r['whois_registrar'] = whois.get('registrar')
-                            r['whois_created'] = whois.get('created')
-                            r['whois_expires'] = whois.get('expires')
-                            r['nameservers'] = whois.get('nameservers', [])
-                            r['whois_registrant_email'] = whois.get('registrant_email')
-                            r['whois_registrant_org'] = whois.get('registrant_org')
-                            r['whois_registrant_name'] = whois.get('registrant_name')
-                            r['whois_registrant_country'] = whois.get('registrant_country')
-                            # WP-3: surface the failure marker so the backend can
-                            # merge-don't-replace — a failed lookup must not null
-                            # out previously-good registrar/registeredAt metadata.
-                            r['whois_failed'] = whois.get('whois_failed', False)
-                            r['mx_records'] = mx
-                            r['page_title'] = title
-                            r['phishtank_match'] = pt_match
-                            r['openphish_match'] = op_match
-                            r['email_security'] = email_sec
-                            if vt:
-                                r['vt_detections'] = vt
-                            score, level = self._score_result(
-                                primary_domain, d,
-                                r['is_registered'], has_web, has_ssl,
-                                page_title=title,
-                                mx_records=mx,
-                                brand_keywords=brand_keywords,
-                                whois_created=whois.get('created'),
-                                vt_detections=vt,
-                                final_url=http_data['final_url'],
-                                phishtank_match=pt_match,
-                                openphish_match=op_match,
-                                email_security=email_sec,
-                            )
-                            r['risk_score'] = score
-                            r['risk_level'] = level
-
-                    if agent:
-                        agent.report_progress(
-                            current_operation="Scoring complete",
-                            current_target=primary_domain,
-                            items_processed=len(registered_domains),
-                            total_items=len(registered_domains),
-                        )
             else:
-                # No DNS check requested - just build results without resolution
+                # No DNS check requested — build unresolved discovery rows.
                 for var_domain, technique in variations:
                     dist = self._damerau_levenshtein(primary_domain, var_domain)
                     max_len = max(len(primary_domain), len(var_domain))
@@ -1899,13 +1519,11 @@ class TyposquatDetectTool(ToolPlugin):
                         'registration_unknown': False,
                         'resolved_ips': [],
                         'resolved_ipv6': [],
-                        'has_web_content': False,
-                        'has_ssl_cert': False,
-                        'http_status_code': 0,
+                        'nameservers': [],
+                        'mx_records': [],
                         'risk_score': 0,
                         'risk_level': 'INFO',
                         'similarity': similarity,
-                        'page_title': None,
                     })
 
             # Sort by risk score descending

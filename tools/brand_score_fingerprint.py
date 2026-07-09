@@ -113,6 +113,31 @@ def _ngram_overlap(texts_a: List[str], texts_b: List[str], n: int = 3) -> float:
     return (len(intersection) / len(union)) * 100 if union else 0.0
 
 
+def _composite_score(
+    color: float, logo: float, font: float, text: float, layout: float,
+    favicon: float, favicon_unreachable: bool,
+    reference_image_score: float = 0.0, has_reference: bool = False,
+) -> float:
+    """Weighted visual-similarity composite (sub-scores 0-100).
+
+    FAV-6: when the target favicon is UNREACHABLE (bot-walled 403), EXCLUDE the
+    0.10 favicon term and renormalize the remaining weights to sum to 1.0 — a
+    forced 0 would otherwise dilute the composite toward 'clean' for a real clone
+    that bot-walls its favicon. An absent-but-reachable favicon keeps its 0 (a
+    genuine no-similarity signal), so the unreachable composite is never LOWER
+    than the favicon-absent composite for otherwise-identical inputs.
+    """
+    weighted = 0.25 * color + 0.25 * logo + 0.10 * font + 0.20 * text + 0.10 * layout
+    total_weight = 0.90
+    if not favicon_unreachable:
+        weighted += 0.10 * favicon
+        total_weight = 1.0
+    composite = weighted / total_weight
+    if has_reference:
+        composite = (composite * 0.8) + (reference_image_score * 0.2)
+    return composite
+
+
 def _hamming_distance_normalized(hash_a: str, hash_b: str) -> float:
     """Compute normalized hamming distance between two hex hash strings (0-100 similarity)."""
     try:
@@ -306,10 +331,11 @@ class BrandScoreFingerprintTool(ToolPlugin):
         try:
             from tools.brand_fingerprint_identity import extract_page_identity
             from playwright.async_api import async_playwright
+            from lib.process_reaper import close_browser_safe
 
             target_page_hash = None
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
                 context = await browser.new_context(
                     viewport={'width': 1920, 'height': 1080},
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -322,7 +348,7 @@ class BrandScoreFingerprintTool(ToolPlugin):
                 except Exception:
                     target_page_hash = None
                 await page.close()
-                await browser.close()
+                await close_browser_safe(browser)
 
             if agent:
                 agent.append_output(
@@ -407,6 +433,13 @@ class BrandScoreFingerprintTool(ToolPlugin):
         favicon_score = 0.0
         if brand_favicon and target_favicon:
             favicon_score = _hamming_distance_normalized(brand_favicon, target_favicon)
+        # FAV-6 — when the target favicon is UNREACHABLE (bot-walled 403, marked
+        # faviconReachable=False by the identity extractor), EXCLUDE the favicon
+        # term and renormalize the remaining weights below — a forced 0 would
+        # otherwise dilute the composite toward 'clean' for a real clone that
+        # bot-walls its favicon. An absent-but-reachable favicon is NOT excluded
+        # (its 0 is a genuine no-similarity signal).
+        favicon_unreachable = target_identity.get('faviconReachable') is False
 
         # 7. Reference image score (manual uploaded screenshots/logos)
         reference_image_hashes = _collect_reference_image_hashes(fingerprint)
@@ -418,17 +451,13 @@ class BrandScoreFingerprintTool(ToolPlugin):
                 if sim > reference_image_score:
                     reference_image_score = sim
 
-        # Composite score
-        composite = (
-            0.25 * color_score +
-            0.25 * logo_score +
-            0.10 * font_score +
-            0.20 * text_score +
-            0.10 * layout_score_val +
-            0.10 * favicon_score
+        # Composite score (favicon term excluded + weights renormalized when the
+        # target favicon is unreachable — FAV-6).
+        composite = _composite_score(
+            color_score, logo_score, font_score, text_score, layout_score_val,
+            favicon_score, favicon_unreachable,
+            reference_image_score, bool(reference_image_hashes),
         )
-        if reference_image_hashes:
-            composite = (composite * 0.8) + (reference_image_score * 0.2)
 
         direct_identity_score = max(logo_score, text_score, favicon_score, reference_image_score)
         if _looks_like_parked_page(target_texts) and direct_identity_score < 70:

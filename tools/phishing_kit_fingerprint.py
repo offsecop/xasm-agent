@@ -40,6 +40,59 @@ from typing import Dict, Any, List, Optional
 #    that defeats path_exists.
 CATCH_ALL_BODY_TOLERANCE = 0.05
 
+# Self-bounding time budget (reliability fix 2026-07-07).
+#
+# The runtime injects the effective per-job watchdog as
+# `parameters['_job_timeout_seconds']` (agent_core_rest.py, #519) precisely so
+# long-running tools can finish BELOW the hard cap and return a structured
+# result. This tool previously ignored it and fanned out every target with an
+# unbounded `asyncio.gather`, so a batch with enough slow/unresponsive domains
+# blew the 300s watchdog, got HARD-KILLED, and every completed probe was
+# discarded (nothing ingested). Fallback when the runtime didn't inject a
+# budget (e.g. direct invocation in tests): assume the standard watchdog.
+DEFAULT_JOB_BUDGET_SECONDS = 300.0
+
+
+def _soft_deadline(budget: float) -> float:
+    """Soft deadline that leaves headroom below the hard watchdog for
+    assembling + returning the (possibly partial) output.
+
+    85% of the budget, but always at least 20s of headroom, floored at 30s so
+    a normal budget never degenerates into an uselessly tiny window — and
+    clamped to never exceed the budget itself when the budget is small.
+    """
+    return min(budget, max(30.0, min(budget * 0.85, budget - 20.0)))
+
+
+async def _gather_within_budget(tasks, soft_deadline):
+    """Await ``tasks`` up to ``soft_deadline`` seconds; return
+    ``(ordered_results, skipped_count)``.
+
+    Completed tasks are returned in INPUT order (``asyncio.wait`` yields
+    unordered sets). Unfinished tasks are cancelled and awaited so their probe
+    sessions don't leak, and counted as skipped — they are simply "not scanned
+    this pass" and picked up on the next cadence. A task that raised is dropped
+    (probe_domain catches internally; this is belt-and-braces so one unexpected
+    failure can't discard the rest of the batch). Pure w.r.t. I/O — the caller
+    owns the tasks; this only bounds and harvests them."""
+    if not tasks:
+        return [], 0
+    done, pending = await asyncio.wait(
+        tasks, timeout=soft_deadline, return_when=asyncio.ALL_COMPLETED
+    )
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    results = []
+    for task in tasks:  # input order
+        if task in done:
+            try:
+                results.append(task.result())
+            except Exception as e:  # noqa: BLE001 - belt-and-braces
+                print(f"[PhishingKit] Probe task raised unexpectedly: {e}")
+    return results, len(pending)
+
 
 def _mask_url_echoes(body: str, path: str) -> str:
     """Strip occurrences of the probed path (and its url-encoded forms) from
@@ -197,6 +250,17 @@ class PhishingKitFingerprintTool(ToolPlugin):
 
         max_targets = int(parameters.get('maxTargets', 50))
         timeout = int(parameters.get('timeout', 10))
+
+        # Self-bound to the per-job budget injected by the runtime (#519) so we
+        # finish cleanly below the hard watchdog with whatever completed,
+        # instead of getting hard-killed and losing ALL the work.
+        try:
+            budget = float(parameters.get('_job_timeout_seconds') or DEFAULT_JOB_BUDGET_SECONDS)
+        except (TypeError, ValueError):
+            budget = DEFAULT_JOB_BUDGET_SECONDS
+        if budget <= 0:
+            budget = DEFAULT_JOB_BUDGET_SECONDS
+        soft_deadline = _soft_deadline(budget)
 
         targets = targets[:max_targets]
         signatures = self._load_signatures()
@@ -479,9 +543,18 @@ class PhishingKitFingerprintTool(ToolPlugin):
 
             return domain_result
 
-        # Run all probes concurrently
-        tasks = [probe_domain(domain) for domain in targets]
-        results = await asyncio.gather(*tasks)
+        # Run all probes concurrently, bounded by the soft deadline. Completed
+        # probes are KEPT (in input order); unfinished ones are cancelled and
+        # simply count as "not scanned this pass" (picked up on the next cadence).
+        tasks = [asyncio.ensure_future(probe_domain(domain)) for domain in targets]
+        completed, skipped = await _gather_within_budget(tasks, soft_deadline)
+        results.extend(completed)
+        if skipped:
+            print(
+                f"[PhishingKit] Self-bounded at soft deadline {soft_deadline:.1f}s "
+                f"(job budget {budget:.1f}s): {len(completed)} targets completed, "
+                f"{skipped} skipped — returning partial results"
+            )
 
         duration = round(time.time() - start_time, 2)
 
@@ -505,7 +578,12 @@ class PhishingKitFingerprintTool(ToolPlugin):
                 'totalScanned': len(results),
                 'kitsDetected': kits_found,
                 'totalArtifacts': total_artifacts,
-                'domainsWithErrors': sum(1 for r in results if r['error'])
+                'domainsWithErrors': sum(1 for r in results if r['error']),
+                # Additive self-bounding telemetry (2026-07-07): how many targets
+                # completed vs were skipped at the soft deadline.
+                'scanned': len(results),
+                'skipped': skipped,
+                'selfBounded': skipped > 0,
             },
             'tool': 'phishing_kit',
             'scan_type': 'fingerprint'

@@ -23,6 +23,7 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timezone
 from plugin_loader import PluginLoader
+from lib import process_reaper
 
 def parse_env_tags(raw_tags):
     if not raw_tags:
@@ -39,6 +40,15 @@ class JobExecutionState:
     current_progress: dict | None = None
     flush_requested: bool = False
     flush_fail_count: int = 0
+    # #571 — subprocess HANDLES this job spawned as process-group leaders
+    # (start_new_session=True). The watchdog tears down every still-alive one in
+    # its finally (all exit paths) before freeing the slot; the periodic reaper
+    # reads their live pgids across active jobs to spare live children. Handles
+    # (not bare pids) so an already-reaped child — whose pid the kernel may have
+    # recycled — is skipped. `effective_timeout` lets the reaper raise its
+    # orphan-age threshold above the default for long-running jobs.
+    spawned_procs: list = field(default_factory=list)
+    effective_timeout: float = 0.0
 
 class Agent:
     def __init__(self, config):
@@ -55,6 +65,15 @@ class Agent:
         self.api_key = None
         self.client_id = os.environ.get('AGENT_CLIENT_ID') or config['server'].get('client_id')
         self.client_secret = os.environ.get('AGENT_CLIENT_SECRET') or config['server'].get('client_secret')
+        # Per-agent enrollment (dedicated bootstrap): the platform "Create Agent"
+        # flow issues a unique enrollmentId + enrollmentToken bound to ONE
+        # tenant-scoped Agent row, and ships them in the downloadable bootstrap
+        # script / config.yaml as AGENT_ENROLLMENT_ID / AGENT_ENROLLMENT_TOKEN
+        # (server.enrollment_id / server.enrollment_token). When present these
+        # take precedence over the tenant-installer creds above and we enroll via
+        # POST /agents/enroll, binding this process 1:1 to that pre-created row.
+        self.enrollment_id = os.environ.get('AGENT_ENROLLMENT_ID') or config['server'].get('enrollment_id')
+        self.enrollment_token = os.environ.get('AGENT_ENROLLMENT_TOKEN') or config['server'].get('enrollment_token')
         self.installation_uid = self._get_or_create_installation_uid()
         self.heartbeat_interval = config.get('heartbeat_interval', 30)
         self.poll_interval = config.get('poll_interval', 5)
@@ -104,6 +123,16 @@ class Agent:
         # their turn on the semaphore.
         self.max_concurrent_jobs = int(os.environ.get('AGENT_MAX_CONCURRENT_JOBS', '3'))
         self._job_semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
+
+        # Per-job execution watchdog: bound the tool run so a wedged tool can't
+        # pin a concurrency slot forever. The semaphore is held for the whole
+        # tool execution, so without this a single hung tool (e.g. a stuck
+        # headless-chromium screenshot) permanently consumes a slot until a
+        # manual restart. On timeout the job is reported FAILED (backend
+        # requeues) and the slot is released. Legitimate large multi-target
+        # jobs can run long, so the default is generous (300s) and tunable via
+        # AGENT_JOB_EXECUTION_TIMEOUT.
+        self.job_execution_timeout = float(os.environ.get('AGENT_JOB_EXECUTION_TIMEOUT', '300'))
 
         # BUG-088: Reusable aiohttp session (lazy-initialized)
         self._session = None
@@ -170,20 +199,71 @@ class Agent:
         return self._session
 
     async def ensure_runtime_key(self):
-        """Obtain this instance's per-instance API key via tenant enrollment.
+        """Obtain this instance's runtime API key.
 
-        Always calls /agents/enroll/tenant: the backend upserts the Agent row
-        keyed on installationUid (idempotent) and returns a freshly-issued,
-        installationUid-prefixed key for THIS instance's own row. A no-op once a
-        key is already held — re-enrollment only happens after an auth failure.
+        Prefers the per-agent enrollment path (a dedicated enrollmentId +
+        enrollmentToken bound to a single tenant-scoped Agent row, issued by the
+        platform "Create Agent" flow) when those creds are present; otherwise
+        falls back to the tenant-installer path (shared clientId/secret +
+        per-instance installationUid). A no-op once a key is already held —
+        re-enrollment only happens after an auth failure.
         """
         if self.api_key:
             return True
 
-        if not (self.client_id and self.client_secret):
-            print("[Enroll] No tenant installer credentials configured (AGENT_CLIENT_ID/AGENT_CLIENT_SECRET)")
+        if self.enrollment_id and self.enrollment_token:
+            return await self._enroll_per_agent()
+
+        if self.client_id and self.client_secret:
+            return await self._enroll_tenant_installer()
+
+        print(
+            "[Enroll] No enrollment credentials configured "
+            "(AGENT_ENROLLMENT_ID/AGENT_ENROLLMENT_TOKEN or AGENT_CLIENT_ID/AGENT_CLIENT_SECRET)"
+        )
+        return False
+
+    async def _enroll_per_agent(self):
+        """Exchange a dedicated enrollmentId + enrollmentToken for this agent's
+        runtime API key via POST /agents/enroll. The Agent row already exists
+        (created tenant-scoped by the platform "Create Agent" UI); enrollment is
+        idempotent and re-issues a fresh key on each call (so re-enrolling after
+        a 401 is safe). One enrollment == one process — never share a single
+        enrollment across two instances or they fight over the same row's key."""
+        try:
+            session = await self._get_session()
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with session.post(
+                f"{self.api_url}/agents/enroll",
+                json={
+                    'enrollmentId': self.enrollment_id,
+                    'enrollmentToken': self.enrollment_token,
+                },
+                timeout=timeout,
+            ) as response:
+                if 200 <= response.status < 300:
+                    payload = await response.json()
+                    self._set_runtime_key(payload.get('apiKey'))
+                    agent = payload.get('agent') or {}
+                    self.agent_name = agent.get('name', self.agent_name)
+                    self.agent_description = agent.get('description', self.agent_description)
+                    self.tags = agent.get('tags') or self.tags
+                    print(f"[Enroll] ✓ Enrolled agent {self.agent_name} via dedicated bootstrap")
+                    return True
+
+                body = await response.text()
+                print(f"[Enroll] Per-agent enrollment failed with status {response.status}: {body[:200]}")
+                return False
+        except Exception as e:
+            print(f"[Enroll] Per-agent enrollment error: {e}")
             return False
 
+    async def _enroll_tenant_installer(self):
+        """Obtain this instance's per-instance API key via tenant enrollment.
+
+        Calls /agents/enroll/tenant: the backend upserts the Agent row keyed on
+        installationUid (idempotent) and returns a freshly-issued,
+        installationUid-prefixed key for THIS instance's own row."""
         try:
             session = await self._get_session()
             timeout = aiohttp.ClientTimeout(total=15)
@@ -265,7 +345,36 @@ class Agent:
             except (NotImplementedError, RuntimeError, ValueError) as e:
                 print(f"[Agent] Could not install handler for {sig!r}: {e}")
 
-        await self.ensure_runtime_key()
+        # #524 — retry enrollment with backoff so a fresh deploy where the agent
+        # starts before the backend is reachable self-heals WITHOUT a manual
+        # `docker compose restart`. (The boot-time config-read retry in
+        # main_rest.load_config already guarantees api_url is the mounted value,
+        # not the localhost fallback.) Only loops when enrollment creds are
+        # present — a static-key / no-creds agent has nothing to retry — and is
+        # bounded so a genuinely unreachable backend still surfaces via the
+        # health endpoint rather than blocking startup forever.
+        if not await self.ensure_runtime_key():
+            has_enroll_creds = bool(
+                (self.enrollment_id and self.enrollment_token)
+                or (self.client_id and self.client_secret)
+            )
+            if has_enroll_creds:
+                max_enroll_attempts = int(os.environ.get('AGENT_ENROLL_RETRY_ATTEMPTS', '6'))
+                attempt = 0
+                while self.running and not self.api_key and attempt < max_enroll_attempts:
+                    attempt += 1
+                    backoff = min(30, 5 * attempt)
+                    print(
+                        f"[Enroll] Enrollment attempt {attempt}/{max_enroll_attempts} failed "
+                        f"against {self.api_url} — retrying in {backoff}s"
+                    )
+                    await asyncio.sleep(backoff)
+                    await self.ensure_runtime_key()
+                if not self.api_key:
+                    print(
+                        f"[Enroll] Still not enrolled after {max_enroll_attempts} attempt(s) "
+                        f"(server={self.api_url}); continuing so health/poll stays observable."
+                    )
 
         # Process any queued results from previous runs
         await self.process_queued_results()
@@ -288,15 +397,21 @@ class Agent:
         # Start periodic nuclei template update (every 24h)
         template_update_task = asyncio.create_task(self._periodic_template_update())
 
+        # #571 — periodic orphan reaper. The ONLY zombie collection in Cloud Run
+        # (no init / no init:true). Backstop for browser processes that reparent
+        # to PID 1 after a tool's own teardown fails.
+        reaper_task = asyncio.create_task(self._orphan_reaper_loop())
+
         # Start main loop
         await self.main_loop()
 
-        # Cancel template update task on shutdown
-        template_update_task.cancel()
-        try:
-            await template_update_task
-        except asyncio.CancelledError:
-            pass
+        # Cancel background tasks on shutdown
+        for bg_task in (template_update_task, reaper_task):
+            bg_task.cancel()
+            try:
+                await bg_task
+            except asyncio.CancelledError:
+                pass
 
     async def _start_http_server(self):
         """Start HTTP server for Pub/Sub push delivery and health checks.
@@ -491,6 +606,66 @@ class Agent:
         except Exception:
             pass
 
+    def _registered_pgids(self) -> set[int]:
+        """Union of every active job's still-alive spawned process groups (#571)."""
+        pgids: set[int] = set()
+        for state in list(self._active_jobs.values()):
+            pgids |= process_reaper.live_pgids(state.spawned_procs)
+        return pgids
+
+    def _reaper_min_etime(self) -> int:
+        """Orphan-age threshold: never reap a process younger than the longest
+        active job could legitimately run (its effective_timeout + slack). Guards
+        long jobs (timeoutSeconds > default) whose live children exceed 330s."""
+        longest = 0.0
+        for state in list(self._active_jobs.values()):
+            if state.effective_timeout > longest:
+                longest = state.effective_timeout
+        return int(max(process_reaper.DEFAULT_MIN_ETIME, longest + 60))
+
+    async def _teardown_spawned(self, state: 'JobExecutionState'):
+        """SIGTERM->grace->SIGKILL every still-alive process group the job spawned (#571).
+
+        Invoked under asyncio.shield from the job's finally BEFORE the _job_semaphore
+        slot is released, so the slot is never freed while the job's spawned OS
+        processes are still alive. Runs on EVERY exit path (success, tool error,
+        timeout, cancel); already-reaped children are skipped, so the success path is
+        a cheap no-op.
+        """
+        procs = list(state.spawned_procs)
+        if not procs:
+            return
+        try:
+            killed = await process_reaper.teardown_procs(procs)
+            if killed:
+                print(f"[ExecuteJob] Tore down {killed} spawned process group(s) "
+                      f"for job {state.job_id[:8]}")
+        except Exception as e:
+            print(f"[ExecuteJob] ⚠ Spawned-group teardown error for "
+                  f"{state.job_id[:8]}: {e}")
+        finally:
+            state.spawned_procs.clear()
+
+    async def _orphan_reaper_loop(self, interval: float = 45.0):
+        """#571 — periodic backstop that reaps orphaned browser processes.
+
+        Runs off the event loop so it never blocks job execution. Only kills
+        genuine orphans (ppid==1) older than the longest active job, whose group
+        is not registered to an active job.
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            try:
+                process_reaper.reap_orphans(
+                    self._registered_pgids(),
+                    min_etime=self._reaper_min_etime(),
+                )
+            except Exception as e:
+                print(f"[ProcessReaper] sweep error: {e}")
+
     async def _drain_in_flight_jobs(self):
         """R4: release every in-flight claimed job back to the queue on shutdown.
 
@@ -570,6 +745,56 @@ class Agent:
             return self._active_jobs.get(job_id)
         return self._current_execution_state.get()
 
+    def _read_int_file(self, path: str) -> int | None:
+        try:
+            raw = Path(path).read_text().strip()
+            if not raw or raw == 'max':
+                return None
+            return int(raw)
+        except Exception:
+            return None
+
+    def _read_process_rss_bytes(self) -> int | None:
+        try:
+            for line in Path('/proc/self/status').read_text().splitlines():
+                if line.startswith('VmRSS:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+        except Exception:
+            return None
+        return None
+
+    def _read_cgroup_memory_usage_bytes(self) -> int | None:
+        return (
+            self._read_int_file('/sys/fs/cgroup/memory.current')
+            or self._read_int_file('/sys/fs/cgroup/memory/memory.usage_in_bytes')
+        )
+
+    def _read_cgroup_memory_limit_bytes(self) -> int | None:
+        limit = (
+            self._read_int_file('/sys/fs/cgroup/memory.max')
+            or self._read_int_file('/sys/fs/cgroup/memory/memory.limit_in_bytes')
+        )
+        if limit is None or limit <= 0 or limit >= 2**60:
+            return None
+        return limit
+
+    def collect_memory_telemetry(self) -> dict:
+        usage = self._read_cgroup_memory_usage_bytes()
+        limit = self._read_cgroup_memory_limit_bytes()
+        percent = None
+        if usage is not None and limit:
+            percent = round((usage / limit) * 100, 2)
+        return {
+            'processRssBytes': self._read_process_rss_bytes(),
+            'containerUsageBytes': usage,
+            'containerLimitBytes': limit,
+            'containerUsagePercent': percent,
+            'source': 'cgroup',
+            'capturedAt': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        }
+
     async def send_heartbeat(self):
         """Send heartbeat via REST API"""
         try:
@@ -577,6 +802,7 @@ class Agent:
                 'activeJobIds': list(self._active_jobs.keys()),
                 'activeJobCount': len(self._active_jobs),
                 'runtimeStartedAt': self.runtime_started_at,
+                'memory': self.collect_memory_telemetry(),
             }
             session = await self._get_session()
             timeout = aiohttp.ClientTimeout(total=5)
@@ -740,8 +966,28 @@ class Agent:
         parameters = job['parameters']
         retry_count = job.get('retryCount', 0)  # BUG-032: Capture retryCount for version checking
 
+        # #521 — honor the workflow step's configured timeout when the backend
+        # provides it (job.timeoutSeconds), so the per-job watchdog matches the
+        # UI value instead of the fixed default cap that produced confusing
+        # "exceeded the per-job execution timeout of 300s" failures on steps the
+        # user had set higher. Ad-hoc/non-workflow jobs omit it → env default.
+        job_timeout = job.get('timeoutSeconds')
+        try:
+            effective_timeout = (
+                float(job_timeout)
+                if job_timeout is not None and float(job_timeout) > 0
+                else self.job_execution_timeout
+            )
+        except (TypeError, ValueError):
+            effective_timeout = self.job_execution_timeout
+
         # Inject job_id for output file naming
         parameters['_job_id'] = job_id
+        # #519 — expose the effective per-job watchdog so long-running tools
+        # (e.g. authentication:ai_browser_login) can self-bound just below it and
+        # return a structured failure instead of wedging until the hard cap fires
+        # and cancels every downstream step.
+        parameters['_job_timeout_seconds'] = effective_timeout
 
         print(f"\n{'='*60}")
         print(f"→ Executing job {job_id[:8]}")
@@ -754,8 +1000,13 @@ class Agent:
         # No need to claim again - proceed directly to execution
 
         state = JobExecutionState(job_id=job_id, retry_count=retry_count)
+        state.effective_timeout = effective_timeout
         self._active_jobs[job_id] = state
         state_token = self._current_execution_state.set(state)
+        # #571 — bind this job's spawned-subprocess registry so tools can register
+        # the process groups they launch (start_new_session=True) via
+        # process_reaper.register_group(proc), and the watchdog can tear them down.
+        reaper_token = process_reaper.begin_job(state.spawned_procs)
 
         # WP6 — publish the active job id so money/secrets-path calls send
         # X-Job-Id. A BOOTSTRAP agent's backend re-derives the billing tenant
@@ -776,8 +1027,18 @@ class Agent:
             # Execute the plugin (plugin can now call report_progress)
             print(f"[ExecuteJob] Starting tool execution: {tool_name}")
             try:
-                result = await self.plugin_loader.execute_tool(tool_name, parameters)
+                result = await asyncio.wait_for(
+                    self.plugin_loader.execute_tool(tool_name, parameters),
+                    timeout=effective_timeout,
+                )
                 print(f"[ExecuteJob] Tool execution completed: {tool_name}")
+            except asyncio.TimeoutError:
+                # The tool wedged past the per-job watchdog. Re-raise so the
+                # outer handler reports the job FAILED (backend requeues) and the
+                # `async with self._job_semaphore` block exits, freeing the slot.
+                print(f"[ExecuteJob] ✗ Tool execution timed out after "
+                      f"{effective_timeout:.0f}s: {tool_name}")
+                raise
             except Exception as tool_error:
                 print(f"[ExecuteJob] ✗ Tool execution failed: {tool_error}")
                 import traceback
@@ -836,16 +1097,45 @@ class Agent:
                     self.queue_result(job_id, result, success=tool_success, retry_count=retry_count)
                 )
             raise
-        except Exception as e:
-            print(f"✗ Job {job_id[:8]} failed: {e}")
+        except asyncio.TimeoutError:
+            # Per-job watchdog fired (#491). Report FAILED like any other tool
+            # failure so the backend requeues, then let the `async with` block
+            # exit to release the semaphore slot. TimeoutError stringifies to ''
+            # so build an explicit message.
+            error_msg = (f"Tool '{tool_name}' exceeded the per-job execution timeout "
+                         f"of {effective_timeout:.0f}s")
+            print(f"✗ Job {job_id[:8]} failed: {error_msg}")
             await self.flush_output_buffer(force=True, state=state)
+            # #521 — report a STRUCTURED failure object, never a bare string. A
+            # bare string is spread field-by-field by the backend into
+            # character-indexed output ({"0":"T","1":"o",...}); a dict stores as a
+            # clean { success: false, error, rawOutput }.
+            error_payload = {'success': False, 'error': error_msg, 'rawOutput': ''}
+            await asyncio.shield(
+                self.queue_result(job_id, error_payload, success=False, retry_count=retry_count)
+            )
+            await self.complete_job(job_id, error_payload, success=False, retry_count=retry_count)
+            # Don't cleanup on failure - keep queue file for retry
+        except Exception as e:
+            error_msg = str(e)
+            print(f"✗ Job {job_id[:8]} failed: {error_msg}")
+            await self.flush_output_buffer(force=True, state=state)
+            # #521 — structured failure object (see TimeoutError handler above).
+            error_payload = {'success': False, 'error': error_msg, 'rawOutput': ''}
             # BUG-032: Include retryCount in failure case too
             await asyncio.shield(
-                self.queue_result(job_id, str(e), success=False, retry_count=retry_count)
+                self.queue_result(job_id, error_payload, success=False, retry_count=retry_count)
             )
-            await self.complete_job(job_id, str(e), success=False, retry_count=retry_count)
+            await self.complete_job(job_id, error_payload, success=False, retry_count=retry_count)
             # Don't cleanup on failure - keep queue file for retry
         finally:
+            # #571 — tear down every still-alive process group the job spawned,
+            # on EVERY exit path (success, tool error, timeout, cancel), under
+            # asyncio.shield so it completes even while the task is being
+            # cancelled — and BEFORE the semaphore slot is released (this finally
+            # runs inside the caller's `async with self._job_semaphore`). The
+            # success path is a no-op: finished children are skipped.
+            await asyncio.shield(self._teardown_spawned(state))
             heartbeat_task.cancel()
             try:
                 await heartbeat_task
@@ -853,6 +1143,7 @@ class Agent:
                 pass
             self._active_jobs.pop(job_id, None)
             self._current_execution_state.reset(state_token)
+            process_reaper.end_job(reaper_token)
             try:
                 from lib.integration_credentials import set_current_job_id
                 set_current_job_id(None)
@@ -887,6 +1178,7 @@ class Agent:
                         'activeJobIds': list(self._active_jobs.keys()),
                         'activeJobCount': len(self._active_jobs),
                         'runtimeStartedAt': self.runtime_started_at,
+                        'memory': self.collect_memory_telemetry(),
                     }
                     if state.current_progress:
                         payload['progress'] = state.current_progress
@@ -945,17 +1237,15 @@ class Agent:
             ) as response:
                 status = response.status
                 self._last_completion_status = status
-                headers = dict(response.headers)
                 body = await response.text()
                 print(f"[DEBUG] Response status: {status}")
-                print(f"[DEBUG] Response headers: {headers}")
-                print(f"[DEBUG] Response body: {body[:300]}")
+                print(f"[DEBUG] Response body length: {len(body)} bytes")
 
                 if 200 <= status < 300:
                     print(f"✓ Job {job_id[:8]} completion sent - Status: {status}")
                     return True
                 else:
-                    print(f"✗ Job completion failed: {status} - {body[:200]}")
+                    print(f"✗ Job completion failed: {status} - response body omitted ({len(body)} bytes)")
                     return False
         except Exception as e:
             self._last_completion_status = None

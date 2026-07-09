@@ -75,6 +75,7 @@ class BrowserMapAppTool(ToolPlugin):
 
         try:
             from playwright.async_api import async_playwright
+            from lib.process_reaper import close_browser_safe
         except Exception as exc:
             return await self._http_fallback(target, parameters, f"Playwright unavailable: {exc}")
 
@@ -155,7 +156,7 @@ class BrowserMapAppTool(ToolPlugin):
                             continue
 
                 await context.close()
-                await browser.close()
+                await close_browser_safe(browser)
 
                 same_origin_links = [u for u in snapshot.get("links", []) if same_origin(target, u)]
                 map_result = {
@@ -185,11 +186,7 @@ class BrowserMapAppTool(ToolPlugin):
                     agent.report_progress("Browser mapping completed", target, 1, 1)
                 return map_result
         except Exception as exc:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+            await close_browser_safe(browser)
             return await self._http_fallback(target, parameters, f"browser mapping failed: {exc}")
 
     async def _http_fallback(self, target: str, parameters: Dict[str, Any], reason: str) -> Dict[str, Any]:

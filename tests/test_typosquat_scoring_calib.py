@@ -176,3 +176,110 @@ class TestCalibFreshGateExempt:
             "(a fresh weaponizing clone must not be capped to MEDIUM)."
         )
         assert score >= 50, f"fresh structure-only score {score} below HIGH cut (50)."
+
+
+# Email-posture shape: an exact-name TLD-swap of a fictitious brand with MX
+# present and a brand-in-title positive signal (so the Phase-3 gate does NOT cap
+# to 49 and the email deltas stay observable below the 75 cap). Aged WHOIS so the
+# fresh/interaction bonuses don't move with date.
+_EMAIL_BASE = dict(
+    original="lumenfield.com",
+    candidate="lumenfield.net",
+    is_registered=True,
+    has_web=False,
+    has_ssl=False,
+    brand_keywords=["Lumenfield"],
+    page_title="Lumenfield Login",   # positive brand-intent → gate exempts (cap 75)
+    mx_records=["mail.lumenfield.net"],
+    whois_created="2015-01-01",
+    vt_detections=None,
+    final_url=None,
+    phishtank_match=False,
+    openphish_match=False,
+)
+
+
+def _score(**email):
+    call = dict(_EMAIL_BASE)
+    call["email_security"] = email or None
+    return SCORER._score_result(**call)[0]
+
+
+class TestEmailPostureScoring:
+    """Layer-A coverage for _score_result's SPF/DMARC posture branch (#277).
+
+    The drp-replay harness injects a pre-baked `email_security` blob, so these
+    branches never executed in the gate. These lock the CURRENT behavior; #277
+    EXTENDS them with the ?all/~all branch and the blind-resolver UNSWEPT fix.
+    Deltas are asserted (not absolute scores) so unrelated weight tweaks don't
+    spuriously break the lock.
+    """
+
+    _AUTH_OK = dict(spf={"has_spf": True}, dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+
+    def test_full_auth_adds_no_posture_risk(self):
+        # Fully-authed posture (SPF present + DMARC enforced) adds 0 — identical
+        # to email_security=None (block skipped). Both are the zero-penalty floor.
+        assert _score(**self._AUTH_OK) == _score()
+
+    def test_no_spf_adds_5(self):
+        no_spf = dict(spf={"has_spf": False}, dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        assert _score(**no_spf) - _score(**self._AUTH_OK) == 5
+
+    def test_spf_plus_all_adds_8(self):
+        plus_all = dict(spf={"has_spf": True, "spf_policy": "+all"},
+                        dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        assert _score(**plus_all) - _score(**self._AUTH_OK) == 8
+
+    def test_no_dmarc_adds_3(self):
+        no_dmarc = dict(spf={"has_spf": True}, dmarc={"has_dmarc": False})
+        assert _score(**no_dmarc) - _score(**self._AUTH_OK) == 3
+
+    def test_dmarc_p_none_adds_2(self):
+        p_none = dict(spf={"has_spf": True}, dmarc={"has_dmarc": True, "dmarc_policy": "none"})
+        assert _score(**p_none) - _score(**self._AUTH_OK) == 2
+
+    def test_posture_only_scored_when_mx_present(self):
+        # No MX → the whole email block is skipped regardless of posture.
+        call = dict(_EMAIL_BASE)
+        call["mx_records"] = []
+        call["email_security"] = dict(spf={"has_spf": False}, dmarc={"has_dmarc": False})
+        no_mx = SCORER._score_result(**call)[0]
+        call["email_security"] = self._AUTH_OK
+        no_mx_authed = SCORER._score_result(**call)[0]
+        assert no_mx == no_mx_authed
+
+    # ---- POST-2: neutral/soft-fail SPF qualifiers --------------------------
+    def test_spf_question_all_adds_5(self):
+        q_all = dict(spf={"has_spf": True, "spf_policy": "?all"},
+                     dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        assert _score(**q_all) - _score(**self._AUTH_OK) == 5
+
+    def test_spf_soft_fail_tilde_all_adds_5(self):
+        t_all = dict(spf={"has_spf": True, "spf_policy": "~all"},
+                     dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        assert _score(**t_all) - _score(**self._AUTH_OK) == 5
+
+    def test_spf_hard_fail_minus_all_adds_0(self):
+        m_all = dict(spf={"has_spf": True, "spf_policy": "-all"},
+                     dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        assert _score(**m_all) - _score(**self._AUTH_OK) == 0
+
+    # ---- POST-1: unswept (blind resolver) must not inflate risk -------------
+    def test_unswept_spf_does_not_add_missing_posture(self):
+        # has_spf False BUT spf_unswept True → blind resolver, no +5 inflation.
+        unswept = dict(spf={"has_spf": False, "spf_unswept": True},
+                       dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        assert _score(**unswept) - _score(**self._AUTH_OK) == 0
+
+    def test_unswept_dmarc_does_not_add_missing_posture(self):
+        unswept = dict(spf={"has_spf": True},
+                       dmarc={"has_dmarc": False, "dmarc_unswept": True})
+        assert _score(**unswept) - _score(**self._AUTH_OK) == 0
+
+    def test_confirmed_absent_still_scores_vs_unswept(self):
+        # A parsed-empty (confirmed-absent) SPF still adds +5, an unswept one 0.
+        absent = dict(spf={"has_spf": False}, dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        unswept = dict(spf={"has_spf": False, "spf_unswept": True},
+                       dmarc={"has_dmarc": True, "dmarc_policy": "reject"})
+        assert _score(**absent) - _score(**unswept) == 5

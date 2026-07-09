@@ -1,0 +1,31 @@
+# xASM curated sensitive-path discovery list (#318).
+# Always merged into the dirsearch:* default wordlist so VCS metadata and
+# app-secret files are probed deterministically, independent of upstream dicc.txt.
+# Plain relative paths only (dirsearch appends them to the target origin).
+# Detection of what these paths expose stays with the dedicated tools:
+#   .git/*   -> git:source_disclosure_scanner / nuclei http/exposures
+#   .env/*   -> nuclei http/exposures + lfi:file_exposure_probe (via traversal)
+.env
+.env.local
+.env.production
+.env.dev
+.env.bak
+.env.example
+.env.save
+.git/HEAD
+.git/config
+.git/index
+.git/logs/HEAD
+.svn/entries
+.svn/wc.db
+.hg/store
+.bzr/branch/branch.conf
+config/database.php
+config/config.php
+config/app.php
+app/etc/env.php
+wp-config.php
+.aws/credentials
+.npmrc
+.dockercfg
+docker-compose.override.yml

@@ -11,8 +11,10 @@ ToolPlugin keyed by `mode`:
 Output keys are stable and consumed by Phase 5c ingestion
 (`processScrapecreatorsTiktokSearchOutput`).
 
-Auth + quota:
-  - `checkout_provider('SCRAPECREATORS', requested_units=1)`. SC bills per call.
+Auth + quota (#1143 — bounded pagination):
+  - ONE lease per PAGE via `lib/sc_paginated_search.paginated_sc_search`
+    (checkout → call → reconcile); SC bills per call including errors; cache
+    hits bill 0; a quota cap mid-run parks the sweep with partial results.
   - Stub mode disabled at production dispatch (no fabricated data).
   - Cache namespace `ScrapeCreators:tiktok`, TTL 3600s per Phase 5a vendor reqs.
 """
@@ -28,16 +30,13 @@ _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent_dir not in sys.path:
     sys.path.append(_parent_dir)
 
-import aiohttp
-
 from plugin_interface import ToolPlugin
-from lib.integration_credentials import (
-    checkout_provider,
-    reconcile_call,
-    upstream_request,
-    QuotaExceededError,
-    IntegrationCredentialsError,
+from lib.search_recency import (
+    parse_search_knobs,
+    tiktok_date_posted,
+    tiktok_sort_by,
 )
+from lib.sc_paginated_search import paginated_sc_search
 from lib.wrapper_helpers import first as _first
 
 logger = logging.getLogger(__name__)
@@ -202,6 +201,25 @@ class ScrapeCreatorsTiktokSearchTool(ToolPlugin):
                     'type': 'string',
                     'description': 'Opaque pagination cursor from a prior keyword response.',
                 },
+                # #1143 — semantic recency/pagination knobs (mapped to the
+                # vendor's real params: sort_by / date_posted / cursor).
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Max items to accumulate across pages (default 50, cap 200).',
+                },
+                'sort': {
+                    'type': 'string',
+                    'enum': ['new', 'relevance', 'top'],
+                    'description': "Result ordering (mapped to vendor `sort_by`: new→date-posted, top→most-liked).",
+                },
+                'window_days': {
+                    'type': 'integer',
+                    'description': 'Recency window in days — bucketed to the vendor `date_posted` enum.',
+                },
+                'max_pages': {
+                    'type': 'integer',
+                    'description': 'Bounded pagination depth for keyword search (default 1, hard cap 5). Each page is one billed vendor call.',
+                },
                 'brand_monitor_id': {'type': 'string'},
                 'tenantId': {'type': 'string'},
             },
@@ -218,6 +236,16 @@ class ScrapeCreatorsTiktokSearchTool(ToolPlugin):
             'output_type': ['posts', 'users'],
             'chainable_after': [],
             'chainable_before': [],
+            # --- canonical taxonomy (#559) ---
+            'taxonomy_domain': ['brand-drp', 'osint'],
+            'lifecycle_phase': 'discovery',
+            'purpose_count': 'multi',
+            'primary_purpose': 'brand/DRP TikTok discovery via keyword, hashtag and user search',
+            'secondary_purposes': [
+                {'mode': 'keyword', 'purpose': 'keyword video search'},
+                {'mode': 'hashtag', 'purpose': 'hashtag video search'},
+                {'mode': 'users', 'purpose': 'user-account search'},
+            ],
         }
 
     def _empty_output(self, mode: str) -> Dict[str, Any]:
@@ -264,167 +292,88 @@ class ScrapeCreatorsTiktokSearchTool(ToolPlugin):
 
         empty_out = self._empty_output(mode)
 
-        try:
-            lease = await checkout_provider(PROVIDER_KEY, requested_units=1)
-        except QuotaExceededError as qe:
+        # #1143 — semantic recency/pagination knobs (defensive; garbage
+        # degrades to the pre-#1143 single-page vendor-default behavior).
+        knobs = parse_search_knobs(parameters)
+        limit = knobs['limit']
+        # Pagination is verified for the KEYWORD endpoint only; hashtag/users
+        # stay single-call.
+        max_pages = knobs['max_pages'] if mode == _MODE_KEYWORD else 1
+
+        if mode == _MODE_KEYWORD:
+            path = '/v1/tiktok/search/keyword'
+            base_params: Dict[str, Any] = {'query': query}
+            sort_by = tiktok_sort_by(knobs['sort'])
+            if sort_by:
+                base_params['sort_by'] = sort_by
+            date_posted = tiktok_date_posted(knobs['window_days'])
+            if date_posted:
+                base_params['date_posted'] = date_posted
+            cursor_param: Optional[str] = 'cursor'
+            item_kind = 'post'
+        elif mode == _MODE_HASHTAG:
+            path = '/v1/tiktok/search/hashtag'
+            base_params = {'hashtag': hashtag}
+            cursor_param = None
+            item_kind = 'post'
+        else:  # users
+            path = '/v1/tiktok/search/users'
+            base_params = {'query': query}
+            cursor_param = None
+            item_kind = 'user'
+
+        def _items(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+            raw_items = _extract_list(data)
+            if item_kind == 'user':
+                built = [_build_user(it) for it in raw_items]
+            else:
+                built = [_build_post(it) for it in raw_items]
+            return [it for it in built
+                    if it and (it.get('post_id') or it.get('handle'))]
+
+        def _cursor(data: Dict[str, Any]) -> Optional[str]:
+            nc = data.get('cursor') or data.get('next_cursor') or data.get('max_cursor')
+            return str(nc) if nc else None
+
+        res = await paginated_sc_search(
+            tool_name=self.name,
+            path=path,
+            base_params=base_params,
+            cache_namespace='tiktok',
+            extract_items=_items,
+            cursor_param=cursor_param,
+            initial_cursor=cursor if cursor_param else None,
+            extract_cursor=_cursor,
+            max_pages=max_pages,
+            limit=limit,
+            logger=logger,
+        )
+
+        if res['kind'] == 'quota_exceeded':
             return {
                 'success': False, 'error': 'quota_exceeded',
-                'retryAfter': qe.retry_after, 'providerKey': PROVIDER_KEY,
+                'retryAfter': res.get('retry_after'), 'providerKey': PROVIDER_KEY,
                 'output': empty_out,
             }
-        except IntegrationCredentialsError as ce:
-            logger.error("[%s] credentials error: %s", self.name, ce)
+        if res['kind'] == 'no_credentials':
             return {
                 'success': False, 'error': 'no_credentials',
-                'message': str(ce), 'providerKey': PROVIDER_KEY,
+                'message': res.get('message'), 'providerKey': PROVIDER_KEY,
                 'output': empty_out,
             }
-
-        api_key = lease.get('apiKey')
-        lease_token = lease.get('leaseToken')
-        if not api_key or not lease_token:
+        if res['kind'] == 'stub_mode_blocked':
+            return {
+                'success': False, 'error': 'stub_mode_blocked',
+                'message': res.get('message'), 'providerKey': PROVIDER_KEY,
+                'output': empty_out,
+            }
+        if res['kind'] == 'checkout_returned_empty':
             return {
                 'success': False, 'error': 'checkout_returned_empty',
                 'output': empty_out,
             }
 
-        base_url = lease.get('baseUrl') or BASE_URL
-        timeout_seconds = lease.get('timeoutSeconds') or DEFAULT_TIMEOUT
-        is_stub = api_key == STUB_API_KEY
-        tenant_id = lease.get('tenantId')
-        stale_grace = lease.get('staleGraceSeconds')
-        ns_ttls = lease.get('cacheNamespaceTtls') or {}
-        base_ttl = lease.get('cacheTtlSeconds')
-
-        success = False
-        error_code: Optional[str] = None
-        items: List[Dict[str, Any]] = []
-        next_cursor: Optional[str] = None
-        has_more = False
-        sc_credits_remaining: Optional[int] = None
-        call_meta: Optional[Dict[str, Any]] = None
-        item_kind = 'post'
-
-        try:
-            if is_stub:
-                logger.error(
-                    "[%s] stub API key detected; refusing to synthesize fake "
-                    "TikTok search results.", self.name,
-                )
-                await reconcile_call(
-                    PROVIDER_KEY, lease_token,
-                    units=0, success=False,
-                    error_code='stub_mode_blocked',
-                    cache_hit=None, cache_stale=None,
-                )
-                return {
-                    'success': False, 'error': 'stub_mode_blocked',
-                    'message': (
-                        'SCRAPECREATORS integration is using a stub API key. '
-                        'Synthetic fixtures are disabled. Provision a real key.'
-                    ),
-                    'providerKey': PROVIDER_KEY,
-                    'output': empty_out,
-                }
-
-            if mode == _MODE_KEYWORD:
-                path = '/v1/tiktok/search/keyword'
-                params: Dict[str, Any] = {'query': query}
-                if cursor:
-                    params['cursor'] = cursor
-                item_kind = 'post'
-            elif mode == _MODE_HASHTAG:
-                path = '/v1/tiktok/search/hashtag'
-                params = {'hashtag': hashtag}
-                item_kind = 'post'
-            else:  # users
-                path = '/v1/tiktok/search/users'
-                params = {'query': query}
-                item_kind = 'user'
-
-            ns_ttl = ns_ttls.get('tiktok', base_ttl)
-            headers = {'x-api-key': api_key}
-            timeout = aiohttp.ClientTimeout(total=timeout_seconds + 5)
-
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                resp, call_meta = await upstream_request(
-                    session, 'GET', f"{base_url}{path}",
-                    headers=headers, params=params,
-                    provider_label='scrapecreators',
-                    timeout_seconds=timeout_seconds,
-                    cache_namespace='tiktok',
-                    cache_ttl_seconds=ns_ttl,
-                    stale_grace_seconds=stale_grace,
-                    tenant_id=tenant_id,
-                )
-                status = getattr(resp, 'status', 0)
-                if status == 429:
-                    raise QuotaExceededError(
-                        provider_key=PROVIDER_KEY, retry_after=5,
-                        period_resets_at=None, cap=None, current_usage=None,
-                    )
-                if status >= 400:
-                    body = await resp.text() if hasattr(resp, 'text') else ''
-                    error_code = f'http_{status}'
-                    logger.warning(
-                        "[%s] upstream %s returned %d: %s",
-                        self.name, path, status, body[:200],
-                    )
-                    raise RuntimeError(f"upstream_{status}")
-                data = await resp.json()
-
-            raw_items = _extract_list(data)
-            if item_kind == 'user':
-                items = [_build_user(it) for it in raw_items]
-            else:
-                items = [_build_post(it) for it in raw_items]
-            items = [it for it in items if it and (it.get('post_id') or it.get('handle'))]
-            sc_credits_remaining = _credits_remaining(data)
-            nc_raw = data.get('cursor') or data.get('next_cursor') or data.get('max_cursor')
-            next_cursor = str(nc_raw) if nc_raw else None
-            has_more = bool(data.get('has_more')) or bool(next_cursor)
-
-            success = True
-        except QuotaExceededError as qe:
-            error_code = 'quota_exceeded'
-            await reconcile_call(
-                PROVIDER_KEY, lease_token,
-                units=0, success=False, error_code=error_code,
-                cache_hit=None, cache_stale=None,
-            )
-            return {
-                'success': False, 'error': error_code,
-                'retryAfter': qe.retry_after, 'providerKey': PROVIDER_KEY,
-                'output': empty_out,
-            }
-        except Exception as e:
-            error_code = type(e).__name__
-            logger.warning(
-                "[%s] upstream call failed (mode=%s): %s",
-                self.name, mode, e,
-            )
-
-        cache_hit = bool(call_meta and call_meta.get('cache_hit'))
-        cache_stale = bool(call_meta and call_meta.get('cache_stale'))
-        # ScrapeCreators bills per call INCLUDING error responses, so bill a
-        # unit whenever the call actually fired (call_meta set, not a cache hit)
-        # — not only on success. Under-billing failed-but-fired calls drifts the
-        # per-tenant quota ledger below real provider usage (provider-ban risk).
-        call_fired = call_meta is not None and not cache_hit
-        eff_units = 0 if cache_hit else (1 if call_fired else 0)
-        try:
-            await reconcile_call(
-                PROVIDER_KEY, lease_token,
-                units=eff_units, success=success,
-                error_code=error_code,
-                cache_hit=cache_hit, cache_stale=cache_stale,
-            )
-        except Exception as rec_err:
-            logger.warning(
-                "[%s] reconcile failed: %s", self.name, rec_err,
-            )
-
-        fetched_at = (call_meta or {}).get('fetched_at')
+        items = res['items']
         out = {
             'items': items,
             'item_kind': item_kind,
@@ -432,18 +381,14 @@ class ScrapeCreatorsTiktokSearchTool(ToolPlugin):
             'mode': mode,
             'query': query,
             'hashtag': hashtag,
-            'next_cursor': next_cursor,
-            'has_more': has_more,
-            'sc_credits_remaining': sc_credits_remaining,
-            '_meta': {
-                'cacheHit': cache_hit,
-                'cacheStale': cache_stale,
-                **({'fetchedAt': fetched_at} if fetched_at else {}),
-            },
+            'next_cursor': res['next_cursor'],
+            'has_more': res['has_more'],
+            'sc_credits_remaining': res['credits_remaining'],
+            '_meta': res['meta'],
         }
-        if not success:
+        if res['kind'] != 'ok':
             return {
-                'success': False, 'error': error_code or 'unknown',
+                'success': False, 'error': res.get('error_code') or 'unknown',
                 'providerKey': PROVIDER_KEY, 'output': out,
             }
         return {'success': True, 'output': out}

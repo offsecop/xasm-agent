@@ -43,6 +43,7 @@ from lib.wrapper_helpers import (
     similarity as _similarity,
     build_account as _build_account,
     classify_account as _classify_account,
+    filter_handles_for_platform,
     B_LEGIT,
     B_BRAND_ADJ,
     B_IMPERSONATOR,
@@ -108,7 +109,7 @@ async def _safe_get(
     finally:
         await resp.release()
 
-def _gen_vip_permutations(handle: str) -> List[str]:
+def _gen_vip_permutations(handle: str, platform: str = 'instagram') -> List[str]:
     """VIP/personal handle permutations — tighter set (no brand-jargon
     suffixes like `_inc` or `_support`).
     """
@@ -120,6 +121,11 @@ def _gen_vip_permutations(handle: str) -> List[str]:
         h.replace('o', '0'), h.replace('i', '1'),
         f"the.{h}", f"{h}.official",
     ]
+    # G6 (#455) — remap + per-platform filter for a non-Instagram target so an
+    # IG `jane.doe` impostor is searched as `jane_doe` on X, `janedoe` on
+    # LinkedIn, etc., and platform-invalid candidates are dropped.
+    if platform and platform.lower() != 'instagram':
+        raw = filter_handles_for_platform(raw, platform)
     seen: Set[str] = set()
     out: List[str] = []
     for p in raw:

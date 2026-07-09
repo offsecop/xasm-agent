@@ -3311,15 +3311,28 @@ class VulnChainProbeTool(ToolPlugin):
         status = int(result.get("status") or 0)
         if status >= 500:
             return None
+        # #916 — a protected / auth-required response is a GATE, not leaked reset
+        # material. A Vercel "Protected deployment" 401 returns
+        # {"error":{"code":"401"},"protection":{"password_enabled":true,...}} —
+        # the generic `code` key below would otherwise match the HTTP status "401"
+        # and raise a bogus HIGH. Real reset-material exposure is a 2xx.
+        if status in (401, 403, 407):
+            return None
         parsed = self._json_body(result)
         sensitive_keys = {"code", "debug_info", "otp", "pin", "reset_pin", "reset_token", "token"}
         if parsed is not None:
             for key, value in self._walk_json_scalars(parsed):
                 key_parts = [part.lower() for part in re.split(r"[.\[\]]+", key) if part]
                 lower_key = key_parts[-1] if key_parts else ""
-                if lower_key in {"code", "otp", "pin", "reset_pin", "reset_token", "token"} and str(value).strip():
+                sval = str(value).strip()
+                if lower_key in {"code", "otp", "pin", "reset_pin", "reset_token", "token"} and sval:
+                    # #916 — `code` is noisy: an HTTP status ("401") or a short error
+                    # code is not reset material. Require a plausible OTP/token — not a
+                    # bare 3-digit HTTP status, and at least 4 chars (real OTPs/tokens).
+                    if lower_key == "code" and (re.fullmatch(r"[1-5]\d\d", sval) or len(sval) < 4):
+                        continue
                     return "secret_exposure"
-                if "debug_info" in key_parts and str(value).strip():
+                if "debug_info" in key_parts and sval:
                     return "debug_exposure"
         text = (result.get("text") or "").lower()
         if re.search(r"(?:reset[_ -]?pin|reset[_ -]?token|verification[_ -]?code|one[- ]time)", text) and re.search(r"\b\d{4,8}\b|token|pin|code", text):

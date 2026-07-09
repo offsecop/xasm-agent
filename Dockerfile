@@ -123,6 +123,20 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -rf /usr/local/go /root/go && \
     chmod +x /usr/local/bin/waybackurls
 
+# Install TruffleHog for GitHub leak LIVE-verification (#452 / DRP G4a). Used by
+# darkweb_monitor._trufflehog_verdict to shallow-clone a flagged repo and scan
+# full git history with --only-verified. The code degrades gracefully if absent
+# (verdict 'unavailable', recall-preserving), so this only ENABLES live verify.
+RUN ARCH=$(dpkg --print-architecture) && \
+    TH_VERSION="3.82.6" && \
+    if [ "$ARCH" = "arm64" ]; then TH_ARCH="arm64"; else TH_ARCH="amd64"; fi && \
+    wget https://github.com/trufflesecurity/trufflehog/releases/download/v${TH_VERSION}/trufflehog_${TH_VERSION}_linux_${TH_ARCH}.tar.gz \
+    && tar xzf trufflehog_${TH_VERSION}_linux_${TH_ARCH}.tar.gz trufflehog \
+    && mv trufflehog /usr/local/bin/ \
+    && rm -f trufflehog_${TH_VERSION}_linux_${TH_ARCH}.tar.gz \
+    && chmod +x /usr/local/bin/trufflehog \
+    && trufflehog --version
+
 # Set working directory
 WORKDIR /app
 

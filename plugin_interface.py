@@ -68,6 +68,20 @@ class ToolPlugin(ABC):
           output_type: list[str] - ips, hostnames, domains, urls, urls_with_params, ports, services, findings, screenshots, session
           chainable_after: list[str] - recommended predecessor tool prefixes
           chainable_before: list[str] - recommended successor tool prefixes
+
+        Canonical taxonomy (#559) — ADDITIVE; the legacy keys above are kept for
+        back-compat. These are OPTIONAL: tools that omit them get the fields
+        backfilled from the legacy triple by tools/_taxonomy.py:derive_canonical().
+        Declare them explicitly for multi-purpose tools so each mode is enumerated.
+          taxonomy_domain: list[str] - canonical domains (web, infra, api, osint,
+                           dns, brand-drp, code, meta); first = primary
+          lifecycle_phase: str - canonical phase (recon-passive, recon-active,
+                           discovery, assessment, scan, exploit-test, post-exploit,
+                           enrichment, auth, reporting, orchestration)
+          purpose_count: str - "single" | "multi"
+          primary_purpose: str - one-line human capability summary
+          secondary_purposes: list[{mode, purpose}] - multi-purpose tools only
+          alias_of: str - (optional) another tool name this one aliases
         """
         return {}
 

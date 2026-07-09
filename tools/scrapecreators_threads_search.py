@@ -9,8 +9,10 @@ Restores Threads keyword discovery that was lost when Phase 5b deleted
 Output keys are stable and consumed by Phase 5c ingestion
 (`processScrapecreatorsThreadsSearchOutput`).
 
-Auth + quota:
-  - `checkout_provider('SCRAPECREATORS', requested_units=1)`. SC bills per call.
+Auth + quota (#1143 — shared single-call fetch):
+  - ONE lease per call via `lib/sc_paginated_search.paginated_sc_search`
+    (the Threads search endpoint does NOT paginate — it returns at most 10
+    results per call; `window_days` maps to its start_date/end_date range).
   - Stub mode disabled at production dispatch.
   - Cache namespace `ScrapeCreators:threads`, TTL 3600s per Phase 5a vendor reqs.
 """
@@ -26,17 +28,10 @@ _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent_dir not in sys.path:
     sys.path.append(_parent_dir)
 
-import aiohttp
-
 from plugin_interface import ToolPlugin
-from lib.integration_credentials import (
-    checkout_provider,
-    reconcile_call,
-    upstream_request,
-    QuotaExceededError,
-    IntegrationCredentialsError,
-)
 from lib.wrapper_helpers import first as _first
+from lib.search_recency import parse_search_knobs, threads_date_range
+from lib.sc_paginated_search import paginated_sc_search
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +162,17 @@ class ScrapeCreatorsThreadsSearchTool(ToolPlugin):
                     'type': 'string',
                     'description': 'Free-text query. Required for both modes.',
                 },
+                # #1143 — recency knob. The Threads search endpoint supports
+                # ONLY start_date/end_date (computed agent-side from
+                # window_days) — no sort, no pagination (≤10 results/call).
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Max items to return (vendor caps a call at ~10 anyway).',
+                },
+                'window_days': {
+                    'type': 'integer',
+                    'description': 'Recency window in days — mapped to the vendor start_date/end_date range.',
+                },
                 'brand_monitor_id': {'type': 'string'},
                 'tenantId': {'type': 'string'},
             },
@@ -183,6 +189,15 @@ class ScrapeCreatorsThreadsSearchTool(ToolPlugin):
             'output_type': ['posts', 'users'],
             'chainable_after': [],
             'chainable_before': [],
+            # --- canonical taxonomy (#559) ---
+            'taxonomy_domain': ['brand-drp', 'osint'],
+            'lifecycle_phase': 'discovery',
+            'purpose_count': 'multi',
+            'primary_purpose': 'brand/DRP Threads discovery via post and user search',
+            'secondary_purposes': [
+                {'mode': 'posts', 'purpose': 'keyword search across Threads posts'},
+                {'mode': 'users', 'purpose': 'keyword search across Threads user accounts'},
+            ],
         }
 
     def _empty_output(self, mode: str) -> Dict[str, Any]:
@@ -212,171 +227,82 @@ class ScrapeCreatorsThreadsSearchTool(ToolPlugin):
             }
 
         empty_out = self._empty_output(mode)
+        item_kind = 'post' if mode == _MODE_POSTS else 'user'
 
-        try:
-            lease = await checkout_provider(PROVIDER_KEY, requested_units=1)
-        except QuotaExceededError as qe:
+        # #1143 — recency knob (defensive; garbage degrades to no date filter).
+        knobs = parse_search_knobs(parameters)
+        limit = knobs['limit']
+
+        if mode == _MODE_POSTS:
+            path = '/v1/threads/search'
+            base_params: Dict[str, Any] = {'query': query}
+            # The ONLY time-ranged SC keyword endpoint: absolute YYYY-MM-DD
+            # dates computed agent-side (step templates can't carry them).
+            start_date, end_date = threads_date_range(knobs['window_days'])
+            if start_date and end_date:
+                base_params['start_date'] = start_date
+                base_params['end_date'] = end_date
+        else:
+            path = '/v1/threads/search/users'
+            base_params = {'query': query}
+
+        def _items(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+            raw_items = _extract_list(data)
+            if item_kind == 'user':
+                built = [_build_user(it) for it in raw_items]
+                return [it for it in built if it and it.get('handle')]
+            built = [_build_post(it) for it in raw_items]
+            return [it for it in built if it and (it.get('post_id') or it.get('text'))]
+
+        res = await paginated_sc_search(
+            tool_name=self.name,
+            path=path,
+            base_params=base_params,
+            cache_namespace='threads',
+            extract_items=_items,
+            cursor_param=None,  # the endpoint does not paginate
+            max_pages=1,
+            limit=limit,
+            logger=logger,
+        )
+
+        if res['kind'] == 'quota_exceeded':
             return {
                 'success': False, 'error': 'quota_exceeded',
-                'retryAfter': qe.retry_after, 'providerKey': PROVIDER_KEY,
+                'retryAfter': res.get('retry_after'), 'providerKey': PROVIDER_KEY,
                 'output': empty_out,
             }
-        except IntegrationCredentialsError as ce:
-            logger.error("[%s] credentials error: %s", self.name, ce)
+        if res['kind'] == 'no_credentials':
             return {
                 'success': False, 'error': 'no_credentials',
-                'message': str(ce), 'providerKey': PROVIDER_KEY,
+                'message': res.get('message'), 'providerKey': PROVIDER_KEY,
                 'output': empty_out,
             }
-
-        api_key = lease.get('apiKey')
-        lease_token = lease.get('leaseToken')
-        if not api_key or not lease_token:
+        if res['kind'] == 'stub_mode_blocked':
+            return {
+                'success': False, 'error': 'stub_mode_blocked',
+                'message': res.get('message'), 'providerKey': PROVIDER_KEY,
+                'output': empty_out,
+            }
+        if res['kind'] == 'checkout_returned_empty':
             return {
                 'success': False, 'error': 'checkout_returned_empty',
                 'output': empty_out,
             }
 
-        base_url = lease.get('baseUrl') or BASE_URL
-        timeout_seconds = lease.get('timeoutSeconds') or DEFAULT_TIMEOUT
-        is_stub = api_key == STUB_API_KEY
-        tenant_id = lease.get('tenantId')
-        stale_grace = lease.get('staleGraceSeconds')
-        ns_ttls = lease.get('cacheNamespaceTtls') or {}
-        base_ttl = lease.get('cacheTtlSeconds')
-
-        success = False
-        error_code: Optional[str] = None
-        items: List[Dict[str, Any]] = []
-        sc_credits_remaining: Optional[int] = None
-        call_meta: Optional[Dict[str, Any]] = None
-        item_kind = 'post' if mode == _MODE_POSTS else 'user'
-
-        try:
-            if is_stub:
-                logger.error(
-                    "[%s] stub API key detected; refusing to synthesize fake "
-                    "Threads search results.", self.name,
-                )
-                await reconcile_call(
-                    PROVIDER_KEY, lease_token,
-                    units=0, success=False,
-                    error_code='stub_mode_blocked',
-                    cache_hit=None, cache_stale=None,
-                )
-                return {
-                    'success': False, 'error': 'stub_mode_blocked',
-                    'message': (
-                        'SCRAPECREATORS integration is using a stub API key. '
-                        'Synthetic fixtures are disabled. Provision a real key.'
-                    ),
-                    'providerKey': PROVIDER_KEY, 'output': empty_out,
-                }
-
-            if mode == _MODE_POSTS:
-                path = '/v1/threads/search'
-                params: Dict[str, Any] = {'query': query}
-            else:
-                path = '/v1/threads/search/users'
-                params = {'query': query}
-
-            ns_ttl = ns_ttls.get('threads', base_ttl)
-            headers = {'x-api-key': api_key}
-            timeout = aiohttp.ClientTimeout(total=timeout_seconds + 5)
-
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                resp, call_meta = await upstream_request(
-                    session, 'GET', f"{base_url}{path}",
-                    headers=headers, params=params,
-                    provider_label='scrapecreators',
-                    timeout_seconds=timeout_seconds,
-                    cache_namespace='threads',
-                    cache_ttl_seconds=ns_ttl,
-                    stale_grace_seconds=stale_grace,
-                    tenant_id=tenant_id,
-                )
-                status = getattr(resp, 'status', 0)
-                if status == 429:
-                    raise QuotaExceededError(
-                        provider_key=PROVIDER_KEY, retry_after=5,
-                        period_resets_at=None, cap=None, current_usage=None,
-                    )
-                if status >= 400:
-                    body = await resp.text() if hasattr(resp, 'text') else ''
-                    error_code = f'http_{status}'
-                    logger.warning(
-                        "[%s] upstream %s returned %d: %s",
-                        self.name, path, status, body[:200],
-                    )
-                    raise RuntimeError(f"upstream_{status}")
-                data = await resp.json()
-
-            raw_items = _extract_list(data)
-            if item_kind == 'user':
-                items = [_build_user(it) for it in raw_items]
-                items = [it for it in items if it and it.get('handle')]
-            else:
-                items = [_build_post(it) for it in raw_items]
-                items = [it for it in items if it and (it.get('post_id') or it.get('text'))]
-            sc_credits_remaining = _credits_remaining(data)
-
-            success = True
-        except QuotaExceededError as qe:
-            error_code = 'quota_exceeded'
-            await reconcile_call(
-                PROVIDER_KEY, lease_token,
-                units=0, success=False, error_code=error_code,
-                cache_hit=None, cache_stale=None,
-            )
-            return {
-                'success': False, 'error': error_code,
-                'retryAfter': qe.retry_after, 'providerKey': PROVIDER_KEY,
-                'output': empty_out,
-            }
-        except Exception as e:
-            error_code = type(e).__name__
-            logger.warning(
-                "[%s] upstream call failed (mode=%s): %s",
-                self.name, mode, e,
-            )
-
-        cache_hit = bool(call_meta and call_meta.get('cache_hit'))
-        cache_stale = bool(call_meta and call_meta.get('cache_stale'))
-        # ScrapeCreators bills per call INCLUDING error responses, so bill a
-        # unit whenever the call actually fired (call_meta set, not a cache hit)
-        # — not only on success. Under-billing failed-but-fired calls drifts the
-        # per-tenant quota ledger below real provider usage (provider-ban risk).
-        call_fired = call_meta is not None and not cache_hit
-        eff_units = 0 if cache_hit else (1 if call_fired else 0)
-        try:
-            await reconcile_call(
-                PROVIDER_KEY, lease_token,
-                units=eff_units, success=success,
-                error_code=error_code,
-                cache_hit=cache_hit, cache_stale=cache_stale,
-            )
-        except Exception as rec_err:
-            logger.warning(
-                "[%s] reconcile failed: %s", self.name, rec_err,
-            )
-
-        fetched_at = (call_meta or {}).get('fetched_at')
+        items = res['items']
         out = {
             'items': items,
             'item_kind': item_kind,
             'total': len(items),
             'mode': mode,
             'query': query,
-            'sc_credits_remaining': sc_credits_remaining,
-            '_meta': {
-                'cacheHit': cache_hit,
-                'cacheStale': cache_stale,
-                **({'fetchedAt': fetched_at} if fetched_at else {}),
-            },
+            'sc_credits_remaining': res['credits_remaining'],
+            '_meta': res['meta'],
         }
-        if not success:
+        if res['kind'] != 'ok':
             return {
-                'success': False, 'error': error_code or 'unknown',
+                'success': False, 'error': res.get('error_code') or 'unknown',
                 'providerKey': PROVIDER_KEY, 'output': out,
             }
         return {'success': True, 'output': out}

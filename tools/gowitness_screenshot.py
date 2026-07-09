@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from tools.screenshot_utils import find_chrome_path, compute_sha256
 
 from lib.wrapper_helpers import resolve_targets as _resolve_targets
+from lib.process_reaper import terminate_group, register_group
 
 
 class GoWitnessScreenshotTool(ToolPlugin):
@@ -107,6 +108,9 @@ class GoWitnessScreenshotTool(ToolPlugin):
         screenshots_dir = output_dir
         os.makedirs(screenshots_dir, exist_ok=True)
 
+        # Orphaned Chromium from a previous timed-out capture is now collected by
+        # the agent's periodic reaper (#571), not a per-job-start sweep here.
+
         if agent:
             agent.report_progress(
                 current_operation=f"Starting screenshots for {len(targets_list)} target(s)",
@@ -140,11 +144,28 @@ class GoWitnessScreenshotTool(ToolPlugin):
                 if chrome_path:
                     gowitness_cmd.extend(['--chrome-path', chrome_path])
 
+                # Snapshot pre-existing files so the timeout branch only deletes
+                # the partial output this run created.
+                try:
+                    before = {
+                        f for f in os.listdir(target_dir)
+                        if f.endswith(('.png', '.jpeg', '.jpg', '.webp'))
+                    }
+                except OSError:
+                    before = set()
+
+                # start_new_session=True makes gowitness a process-group leader
+                # so its Chromium children share its pgid and can be killed as a
+                # group on timeout (otherwise Chromium orphans to PID 1).
                 process = await asyncio.create_subprocess_exec(
                     *gowitness_cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
                 )
+                # #571 — register so the job watchdog tears the group down too if
+                # the OUTER per-job timeout fires during this communicate().
+                register_group(process)
 
                 try:
                     stdout, stderr = await asyncio.wait_for(
@@ -152,8 +173,8 @@ class GoWitnessScreenshotTool(ToolPlugin):
                         timeout=60  # 1 minute max per target
                     )
                 except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+                    await terminate_group(process)
+                    self._remove_partial_outputs(target_dir, before)
                     if agent:
                         agent.append_output(f"[GoWitness] Timeout on {target}")
                     screenshots.append({'target': target, 'success': False, 'error': 'timeout'})
@@ -263,6 +284,25 @@ class GoWitnessScreenshotTool(ToolPlugin):
         if parsed.hostname:
             return f"http://{target}"
         return target
+
+    def _remove_partial_outputs(self, directory: str, before: set) -> None:
+        """Delete screenshot files this run created (anything not in `before`).
+
+        Called only on the timeout branch — best-effort and guarded; never
+        touches the pre-existing files captured in `before`.
+        """
+        try:
+            current = {
+                f for f in os.listdir(directory)
+                if f.endswith(('.png', '.jpeg', '.jpg', '.webp'))
+            }
+        except OSError:
+            return
+        for fname in current - before:
+            try:
+                os.remove(os.path.join(directory, fname))
+            except OSError:
+                pass
 
     def _find_recent_screenshot(self, directory: str) -> str:
         """Find the most recently created screenshot file."""

@@ -16,6 +16,11 @@ DICC_WORDLIST_URL = "https://raw.githubusercontent.com/maurosoria/dirsearch/mast
 DICC_WORDLIST_PATH = "/tmp/dirsearch_dicc.txt"
 COMBINED_WORDLIST_DIR = "/tmp/xasm_dirsearch_wordlists"
 
+# #318: curated sensitive-path list baked into the agent image. Always merged into
+# the default wordlist so .git/ and .env (and friends) are probed deterministically,
+# regardless of whether upstream dicc.txt downloaded or contains them.
+SENSITIVE_PATHS_WORDLIST = os.path.join(os.path.dirname(__file__), "wordlists", "sensitive-paths.txt")
+
 # The agent is mounted at /app in Docker, so /app/wordlists/fuzz.txt is the
 # durable runtime location for customer-provided additions.
 COMMON_WORDLIST_CANDIDATES = [
@@ -118,6 +123,10 @@ def discover_extra_wordlists(parameters=None):
     auto_paths = []
     if _is_enabled(parameters.get("includeFuzzWordlist"), default=True):
         auto_paths.extend(FUZZ_WORDLIST_CANDIDATES)
+    # #318: always fold in the baked sensitive-path list (.git/, .env, …) so every
+    # dirsearch:* scan covers VCS metadata + app-secret files by default.
+    if _is_enabled(parameters.get("includeSensitivePaths"), default=True):
+        auto_paths.append(SENSITIVE_PATHS_WORDLIST)
 
     return _existing_wordlists(explicit_paths + env_paths + auto_paths)
 
@@ -157,7 +166,7 @@ def combine_wordlists(wordlists, tool_label="Dirsearch"):
             with open(wordlist, "r", encoding="utf-8", errors="ignore") as handle:
                 for raw_line in handle:
                     entry = raw_line.strip()
-                    if not entry or entry in seen:
+                    if not entry or entry.startswith("#") or entry in seen:
                         continue
                     seen.add(entry)
                     output.write(f"{entry}\n")

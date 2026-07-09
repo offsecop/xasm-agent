@@ -19,6 +19,7 @@ from typing import Dict, Any, Optional
 from plugin_interface import ToolPlugin
 
 from lib.wrapper_helpers import resolve_targets as _resolve_targets
+from lib.process_reaper import close_browser_safe, register_group
 
 
 # CWE mapping for Origami finding categories
@@ -106,7 +107,9 @@ class OrigamiMCPClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                start_new_session=True,  # #571 — group leader for watchdog/reaper teardown
             )
+            register_group(self.process)
 
             # Drain stderr in background to prevent pipe buffer overflow
             self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -511,7 +514,7 @@ class OrigamiBrowserDastTool(ToolPlugin):
             raw_lines.append(f"ERROR: {str(exc)}")
         finally:
             if context:
-                await context.close()
+                await close_browser_safe(context)
             if pw:
                 try:
                     await pw.__aexit__(None, None, None)

@@ -26,9 +26,33 @@ from tools.brand_score_fingerprint import (
     _as_list,
     _collect_reference_image_hashes,
     _color_frequency_vector,
+    _composite_score,
     _fingerprint_has_usable_signals,
     _parse_color_hex,
 )
+
+
+class TestFaviconUnreachableRenorm:
+    """FAV-6 — an UNREACHABLE (bot-walled) favicon excludes the favicon term and
+    renormalizes, so it never scores LOWER than the favicon-absent case."""
+
+    BASE = dict(color=90.0, logo=90.0, font=90.0, text=90.0, layout=90.0)
+
+    def test_unreachable_not_lower_than_absent(self):
+        absent = _composite_score(**self.BASE, favicon=0.0, favicon_unreachable=False)
+        unreachable = _composite_score(**self.BASE, favicon=0.0, favicon_unreachable=True)
+        assert unreachable >= absent
+        assert unreachable > absent  # renorm strictly raises it (no 0 dilution)
+
+    def test_unreachable_renorms_to_remaining_terms(self):
+        # all sub-scores 90, favicon excluded → composite == 90 (renorm), not 81.
+        c = _composite_score(**self.BASE, favicon=0.0, favicon_unreachable=True)
+        assert abs(c - 90.0) < 0.01
+
+    def test_reachable_favicon_contributes_to_score(self):
+        no_match = _composite_score(**self.BASE, favicon=0.0, favicon_unreachable=False)
+        full_match = _composite_score(**self.BASE, favicon=100.0, favicon_unreachable=False)
+        assert full_match > no_match
 
 
 # The exact poisoned legacy shape served to every score job (F1).

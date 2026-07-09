@@ -9,10 +9,24 @@ import asyncio
 import hashlib
 import json
 import os
+import re
+import socket
 import time
+from urllib.parse import urlparse
 from plugin_interface import ToolPlugin
 from typing import Dict, Any, List, Optional
 from tools.screenshot_utils import find_chrome_path, compute_sha256
+from lib.process_reaper import terminate_group, register_group
+
+# #574 — fail-fast capture tuning. Tightened from gowitness's generous
+# --timeout 30 / --delay 5 so a live-but-slow host is bounded to ~10s and a
+# 9-target chunk stays well inside the 300s per-job watchdog. Env-tunable so
+# cloud can adjust without a code change.
+GOWITNESS_TIMEOUT = os.environ.get('DRP_GOWITNESS_TIMEOUT', '10')
+GOWITNESS_DELAY = os.environ.get('DRP_GOWITNESS_DELAY', '1')
+# Per-precheck network budget: DNS resolve + TCP connect each get this long, so a
+# dead host short-circuits (zero Chromium) in a few seconds at most.
+PRECHECK_TIMEOUT = float(os.environ.get('DRP_SCREENSHOT_PRECHECK_TIMEOUT', '2.0'))
 
 
 UA_PROFILES = {
@@ -22,6 +36,26 @@ UA_PROFILES = {
 }
 
 CLOAKING_DISTANCE_THRESHOLD = 0.55
+
+# #880 — parking / for-sale landing-page fingerprint. A GoDaddy/Sedo/etc. for-sale
+# lander legitimately serves DIFFERENT content to bot vs human captures (per-request
+# ad/upsell rotation), so bot-vs-human pHashes diverge past the cloaking threshold —
+# but that is NOT consciousness-of-guilt cloaking. When a capture's final host (post
+# redirect) is a known parking service OR its title matches the for-sale pattern,
+# the cloaking signal is suppressed and the domain is fingerprinted `parked` so the
+# scorer's lifecycle_dampen arms for the sibling alerts.
+PARKING_HOSTS = frozenset({
+    'forsale.godaddy.com',
+    'sedoparking.com',
+    'afternic.com',
+    'dan.com',
+    'parkingcrew.net',
+    'bodis.com',
+})
+PARKING_TITLE_RE = re.compile(
+    r'(domain (is )?for sale|parked free|this domain may be for sale|buy this domain)',
+    re.IGNORECASE,
+)
 
 
 class BrandMonitorScreenshotTool(ToolPlugin):
@@ -93,6 +127,9 @@ class BrandMonitorScreenshotTool(ToolPlugin):
 
     async def execute(self, parameters: Dict[str, Any]) -> Any:
         agent = parameters.get('_agent')
+
+        # Orphaned Chromium from a previous timed-out capture is now collected by
+        # the agent's periodic reaper (#571), not a per-job-start sweep here.
 
         targets = parameters.get('targets', [])
         if isinstance(targets, str):
@@ -197,6 +234,9 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                 for result in ua_results:
                     result['cloakingDetected'] = cloaking['detected']
                     result['cloakingScore'] = cloaking['score']
+                    # #880 — parking/for-sale fingerprint; ingestion stamps
+                    # metadata.parkedFingerprint so computeLifecycleStage → 'parked'.
+                    result['parkedFingerprint'] = cloaking.get('parked', False)
                 screenshots.extend(ua_results)
             else:
                 result = await self._capture_screenshot(
@@ -260,6 +300,83 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             return 'https://' + url[len('http://'):]
         return None
 
+    @staticmethod
+    async def _host_resolves(host: Optional[str]) -> str:
+        """#574/#884 — TRI-STATE DNS liveness pre-check (shared by both schemes).
+
+        Returns one of:
+          'resolves'  — getaddrinfo succeeded (host has an address).
+          'nxdomain'  — an AUTHORITATIVE "no such name" (``EAI_NONAME`` /
+                        ``EAI_NODATA``): the host is dead on EVERY scheme, so the
+                        caller short-circuits the browser launch (the #574
+                        fast-fail, preserved).
+          'ambiguous' — a TRANSIENT resolver failure (``EAI_AGAIN`` "temporary
+                        failure", a timeout, or any other ``OSError``): the
+                        RESOLVER, not the host, is the problem. #884 — collapsing
+                        this into "dead" converted 29 live, registered lookalikes
+                        into confident "host does not resolve (DNS)" verdicts
+                        during a resolver outage, dropped them from evidence, and
+                        drove the capture breaker toward permanent give-up. The
+                        caller must NOT stamp the dead verdict — it proceeds to the
+                        browser attempt instead.
+
+        Uses the stdlib resolver off the event loop; no new dependency.
+        """
+        if not host:
+            return 'nxdomain'
+        # Authoritative-negative errnos. EAI_NODATA is absent on some platforms,
+        # so probe defensively (keeps the unit test portable across OSes).
+        nxdomain_errnos = set()
+        for name in ('EAI_NONAME', 'EAI_NODATA'):
+            val = getattr(socket, name, None)
+            if val is not None:
+                nxdomain_errnos.add(val)
+        try:
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP),
+                timeout=PRECHECK_TIMEOUT,
+            )
+            return 'resolves'
+        except socket.gaierror as e:
+            # Only an authoritative "no such name" is a definitive dead host; a
+            # transient EAI_AGAIN (and any other gaierror) is resolver-side.
+            if e.errno in nxdomain_errnos:
+                return 'nxdomain'
+            return 'ambiguous'
+        except (asyncio.TimeoutError, OSError):
+            return 'ambiguous'
+
+    @staticmethod
+    async def _port_definitely_closed(candidate_url: str) -> bool:
+        """#574 — TCP pre-check for ONE scheme candidate's port.
+
+        Returns True ONLY when the port actively REFUSES the connection (RST) — a
+        definitive "nothing is listening" that is safe to skip without a browser
+        launch. A timeout or any other error is AMBIGUOUS (a slow host, a filtered
+        firewall, or a CDN/WAF that stalls a raw connect) and returns False so
+        gowitness still gets its chance — we must never drop a live-but-slow
+        capture, which is exactly the population typosquats hide behind.
+        """
+        parsed = urlparse(candidate_url)
+        host = parsed.hostname
+        if not host:
+            return False  # can't tell — let gowitness try
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        try:
+            fut = asyncio.open_connection(host, port)
+            _, writer = await asyncio.wait_for(fut, timeout=PRECHECK_TIMEOUT)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return False  # open
+        except ConnectionRefusedError:
+            return True  # definitively dead — safe to skip the browser
+        except (asyncio.TimeoutError, OSError):
+            return False  # ambiguous — proceed to gowitness (never drop a live host)
+
     async def _run_gowitness_once(
         self,
         url: str,
@@ -289,23 +406,32 @@ class BrandMonitorScreenshotTool(ToolPlugin):
         gowitness_cmd = [
             'gowitness', 'scan', 'single', '--url', url,
             '--screenshot-path', target_dir,
-            '--delay', '5', '--timeout', '30',
+            '--delay', GOWITNESS_DELAY, '--timeout', GOWITNESS_TIMEOUT,
         ]
         if user_agent_string:
             gowitness_cmd.extend(['--chrome-user-agent', user_agent_string])
         if chrome_path:
             gowitness_cmd.extend(['--chrome-path', chrome_path])
 
+        # start_new_session=True makes gowitness a process-group leader so its
+        # Chromium children share its pgid and can be killed as a group on
+        # timeout (otherwise the Chromium tree orphans to PID 1 and burns CPU).
         process = await asyncio.create_subprocess_exec(
             *gowitness_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
+        # #571 — register the group so the job watchdog also tears it down if the
+        # OUTER per-job timeout fires while this inner communicate() is waiting.
+        register_group(process)
         try:
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=60)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            await terminate_group(process)
+            # Best-effort: remove any partial screenshot gowitness left behind
+            # for this run so it can't be mistaken for a real capture later.
+            self._remove_partial_outputs(target_dir, before)
             return {'ok': False, 'error': 'timeout', 'stdout_text': ''}
 
         # Wait briefly for the file to appear
@@ -368,6 +494,31 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             url_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
             ua_suffix = f"_{user_agent_key}" if user_agent_key else ""
 
+            # #574 — DNS liveness pre-check: a NXDOMAIN host is dead on every
+            # scheme, so short-circuit here with ZERO Chromium launches (the
+            # majority of registered lookalikes never resolve). Returns the SAME
+            # per-target shape as the all-candidates-failed path below so ingestion
+            # sees a normal failed capture, not a truncated dict.
+            host = urlparse(url).hostname
+            # #884 — only an AUTHORITATIVE NXDOMAIN short-circuits with the dead
+            # verdict. An 'ambiguous' (transient resolver / EAI_AGAIN) result
+            # proceeds to the browser attempt so a resolver outage does not stamp
+            # a live registered lookalike as "host does not resolve (DNS)".
+            if await self._host_resolves(host) == 'nxdomain':
+                return {
+                    'target': url,
+                    'success': False,
+                    'error': 'host does not resolve (DNS)',
+                    'filePath': None,
+                    'fileHash': None,
+                    'perceptualHash': None,
+                    'fileSize': 0,
+                    'httpStatusCode': None,
+                    'pageTitle': None,
+                    'hasContent': False,
+                    'userAgent': user_agent_key or 'desktop',
+                }
+
             # Candidate URLs: the primary, then the opposite scheme as fallback.
             candidates = [url]
             alt_url = self._alternate_protocol_url(url)
@@ -377,6 +528,20 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             capture: Optional[Dict[str, Any]] = None  # best result so far
             last_error = 'capture failed'
             for candidate_url in candidates:
+                # #574 — TCP-connect pre-check: skip the browser launch only for a
+                # port that DEFINITIVELY refuses (RST). An ambiguous timeout falls
+                # through to gowitness so a slow/CDN-fronted-but-live host is never
+                # dropped; the alternate-protocol retry is likewise only skipped on
+                # a definitive refusal.
+                if await self._port_definitely_closed(candidate_url):
+                    last_error = 'connection refused'
+                    if candidate_url != url:
+                        print(
+                            f"[BrandMonitor:Screenshot] Alternate scheme "
+                            f"({candidate_url}) port refused for {url}; skipping"
+                        )
+                    continue
+
                 attempt = await self._run_gowitness_once(
                     candidate_url, target_dir, url_hash, ua_suffix,
                     chrome_path, user_agent_string,
@@ -453,9 +618,11 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             stdout_text = capture['stdout_text']
             http_status = self._extract_http_status(stdout_text)
             page_title = self._extract_page_title(stdout_text)
+            final_url = self._extract_final_url(stdout_text)  # #880
 
             result_entry = {
                 'target': url,
+                'finalUrl': final_url,  # #880 — post-redirect URL for parking fingerprint
                 'filePath': relative_path,
                 'fileHash': f'sha256:{file_hash}',
                 'perceptualHash': f'phash:{perceptual_hash}' if perceptual_hash else None,
@@ -583,6 +750,27 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             pass
         return obj
 
+    def _remove_partial_outputs(self, directory: str, before: set) -> None:
+        """Delete screenshot files this run created (anything not in `before`).
+
+        Called only on the timeout branch — `before` is the pre-run snapshot, so
+        any image file now present that wasn't before is a partial capture from
+        the killed gowitness run. Best-effort and guarded; never touches the
+        pre-existing dedup files in `before`.
+        """
+        try:
+            current = {
+                f for f in os.listdir(directory)
+                if f.endswith(('.png', '.jpeg', '.jpg', '.webp'))
+            }
+        except OSError:
+            return
+        for fname in current - before:
+            try:
+                os.remove(os.path.join(directory, fname))
+            except OSError:
+                pass
+
     def _find_recent_screenshot(self, directory: str, exclude: Optional[set] = None) -> Optional[str]:
         """Find the most recently created screenshot file.
 
@@ -652,11 +840,36 @@ class BrandMonitorScreenshotTool(ToolPlugin):
 
     def _extract_page_title(self, output: str) -> Optional[str]:
         """Try to extract page title from gowitness output."""
-        import re
         match = re.search(r'title[=:]\s*"?([^"\n]+)"?', output, re.IGNORECASE)
         if match:
             return match.group(1).strip()[:255]
         return None
+
+    def _extract_final_url(self, output: str) -> Optional[str]:
+        """#880 — the FINAL navigated URL (post-redirect) from gowitness output,
+        so a redirect to a parking-service host can be fingerprinted. Prefers an
+        explicit final_url / location field; otherwise the LAST http(s) URL in the
+        output (gowitness logs the resolved URL after following redirects)."""
+        m = re.search(r'(?:final[_-]?url|location)[=:]\s*"?(https?://\S+?)"?[\s,\n]', output + '\n', re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        urls = re.findall(r'https?://[^\s"\'<>]+', output)
+        return urls[-1].strip() if urls else None
+
+    def _is_parked_capture(self, results: List[Dict[str, Any]]) -> bool:
+        """#880 — does ANY capture fingerprint a parking / for-sale landing page?
+        A parking host (post-redirect final URL) or a for-sale title. Author
+        identity of the page, never the pHash divergence (which parking rotation
+        trips legitimately)."""
+        for r in results:
+            title = str(r.get('pageTitle') or '')
+            if title and PARKING_TITLE_RE.search(title):
+                return True
+            final_url = str(r.get('finalUrl') or '')
+            host = (urlparse(final_url).hostname or '').lower()
+            if host in PARKING_HOSTS:
+                return True
+        return False
 
     def _detect_cloaking(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Compare screenshots across UA profiles to detect cloaking.
@@ -705,7 +918,16 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                 max_distance = 1.0
 
         detected = max_distance >= CLOAKING_DISTANCE_THRESHOLD
-        return {'detected': detected, 'score': round(max_distance, 4)}
+        # #880 — parking / for-sale gate. A for-sale lander rotates ads per request
+        # so bot-vs-human pHashes diverge past the threshold, but that is NOT
+        # cloaking. Suppress the cloaking signal for a parking-fingerprinted domain
+        # and mark it `parked` so the scorer's lifecycle_dampen arms for the
+        # sibling alerts. Recall preserved: a genuine bot=phish / human=decoy
+        # divergence on a NON-parking host still reports cloaking.
+        parked = self._is_parked_capture(results)
+        if parked:
+            detected = False
+        return {'detected': detected, 'score': round(max_distance, 4), 'parked': parked}
 
 
 def get_tool():

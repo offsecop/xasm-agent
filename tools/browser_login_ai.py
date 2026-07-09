@@ -6,6 +6,7 @@ Supports multi-step MFA flows with hybrid screenshot+HTML analysis and multi-str
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import yaml
@@ -15,6 +16,17 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 from plugin_interface import ToolPlugin
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    """Best-effort float coercion with a default (used for #519 time budgets)."""
+    try:
+        if value is None:
+            return default
+        coerced = float(value)
+        return coerced if coerced > 0 else default
+    except (TypeError, ValueError):
+        return default
 
 
 # Phase 8 hardening (BUG-556): cookie filter for AI Login output.
@@ -53,8 +65,31 @@ REGISTER_PATH_HINTS = (
 )
 
 
-def registration_fallback_allowed(login_instructions: Optional[str]) -> bool:
-    """Return true when the auth profile explicitly authorizes account creation."""
+def coerce_optional_bool(value: Any) -> Optional[bool]:
+    """Coerce common JSON/string boolean values while preserving "not provided"."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
+
+def registration_fallback_allowed(
+    login_instructions: Optional[str],
+    auto_register: Optional[bool] = None,
+) -> bool:
+    """Return true only when account creation is explicitly authorized."""
+    if auto_register is not None:
+        return bool(auto_register)
+
+    # Backward-compatible fallback for direct unit tests or legacy callers that
+    # have not yet been wired to aiConfig.autoRegister. Workflow execution sends
+    # auto_register=False by default, so free-text instructions no longer enable
+    # registration in the product path.
     text = (login_instructions or "").lower()
     return any(
         marker in text
@@ -157,6 +192,141 @@ SUBMIT_FALLBACK_STRATEGIES = [
     {"type": "css", "selector": "[role='button']:has-text('Continue')"},
     {"type": "css", "selector": "[role='button']:has-text('Next')"},
 ]
+
+REGISTRATION_FIELD_SELECTORS: Dict[str, List[str]] = {
+    "email": [
+        "input[type='email']",
+        "input[name='email']",
+        "input[id='email']",
+        "input[name*='email' i]",
+        "input[id*='email' i]",
+        "input[autocomplete='email']",
+    ],
+    "confirmpassword": [
+        "input[name='confirmPassword']",
+        "input[name='confirm_password']",
+        "input[name='password_confirmation']",
+        "input[id='confirmPassword']",
+        "input[id*='confirm' i][type='password']",
+        "input[autocomplete='new-password']",
+    ],
+    "displayname": [
+        "input[name='displayName']",
+        "input[name='display_name']",
+        "input[id='displayName']",
+        "input[name*='display' i]",
+        "input[id*='display' i]",
+    ],
+    "fullname": [
+        "input[name='fullName']",
+        "input[name='full_name']",
+        "input[name='name']",
+        "input[id='fullName']",
+        "input[id*='name' i]",
+        "input[autocomplete='name']",
+    ],
+}
+
+
+def normalize_registration_fields(
+    raw_fields: Any,
+    *,
+    username: str,
+    password: str,
+) -> Dict[str, str]:
+    """Normalize optional registration-only field values without logging secrets."""
+    fields: Dict[str, str] = {}
+    if isinstance(raw_fields, dict):
+        for key, value in raw_fields.items():
+            if isinstance(key, str) and isinstance(value, str) and value.strip():
+                fields[key.strip()] = value.strip()
+
+    if username and "@" in username and not any(key.lower() == "email" for key in fields):
+        fields["email"] = username
+
+    if password and not any(
+        re.sub(r"[^a-z0-9]", "", key.lower()) == "confirmpassword"
+        for key in fields
+    ):
+        fields["confirmPassword"] = password
+
+    return fields
+
+
+def registration_field_strategies(field_name: str) -> List[dict]:
+    normalized = re.sub(r"[^a-z0-9]", "", field_name.lower())
+    selectors = list(REGISTRATION_FIELD_SELECTORS.get(normalized, []))
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "", field_name)
+    if safe_name:
+        selectors.extend(
+            [
+                f"input[name='{safe_name}']",
+                f"input[id='{safe_name}']",
+                f"textarea[name='{safe_name}']",
+                f"textarea[id='{safe_name}']",
+            ]
+        )
+
+    seen = set()
+    deduped: List[dict] = []
+    for selector in selectors:
+        if selector not in seen:
+            seen.add(selector)
+            deduped.append({"type": "css", "selector": selector})
+    return deduped
+
+SSO_ENTRYPOINT_STRATEGIES = {
+    "google": [
+        {"type": "text", "text": "Sign in with Google"},
+        {"type": "text", "text": "Continue with Google"},
+        {"type": "text", "text": "Login with Google"},
+        {"type": "css", "selector": "button:has-text('Continue with Google')"},
+        {"type": "css", "selector": "a:has-text('Continue with Google')"},
+        {"type": "css", "selector": "[role='button']:has-text('Continue with Google')"},
+        {"type": "css", "selector": "button:has-text('Sign in with Google')"},
+        {"type": "css", "selector": "a:has-text('Sign in with Google')"},
+        {"type": "css", "selector": "[role='button']:has-text('Sign in with Google')"},
+        {"type": "css", "selector": "button:has-text('Google')"},
+        {"type": "css", "selector": "a:has-text('Google')"},
+        {"type": "css", "selector": "[role='button']:has-text('Google')"},
+        {"type": "css", "selector": "[aria-label*='Google' i]"},
+        {"type": "css", "selector": "[data-provider*='google' i]"},
+        {"type": "css", "selector": "[href*='google' i]"},
+    ],
+    "microsoft": [
+        {"type": "text", "text": "Sign in with Microsoft"},
+        {"type": "text", "text": "Continue with Microsoft"},
+        {"type": "text", "text": "Login with Microsoft"},
+        {"type": "css", "selector": "button:has-text('Continue with Microsoft')"},
+        {"type": "css", "selector": "a:has-text('Continue with Microsoft')"},
+        {"type": "css", "selector": "[role='button']:has-text('Continue with Microsoft')"},
+        {"type": "css", "selector": "button:has-text('Sign in with Microsoft')"},
+        {"type": "css", "selector": "a:has-text('Sign in with Microsoft')"},
+        {"type": "css", "selector": "[role='button']:has-text('Sign in with Microsoft')"},
+        {"type": "css", "selector": "button:has-text('Microsoft')"},
+        {"type": "css", "selector": "a:has-text('Microsoft')"},
+        {"type": "css", "selector": "[role='button']:has-text('Microsoft')"},
+        {"type": "css", "selector": "[aria-label*='Microsoft' i]"},
+        {"type": "css", "selector": "[href*='microsoft' i]"},
+        {"type": "css", "selector": "[href*='login.microsoftonline.com' i]"},
+    ],
+    "okta": [
+        {"type": "text", "text": "Sign in with Okta"},
+        {"type": "text", "text": "Continue with Okta"},
+        {"type": "text", "text": "Login with Okta"},
+        {"type": "css", "selector": "button:has-text('Continue with Okta')"},
+        {"type": "css", "selector": "a:has-text('Continue with Okta')"},
+        {"type": "css", "selector": "[role='button']:has-text('Continue with Okta')"},
+        {"type": "css", "selector": "button:has-text('Sign in with Okta')"},
+        {"type": "css", "selector": "a:has-text('Sign in with Okta')"},
+        {"type": "css", "selector": "[role='button']:has-text('Sign in with Okta')"},
+        {"type": "css", "selector": "button:has-text('Okta')"},
+        {"type": "css", "selector": "a:has-text('Okta')"},
+        {"type": "css", "selector": "[role='button']:has-text('Okta')"},
+        {"type": "css", "selector": "[aria-label*='Okta' i]"},
+        {"type": "css", "selector": "[href*='okta' i]"},
+    ],
+}
 
 POST_LOGIN_INTERSTITIAL_STRATEGIES = [
     {"type": "css", "selector": "input#idSIButton9"},
@@ -267,6 +437,7 @@ async def request_operator_input(
     challenge_code: Optional[str] = None,
     display_value: Optional[str] = None,
     challenge_prompt: Optional[str] = None,
+    browser_snapshot: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Tell the backend/UI that this job is blocked on human MFA input."""
     if not agent or not job_id:
@@ -291,6 +462,8 @@ async def request_operator_input(
             payload["displayValue"] = display_value
         if challenge_prompt:
             payload["challengePrompt"] = challenge_prompt
+        if browser_snapshot:
+            payload["browserSnapshot"] = browser_snapshot
         async with aiohttp.ClientSession(headers={"X-API-Key": agent.api_key}) as session:
             async with session.post(
                 f"{agent.api_url}/agents/jobs/{job_id}/operator-input/request",
@@ -562,6 +735,550 @@ async def click_element(
     return False
 
 
+def normalize_login_flow(value: Optional[Any]) -> Optional[str]:
+    flow = str(value or "").strip().upper()
+    if flow in {"AI_PASSWORD", "AI_ASSISTED_SSO", "MICROSOFT_SSO", "GOOGLE_SSO", "OKTA_SSO"}:
+        return flow
+    return None
+
+
+def normalize_sso_provider(
+    value: Optional[Any],
+    login_flow: Optional[Any] = None,
+) -> Optional[str]:
+    provider = str(value or "").strip().lower()
+    if provider in {"google", "microsoft", "okta"}:
+        return provider
+
+    flow = normalize_login_flow(login_flow)
+    if flow == "GOOGLE_SSO":
+        return "google"
+    if flow == "MICROSOFT_SSO":
+        return "microsoft"
+    if flow == "OKTA_SSO":
+        return "okta"
+    return None
+
+
+def build_provider_guidance(
+    login_flow: Optional[Any],
+    sso_provider: Optional[Any],
+) -> str:
+    provider = normalize_sso_provider(sso_provider, login_flow)
+    flow = normalize_login_flow(login_flow)
+
+    if provider == "google":
+        return (
+            "Provider-specific login flow: Google SSO. Start at the configured app URL, "
+            "prefer a 'Continue with Google' or 'Sign in with Google' entrypoint when present, "
+            "follow redirects to accounts.google.com, use the selected credential on Google identity "
+            "screens, and wait for operator MFA approval when prompted."
+        )
+    if provider == "microsoft":
+        return (
+            "Provider-specific login flow: Microsoft/Azure AD SSO. Start at the configured app URL, "
+            "prefer Microsoft or SSO sign-in buttons when present, follow redirects to "
+            "login.microsoftonline.com, use the selected credential on Microsoft identity screens, "
+            "and wait for operator MFA approval or number matching when prompted."
+        )
+    if provider == "okta":
+        return (
+            "Provider-specific login flow: Okta SSO. Start at the configured app URL, prefer Okta "
+            "or SSO sign-in buttons when present, follow redirects to the Okta identity page, use "
+            "the selected credential on Okta identity screens, and wait for operator MFA approval "
+            "when prompted."
+        )
+    if flow == "AI_ASSISTED_SSO":
+        return (
+            "Login flow: AI-assisted SSO/MFA. Start at the configured app URL, follow the visible "
+            "SSO provider flow instead of forcing local username/password fields, and wait for "
+            "operator MFA input when prompted."
+        )
+    return ""
+
+
+def merge_login_instructions(
+    login_instructions: Optional[str],
+    login_flow: Optional[Any],
+    sso_provider: Optional[Any],
+) -> Optional[str]:
+    guidance = build_provider_guidance(login_flow, sso_provider)
+    base = (login_instructions or "").strip()
+    if not guidance:
+        return base or None
+    if base and guidance in base:
+        return base
+    if base:
+        return f"{base}\n\n{guidance}"
+    return guidance
+
+
+def is_on_known_idp(current_url: str, provider: Optional[str]) -> bool:
+    host = urlparse(current_url or "").netloc.lower()
+    if provider == "google":
+        return "accounts.google." in host or host == "accounts.google.com"
+    if provider == "microsoft":
+        return "login.microsoftonline." in host or host.endswith(".microsoftonline.com")
+    if provider == "okta":
+        return "okta.com" in host or "okta-emea.com" in host or "okta-preview.com" in host
+    return False
+
+
+def _safe_url_for_error(url: Optional[str]) -> str:
+    """Return origin/path only so IdP query params do not leak into UI/logs."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+    except Exception:
+        pass
+    return str(url).split("?", 1)[0][:180]
+
+
+def _mask_identifier(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "@" in text:
+        local, domain = text.split("@", 1)
+        return f"{local[:2]}***@{domain}" if local else f"***@{domain}"
+    if len(text) <= 4:
+        return "***"
+    return f"{text[:2]}***{text[-2:]}"
+
+
+def _redact_identity_text(text: str, max_chars: int = 240) -> str:
+    if not text:
+        return ""
+    compact = " ".join(str(text).split())
+    compact = re.sub(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        lambda match: _mask_identifier(match.group(0)) or "[redacted-email]",
+        compact,
+    )
+    return compact[:max_chars]
+
+
+async def _read_page_text_for_diagnostics(page, max_chars: int = 1200) -> str:
+    """Best-effort visible text reader for IdP diagnostic messages."""
+    snippets: List[str] = []
+    for _ in range(3):
+        snippets = []
+        try:
+            title = await page.title()
+            if title:
+                snippets.append(title)
+        except Exception:
+            pass
+        try:
+            body_text = await page.locator("body").inner_text(timeout=1500)
+            if body_text:
+                snippets.append(body_text)
+        except Exception:
+            pass
+        text = " ".join(" ".join(snippets).split())
+        if text:
+            return text[:max_chars]
+        await asyncio.sleep(0.5)
+    try:
+        html = await page.content()
+        text = re.sub(r"<(script|style)[\s\S]*?</\1>", " ", html, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return " ".join(text.split())[:max_chars]
+    except Exception:
+        return ""
+
+
+def _format_idp_blocking_error(blocking_state: Dict[str, Any]) -> str:
+    """Produce an operator-friendly error without leaking raw IdP query params."""
+    message = str(blocking_state.get("message") or "Identity provider rejected the login.")
+    parts = [message]
+
+    reason = blocking_state.get("reason")
+    if reason:
+        parts.append(f"Reason: {reason}")
+
+    operator_hint = blocking_state.get("operator_hint")
+    if operator_hint:
+        parts.append(f"Hint: {operator_hint}")
+
+    page_excerpt = blocking_state.get("page_excerpt")
+    if page_excerpt:
+        parts.append(f"Page excerpt: {page_excerpt}")
+
+    return "\n".join(parts)
+
+
+def get_interactive_browser_cdp_url(parameters: Dict[str, Any]) -> Optional[str]:
+    """Resolve an optional trusted Chrome/CDP endpoint for interactive SSO capture."""
+    for key in ("interactiveBrowserCdpUrl", "browserCdpUrl", "cdpUrl"):
+        value = parameters.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    for env_name in (
+        "XASM_INTERACTIVE_BROWSER_CDP_URL",
+        "INTERACTIVE_BROWSER_CDP_URL",
+        "CHROME_CDP_URL",
+    ):
+        value = os.getenv(env_name)
+        if value and value.strip():
+            return value.strip()
+
+    return None
+
+
+def get_interactive_browser_state_dir(parameters: Dict[str, Any]) -> Path:
+    """Directory used for per-profile interactive browser storage state."""
+    configured = (
+        parameters.get("interactiveBrowserStateDir")
+        or parameters.get("browserStateDir")
+        or os.getenv("XASM_BROWSER_STATE_DIR")
+    )
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured.strip())
+
+    app_storage = Path("/app-storage")
+    if app_storage.exists():
+        return app_storage / "auth-browser-states"
+    return Path("/tmp/xasm-auth-browser-states")
+
+
+def _normalized_origin(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    except Exception:
+        pass
+    return str(value).strip().lower()
+
+
+def get_interactive_browser_partition_key(
+    parameters: Dict[str, Any],
+    login_url: str,
+    protected_resource_url: Optional[str],
+    username: Optional[str],
+) -> str:
+    """Build a non-sensitive key so multiple auth profiles never share browser state."""
+    tenant_id = str(parameters.get("tenantId") or parameters.get("tenant_id") or "unknown-tenant")
+    profile_id = str(
+        parameters.get("authenticationProfileId")
+        or parameters.get("authProfileId")
+        or parameters.get("profileId")
+        or "unknown-profile"
+    )
+    credential_id = str(
+        parameters.get("credentialId")
+        or parameters.get("credentialSetId")
+        or "unknown-credential"
+    )
+    origin = _normalized_origin(protected_resource_url) or _normalized_origin(login_url)
+    username_hash = hashlib.sha256((username or "").encode("utf-8")).hexdigest()[:12]
+    material = "|".join([tenant_id, profile_id, credential_id, origin, username_hash])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+async def persist_partitioned_browser_state(context) -> None:
+    """Persist Playwright storage state when this context is profile-partitioned."""
+    state_path = getattr(context, "_xasm_storage_state_path", None)
+    if not state_path:
+        return
+    try:
+        path = Path(state_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        await context.storage_state(path=str(path))
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        print(f"[AI Login] Persisted partitioned browser state: {path}")
+    except Exception as exc:
+        print(f"[AI Login] WARNING: Could not persist partitioned browser state: {exc}")
+
+
+async def connect_interactive_browser_over_cdp(
+    playwright,
+    cdp_url: str,
+    browser_viewport: Dict[str, int],
+    browser_user_agent: str,
+    partition_key: Optional[str] = None,
+    state_dir: Optional[Path] = None,
+):
+    """Attach to Chrome over CDP, using isolated storage per auth profile when possible."""
+    browser = await playwright.chromium.connect_over_cdp(cdp_url)
+
+    if partition_key:
+        state_root = state_dir or Path("/tmp/xasm-auth-browser-states")
+        state_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(state_root, 0o700)
+        except OSError:
+            pass
+        state_path = state_root / f"{partition_key}.json"
+        context_kwargs = {
+            "viewport": browser_viewport,
+            "user_agent": browser_user_agent,
+            "locale": "en-US",
+        }
+        if state_path.exists() and state_path.stat().st_size > 0:
+            context_kwargs["storage_state"] = str(state_path)
+            print(f"[AI Login] Loading partitioned browser state: {state_path}")
+        else:
+            print(f"[AI Login] Starting new partitioned browser state: {state_path}")
+
+        context = await browser.new_context(**context_kwargs)
+        setattr(context, "_xasm_storage_state_path", str(state_path))
+        page = await context.new_page()
+    else:
+        if browser.contexts:
+            context = browser.contexts[0]
+        else:
+            context = await browser.new_context(
+                viewport=browser_viewport,
+                user_agent=browser_user_agent,
+                locale="en-US",
+            )
+
+        if context.pages:
+            page = context.pages[-1]
+        else:
+            page = await context.new_page()
+
+    try:
+        await page.set_viewport_size(browser_viewport)
+    except Exception:
+        pass
+
+    return browser, context, page
+
+
+async def classify_idp_blocking_state(
+    page,
+    provider: Optional[str],
+    username: Optional[str] = None,
+    interactive_browser_configured: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Detect IdP-level rejection states before we incorrectly blame selectors."""
+    current_url = getattr(page, "url", "") or ""
+    try:
+        parsed = urlparse(current_url)
+        query = parse_qs(parsed.query)
+        path = (parsed.path or "").lower()
+        host = (parsed.netloc or "").lower()
+    except Exception:
+        query = {}
+        path = ""
+        host = ""
+
+    body_text = await _read_page_text_for_diagnostics(page)
+    lowered_body = body_text.lower()
+    lowered_url = current_url.lower()
+
+    account_hint = None
+    for key in ("idnf", "identifier", "login_hint", "email", "username"):
+        values = query.get(key) or []
+        if values:
+            account_hint = _mask_identifier(values[0])
+            break
+    account_hint = account_hint or _mask_identifier(username)
+
+    google_rejection_markers = (
+        "signin/rejected",
+        "identifierrejected",
+        "idnf=",
+    )
+    google_browser_not_secure_markers = (
+        "this browser or app may not be secure",
+        "try using a different browser",
+        "browser or app may not be secure",
+        "este navegador ou app pode nao ser seguro",
+        "este navegador ou aplicativo pode nao ser seguro",
+        "tente usar outro navegador",
+    )
+    google_account_not_found_markers = (
+        "couldn’t find your google account",
+        "couldn't find your google account",
+        "could not find your google account",
+        "não foi possível encontrar sua conta do google",
+        "nao foi possivel encontrar sua conta do google",
+    )
+    google_app_access_markers = (
+        "access blocked",
+        "this app is blocked",
+        "app is blocked",
+        "the developer hasn’t given you access",
+        "the developer hasn't given you access",
+        "you don't have access to this app",
+        "you do not have access to this app",
+        "not allowed to access this app",
+    )
+    generic_block_markers = (
+        "access blocked",
+        "app is blocked",
+        "not authorized",
+        "you don't have access",
+        "you do not have access",
+        "account disabled",
+        "account has been disabled",
+        "couldn’t sign you in",
+        "couldn't sign you in",
+        "could not sign you in",
+        "request access",
+        "solicitar acesso",
+        "acesso bloqueado",
+        "não tem acesso",
+        "nao tem acesso",
+    )
+
+    detected = False
+    label = "Identity provider"
+    reason_detail = None
+    reason_code = "IDP_REJECTED_LOGIN"
+    operator_hint = None
+    if provider == "google" and ("accounts.google." in host or "google." in host):
+        label = "Google SSO"
+        if any(marker in lowered_body for marker in google_browser_not_secure_markers):
+            detected = True
+            reason_code = "GOOGLE_BROWSER_NOT_SECURE"
+            reason_detail = "Google blocked the automated browser before the password step"
+            if interactive_browser_configured:
+                operator_hint = (
+                    "Google reported that the browser/app may not be secure. Continue the "
+                    "login in the configured trusted interactive Chrome session so xASM can "
+                    "capture cookies from the same browser context after authentication."
+                )
+            else:
+                operator_hint = (
+                    "Google reported that the browser/app may not be secure. This deployment "
+                    "does not have a trusted interactive Chrome/CDP browser configured, so "
+                    "xASM cannot complete Google SSO automatically or read cookies from an "
+                    "external browser tab. Configure XASM_INTERACTIVE_BROWSER_CDP_URL on the "
+                    "agent or use an already captured active session."
+                )
+        elif any(marker in lowered_body for marker in google_account_not_found_markers) or "idnf" in query:
+            detected = True
+            reason_code = "GOOGLE_ACCOUNT_NOT_FOUND"
+            reason_detail = "Google reported that the account could not be found"
+        elif any(marker in lowered_body for marker in google_app_access_markers):
+            detected = True
+            reason_code = "GOOGLE_APP_ACCESS_BLOCKED"
+            reason_detail = "Google blocked this account from accessing the OAuth application"
+            operator_hint = (
+                "Verify the Google OAuth consent/app access configuration and make sure "
+                "the account is allowed to sign in to this application."
+            )
+        elif any(marker in lowered_url for marker in google_rejection_markers):
+            detected = True
+            reason_code = "GOOGLE_SIGNIN_REJECTED"
+            reason_detail = "Google redirected to a sign-in rejection page before the password step"
+            operator_hint = (
+                "Review the Google page excerpt or debug screenshot. This commonly means "
+                "browser automation was blocked or the OAuth application/account is not allowed."
+            )
+
+    if not detected and any(marker in lowered_body for marker in generic_block_markers):
+        detected = True
+        label = (provider or "identity provider").replace("_", " ").title()
+        reason_detail = "the identity provider displayed an access/account blocking message"
+        reason_code = "IDP_ACCESS_BLOCKED"
+
+    if not detected:
+        return None
+
+    message_parts = [
+        f"{label} rejected the login before a reusable session could be created",
+    ]
+    if reason_detail:
+        message_parts.append(reason_detail)
+    if account_hint:
+        message_parts.append(f"account={account_hint}")
+    safe_url = _safe_url_for_error(current_url)
+    if safe_url:
+        message_parts.append(f"url={safe_url}")
+
+    return {
+        "detected": True,
+        "provider": provider,
+        "reason": reason_code,
+        "message": "; ".join(message_parts) + ".",
+        "current_url": safe_url,
+        "account_hint": account_hint,
+        "page_excerpt": _redact_identity_text(body_text),
+        "operator_hint": operator_hint,
+        "manual_capture_required": reason_code == "GOOGLE_BROWSER_NOT_SECURE",
+        "interactive_browser_required": reason_code == "GOOGLE_BROWSER_NOT_SECURE",
+        "interactive_browser_configured": bool(interactive_browser_configured),
+    }
+
+
+def should_attempt_managed_browser_recovery(
+    blocking_state: Optional[Dict[str, Any]],
+    *,
+    interactive_browser_configured: bool = False,
+) -> bool:
+    """Try the managed browser before falling back to static operator guidance."""
+    if not blocking_state:
+        return True
+    if blocking_state.get("reason") == "GOOGLE_BROWSER_NOT_SECURE":
+        return bool(interactive_browser_configured)
+    return True
+
+
+async def click_sso_entrypoint_if_needed(
+    page,
+    login_url: str,
+    login_flow: Optional[Any],
+    sso_provider: Optional[Any],
+    wait_ms: int,
+    page_load_strategy: str,
+    load_timeout_ms: int,
+    agent=None,
+) -> bool:
+    provider = normalize_sso_provider(sso_provider, login_flow)
+    if not provider:
+        return False
+
+    current_url = page.url or login_url
+    if is_on_known_idp(current_url, provider):
+        print(f"[AI Login] Already on {provider} identity provider, skipping SSO entrypoint click")
+        return False
+
+    strategies = SSO_ENTRYPOINT_STRATEGIES.get(provider, [])
+    if not strategies:
+        return False
+
+    if agent:
+        agent.report_progress(
+            current_operation=f"Selecting {provider.title()} SSO entrypoint",
+            current_target=current_url,
+        )
+    print(f"[AI Login] Trying provider-specific {provider} SSO entrypoint strategies")
+    clicked = await click_element(
+        page,
+        strategies,
+        f"{provider}_sso_entrypoint",
+        timeout_ms=1800,
+    )
+    if not clicked:
+        print(f"[AI Login] No visible {provider} SSO entrypoint was clicked")
+        return False
+
+    await asyncio.sleep(max(wait_ms, 1000) / 1000)
+    try:
+        await page.wait_for_load_state(page_load_strategy, timeout=load_timeout_ms)
+    except Exception:
+        pass
+    print(f"[AI Login] Provider SSO entrypoint selected; current URL: {page.url}")
+    return True
+
+
 async def press_enter_on_field(
     page,
     strategies: list,
@@ -662,6 +1379,7 @@ async def fill_credentials_and_submit(
     *,
     submit_strategies: list,
     action_label: str,
+    extra_fields: Optional[Dict[str, str]] = None,
     field_timeout_ms: int = 2500,
 ) -> bool:
     """Fill username/password and submit the closest auth form using page handlers."""
@@ -681,6 +1399,19 @@ async def fill_credentials_and_submit(
     )
     if not (username_ok and password_ok):
         return False
+
+    for field_name, field_value in (extra_fields or {}).items():
+        if field_name.lower() in {"username", "password"}:
+            continue
+        field_ok = await fill_field(
+            page,
+            registration_field_strategies(field_name),
+            field_value,
+            f"{action_label} {field_name}",
+            timeout_ms=field_timeout_ms,
+        )
+        if not field_ok:
+            print(f"[AI Login]   {action_label}: optional registration field not found: {field_name}")
 
     submitted = await click_element(
         page,
@@ -731,6 +1462,8 @@ async def attempt_registration_then_login(
     username: str,
     password: str,
     login_instructions: Optional[str],
+    auto_register: bool,
+    registration_fields: Optional[Dict[str, str]],
     page_load_strategy: str,
     timeout_ms: int,
     post_submit_wait_ms: int,
@@ -738,10 +1471,11 @@ async def attempt_registration_then_login(
     agent,
 ) -> bool:
     """Create the seeded lab account, then retry login, when instructions allow it."""
-    if not registration_fallback_allowed(login_instructions):
+    if not registration_fallback_allowed(login_instructions, auto_register):
         return False
 
-    print("[AI Login]   Login failed; attempting instruction-authorized registration fallback")
+    safe_field_names = sorted((registration_fields or {}).keys())
+    print(f"[AI Login]   Login failed; attempting explicit auto-registration fallback fields={safe_field_names}")
     if agent:
         agent.report_progress(
             current_operation="Login failed; attempting account registration fallback",
@@ -760,6 +1494,7 @@ async def attempt_registration_then_login(
                 password,
                 submit_strategies=submit_strategies,
                 action_label="registration",
+                extra_fields=registration_fields,
             )
             if not registered:
                 continue
@@ -2091,6 +2826,199 @@ async def save_debug_screenshot(page, step: int, description: str, enabled: bool
     return str(filepath)
 
 
+async def capture_operator_browser_snapshot(
+    page,
+    label: str,
+    *,
+    max_bytes: int = 900_000,
+) -> Dict[str, Any]:
+    """Capture a small viewport snapshot for the operator MFA prompt."""
+    snapshot: Dict[str, Any] = {
+        "label": label,
+        "currentUrl": getattr(page, "url", "") or "",
+        "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        try:
+            title = await page.title()
+            if title:
+                snapshot["title"] = title[:180]
+        except Exception:
+            pass
+
+        try:
+            viewport = page.viewport_size or {}
+            if viewport:
+                snapshot["width"] = viewport.get("width")
+                snapshot["height"] = viewport.get("height")
+        except Exception:
+            pass
+
+        image_bytes = await page.screenshot(
+            type="jpeg",
+            quality=42,
+            full_page=False,
+        )
+        if len(image_bytes) > max_bytes:
+            image_bytes = await page.screenshot(
+                type="jpeg",
+                quality=28,
+                full_page=False,
+            )
+        if len(image_bytes) <= max_bytes:
+            snapshot["mimeType"] = "image/jpeg"
+            snapshot["imageBase64"] = base64.b64encode(image_bytes).decode("utf-8")
+        else:
+            snapshot["error"] = "Browser snapshot exceeded safe size limit"
+    except Exception as exc:
+        snapshot["error"] = str(exc)[:240]
+    return snapshot
+
+
+def _coerce_browser_coordinate(value: Any, fallback: int = 0) -> int:
+    """Convert a UI-provided screenshot coordinate into a safe Playwright coordinate."""
+    try:
+        return max(0, int(round(float(value))))
+    except (TypeError, ValueError):
+        return fallback
+
+
+async def apply_operator_browser_command(page, command: Dict[str, Any]) -> str:
+    """Apply one operator-issued command to the managed Playwright browser."""
+    action = str((command or {}).get("action") or "").lower().strip()
+
+    if action == "click":
+        x = _coerce_browser_coordinate(command.get("x"))
+        y = _coerce_browser_coordinate(command.get("y"))
+        await page.mouse.click(x, y)
+        return "continue"
+
+    if action == "type":
+        text = str(command.get("text") or "")
+        if text:
+            await page.keyboard.type(text, delay=15)
+        return "continue"
+
+    if action == "press":
+        key = str(command.get("key") or "Enter").strip() or "Enter"
+        allowed_keys = {
+            "Enter",
+            "Tab",
+            "Escape",
+            "Backspace",
+            "Delete",
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            "ArrowDown",
+            "Space",
+        }
+        await page.keyboard.press(key if key in allowed_keys else "Enter")
+        return "continue"
+
+    if action == "refresh":
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        return "continue"
+
+    if action == "wait":
+        try:
+            seconds = float(command.get("seconds") or 2)
+        except (TypeError, ValueError):
+            seconds = 2
+        await asyncio.sleep(min(max(seconds, 0.5), 15))
+        return "continue"
+
+    if action == "done":
+        return "done"
+
+    return "continue"
+
+
+async def request_operator_browser_interaction(
+    page,
+    agent,
+    job_id: Optional[str],
+    *,
+    login_url: str,
+    protected_resource_url: Optional[str],
+    label: str,
+    prompt: str,
+    helper_text: str,
+    expires_in_seconds: int,
+    max_rounds: int,
+    page_load_strategy: str,
+    load_timeout_ms: int,
+) -> bool:
+    """Let the operator drive the managed browser until a reusable session exists."""
+    if not agent or not job_id:
+        return False
+
+    rounds = max(1, min(int(max_rounds or 1), 12))
+    wait_budget = max(60, min(int(expires_in_seconds or 180), 900))
+
+    for round_index in range(rounds):
+        current_assessment = await assess_current_page_session(
+            page,
+            protected_resource_url,
+            login_url=login_url,
+        )
+        if current_assessment.get("valid"):
+            return True
+
+        snapshot = await capture_operator_browser_snapshot(
+            page,
+            f"Interactive browser round {round_index + 1}",
+        )
+        request_id = f"{job_id}-browser-{int(time.time())}-{round_index}"
+        requested = await request_operator_input(
+            agent,
+            job_id,
+            request_id,
+            kind="browser_interaction",
+            label=label,
+            prompt=prompt,
+            helper_text=helper_text,
+            current_target=page.url or login_url,
+            expires_in_seconds=wait_budget,
+            mfa_round=round_index + 1,
+            browser_snapshot=snapshot,
+        )
+        if not requested:
+            return False
+
+        deadline = time.time() + wait_budget
+        operator_response: Optional[Dict[str, Any]] = None
+        while time.time() < deadline:
+            operator_response = await consume_operator_input(agent, job_id, request_id)
+            if operator_response:
+                break
+            await asyncio.sleep(1)
+
+        if not operator_response:
+            return False
+
+        command = operator_response.get("command") or {}
+        command_result = await apply_operator_browser_command(page, command)
+        await asyncio.sleep(0.5)
+        try:
+            await page.wait_for_load_state(page_load_strategy, timeout=load_timeout_ms)
+        except Exception:
+            pass
+
+        if command_result == "done":
+            final_assessment = await assess_current_page_session(
+                page,
+                protected_resource_url,
+                login_url=login_url,
+            )
+            return bool(final_assessment.get("valid") or not protected_resource_url)
+
+    return False
+
+
 class BrowserLoginAiTool(ToolPlugin):
     @property
     def name(self) -> str:
@@ -2120,6 +3048,14 @@ class BrowserLoginAiTool(ToolPlugin):
                 "loginInstructions": {
                     "type": "string",
                     "description": "Natural language instructions for AI (auto-injected from credentials)"
+                },
+                "loginFlow": {
+                    "type": "string",
+                    "description": "UI-selected login flow hint (AI_PASSWORD, AI_ASSISTED_SSO, MICROSOFT_SSO, GOOGLE_SSO, OKTA_SSO)"
+                },
+                "ssoProvider": {
+                    "type": "string",
+                    "description": "Provider-specific SSO hint (generic, microsoft, google, okta)"
                 },
                 "headless": {
                     "type": "boolean",
@@ -2160,7 +3096,13 @@ class BrowserLoginAiTool(ToolPlugin):
                     "default": False
                 }
             },
-            "required": ["loginUrl", "username", "password"]
+            # Nothing is strictly required. loginUrl AND username/password are all "optional
+            # auth": when any is absent (e.g. an optional AI-login step in a public/unauth scan)
+            # the tool SKIPS gracefully with success instead of failing, so the PROGRAMMATIC
+            # chain stays clean and continues unauthenticated. When all are present it performs
+            # the normal authenticated login. (#907 — a required loginUrl made validation reject
+            # the job before execute()'s graceful skip could run, halting the whole chain.)
+            "required": []
         }
 
     @property
@@ -2180,7 +3122,42 @@ class BrowserLoginAiTool(ToolPlugin):
         login_url = parameters.get('loginUrl')
         username = parameters.get('username')
         password = parameters.get('password')
+
+        # Optional auth: with no login URL OR no credentials (an optional AI-login step in a
+        # public/unauthenticated scan), skip gracefully with success instead of failing — the
+        # unauthenticated scan continues clean. Guarding on loginUrl too (#907) is what lets an
+        # optional step-0 login survive a run that carries no auth context at all: without it the
+        # required-param check rejects the job before this skip runs and the whole chain halts.
+        if (
+            not (login_url and str(login_url).strip())
+            or not (username and str(username).strip())
+            or not (password and str(password).strip())
+        ):
+            print(
+                "[AI Login] No loginUrl/credentials provided — skipping optional AI login "
+                "(unauthenticated scan continues)"
+            )
+            return {
+                "success": True,
+                "skipped": True,
+                "authenticated": False,
+                "reason": "No loginUrl/credentials provided — optional AI login skipped; scan continues unauthenticated.",
+                "cookies": [],
+                "session_data": {},
+                "storage_state": {},
+            }
+
         login_instructions = parameters.get('loginInstructions')
+        login_flow = normalize_login_flow(parameters.get('loginFlow') or parameters.get('login_flow'))
+        sso_provider = normalize_sso_provider(
+            parameters.get('ssoProvider') or parameters.get('sso_provider'),
+            login_flow,
+        )
+        login_instructions = merge_login_instructions(
+            login_instructions,
+            login_flow,
+            sso_provider,
+        )
         headless = parameters.get('headless', True)
         timeout_seconds = parameters.get('timeout_seconds', 120)
         original_protected_resource_url = parameters.get('protectedResourceUrl')
@@ -2201,6 +3178,8 @@ class BrowserLoginAiTool(ToolPlugin):
         print(f"[AI Login] Starting execution for: {login_url}")
         print(f"[AI Login] Credentials: username=***REDACTED***, password={'***' if password else 'NONE'}")
         print(f"[AI Login] Headless: {headless}, Timeout: {timeout_seconds}s")
+        if login_flow or sso_provider:
+            print(f"[AI Login] Login flow hints: loginFlow={login_flow}, ssoProvider={sso_provider}")
 
         try:
             # Report initial progress
@@ -2217,6 +3196,7 @@ class BrowserLoginAiTool(ToolPlugin):
                 error_msg = f'Missing required parameters: loginUrl={bool(login_url)}, username={bool(username)}, password={bool(password)}'
                 print(f"[AI Login] ERROR: {error_msg}")
                 return {
+                    'success': False,
                     'status': 'FAILED',
                     'error': error_msg,
                     'session_valid': False
@@ -2231,18 +3211,68 @@ class BrowserLoginAiTool(ToolPlugin):
                     total_items=4
                 )
 
-            # Perform AI-driven login
-            print(f"[AI Login] Calling _ai_driven_login...")
-            login_result = await self._ai_driven_login(
-                login_url=login_url,
-                username=username,
-                password=password,
-                login_instructions=login_instructions,
-                headless=headless,
-                timeout_seconds=timeout_seconds,
-                agent=agent,
-                parameters=parameters
+            # #519 — bound the ENTIRE login with an overall wall-clock budget.
+            # The internal sub-timeouts (per-navigation, per-LLM call, per-MFA
+            # round) are individually bounded, but their SUM had no cap: a slow
+            # vision LLM/relay, a multi-round MFA flow, or an LLM misreading a
+            # plain login as MFA and retry-looping could wedge the tool until the
+            # agent's hard per-job watchdog killed it, cancelling every downstream
+            # step with no usable result.
+            #
+            # The budget is bounded BOTH ways: never above the job watchdog (minus
+            # margin to report) AND never above a login-appropriate ceiling. The
+            # job watchdog is sized for long SCANS (e.g. a 3200s nuclei full scan);
+            # a *login* must never inherit that — it should fail in minutes, not
+            # ~an hour. `overallTimeoutSeconds` is an explicit per-run override;
+            # `AI_LOGIN_MAX_OVERALL_SECONDS` / `aiLoginMaxOverallSeconds` tune the
+            # ceiling (default 300s — covers a few MFA rounds).
+            watchdog_seconds = _coerce_float(parameters.get('_job_timeout_seconds'), 300.0)
+            login_ceiling = _coerce_float(
+                parameters.get('aiLoginMaxOverallSeconds')
+                or os.environ.get('AI_LOGIN_MAX_OVERALL_SECONDS'),
+                300.0,
             )
+            explicit_budget = parameters.get('overallTimeoutSeconds')
+            if explicit_budget:
+                overall_budget = _coerce_float(explicit_budget, login_ceiling)
+            else:
+                overall_budget = min(max(30.0, watchdog_seconds - 20.0), login_ceiling)
+            print(f"[AI Login] Calling _ai_driven_login (overall budget {overall_budget:.0f}s)...")
+            try:
+                login_result = await asyncio.wait_for(
+                    self._ai_driven_login(
+                        login_url=login_url,
+                        username=username,
+                        password=password,
+                        login_instructions=login_instructions,
+                        headless=headless,
+                        timeout_seconds=timeout_seconds,
+                        agent=agent,
+                        parameters=parameters
+                    ),
+                    timeout=overall_budget,
+                )
+            except asyncio.TimeoutError:
+                print(f"[AI Login] ✗ Overall login budget of {overall_budget:.0f}s exceeded for {login_url}")
+                return {
+                    'success': False,
+                    'status': 'FAILED',
+                    'error': (
+                        f"AI login exceeded its overall time budget of {overall_budget:.0f}s and was "
+                        f"aborted so downstream steps can proceed. This usually means the vision "
+                        f"LLM/relay was slow or unreachable, or the login flow needed more "
+                        f"steps/MFA rounds than the budget allows. Verify the agent.browser_login_ai "
+                        f"route points at a reachable text+vision provider, or raise the step timeout."
+                    ),
+                    'session_valid': False,
+                    'login_method': 'ai',
+                    'cookies': [],
+                    'session_data': {},
+                    'storage_state': {},
+                    'protected_resource_url': protected_resource_url,
+                    'original_protected_resource_url': original_protected_resource_url,
+                    'protected_resource_url_note': protected_resource_note,
+                }
 
             print(f"[AI Login] Login result: success={login_result.get('success')}, cookies_count={len(login_result.get('cookies', []))}")
 
@@ -2250,6 +3280,7 @@ class BrowserLoginAiTool(ToolPlugin):
                 error = login_result.get('error', 'Login failed')
                 print(f"[AI Login] Login FAILED: {error[0:200]}")
                 return {
+                    'success': False,
                     'status': 'FAILED',
                     'error': error,
                     'session_valid': False,
@@ -2288,6 +3319,7 @@ class BrowserLoginAiTool(ToolPlugin):
 
             if not filtered_cookies:
                 return {
+                    'success': False,
                     'status': 'FAILED',
                     'error': (
                         'Login flow completed, but no reusable cookies were captured for '
@@ -2321,6 +3353,7 @@ class BrowserLoginAiTool(ToolPlugin):
             cookies_string = '; '.join([f"{c['name']}={c['value']}" for c in filtered_cookies])
 
             result = {
+                'success': True,
                 'status': 'SUCCESS',
                 'login_method': 'ai',
                 'headers_file': artifacts['headers_file'],
@@ -2351,6 +3384,7 @@ class BrowserLoginAiTool(ToolPlugin):
             error_full = f"{str(e)}\n{traceback.format_exc()}"
             print(f"[AI Login] EXCEPTION in execute(): {error_full[0:300]}")
             return {
+                'success': False,
                 'status': 'FAILED',
                 'error': error_full,
                 'session_valid': False,
@@ -2375,6 +3409,7 @@ class BrowserLoginAiTool(ToolPlugin):
         """
         try:
             from playwright.async_api import async_playwright
+            from lib.process_reaper import close_browser_safe
 
             # Read AI config parameters (injected from aiConfig)
             mfa_auto_fill_timeout = parameters.get('mfaAutoFillTimeout', 60)
@@ -2387,6 +3422,26 @@ class BrowserLoginAiTool(ToolPlugin):
             browser_viewport = parameters.get('browserViewport', {"width": 1280, "height": 900})
             protected_resource_url = parameters.get('protectedResourceUrl')
             debug_screenshots = parameters.get('debugScreenshots', False)
+            login_flow = normalize_login_flow(parameters.get('loginFlow') or parameters.get('login_flow'))
+            sso_provider = normalize_sso_provider(
+                parameters.get('ssoProvider') or parameters.get('sso_provider'),
+                login_flow,
+            )
+            login_instructions = merge_login_instructions(
+                login_instructions,
+                login_flow,
+                sso_provider,
+            )
+            auto_register = coerce_optional_bool(
+                parameters.get('autoRegister', parameters.get('auto_register'))
+            )
+            if auto_register is None:
+                auto_register = False
+            registration_fields = normalize_registration_fields(
+                parameters.get('registrationFields') or parameters.get('registration_fields'),
+                username=username,
+                password=password,
+            )
             login_test_mode = bool(parameters.get('loginTestMode') or parameters.get('testMode'))
             job_id = parameters.get('_job_id')
             interactive_mfa = (
@@ -2421,7 +3476,7 @@ class BrowserLoginAiTool(ToolPlugin):
                 f"mfaMaxRounds={mfa_max_rounds}, debug={debug_screenshots}, "
                 f"testMode={login_test_mode}, pageLoadStrategy={page_load_strategy}, "
                 f"llmTimeout={llm_timeout_seconds}s, initialRenderWait={initial_render_wait_ms}ms, "
-                f"interactiveMfa={interactive_mfa}"
+                f"interactiveMfa={interactive_mfa}, loginFlow={login_flow}, ssoProvider={sso_provider}"
             )
 
             # Phase 6 — vendor-agnostic LLM resolution. Pull the platform LLM
@@ -2517,34 +3572,177 @@ class BrowserLoginAiTool(ToolPlugin):
                 if protected_resource_url and interactive_mfa
                 else login_url
             )
+            interactive_browser_cdp_url = get_interactive_browser_cdp_url(parameters)
+            use_trusted_interactive_browser = bool(
+                interactive_browser_cdp_url and sso_provider == "google"
+            )
+            interactive_browser_partition_key = None
+            interactive_browser_state_dir = None
+            if use_trusted_interactive_browser:
+                interactive_browser_partition_key = get_interactive_browser_partition_key(
+                    parameters,
+                    login_url=login_url,
+                    protected_resource_url=protected_resource_url,
+                    username=username,
+                )
+                interactive_browser_state_dir = get_interactive_browser_state_dir(parameters)
             if entry_url != login_url:
                 print(
                     "[AI Login] Using protected resource as SSO entrypoint: "
                     f"{entry_url} (loginUrl fallback: {login_url})"
                 )
+            if use_trusted_interactive_browser:
+                print(
+                    "[AI Login] Google SSO will use trusted interactive Chrome over CDP: "
+                    f"{interactive_browser_cdp_url}"
+                )
+                print(
+                    "[AI Login] Interactive browser state is isolated for this auth profile: "
+                    f"{interactive_browser_partition_key}"
+                )
 
             # Report progress
             if agent:
                 agent.report_progress(
-                    current_operation=f"Opening browser and navigating to: {entry_url}",
+                    current_operation=(
+                        "Connecting to trusted interactive browser"
+                        if use_trusted_interactive_browser
+                        else f"Opening browser and navigating to: {entry_url}"
+                    ),
                     current_target=entry_url
                 )
 
             # Initialize Playwright with hardened browser settings
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=headless,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-                context = await browser.new_context(
-                    viewport=browser_viewport,
-                    user_agent=browser_user_agent,
-                )
-                page = await context.new_page()
+                browser = None
+                context = None
+                owns_browser = True
+                owns_context = False
+                if use_trusted_interactive_browser:
+                    browser, context, page = await connect_interactive_browser_over_cdp(
+                        p,
+                        interactive_browser_cdp_url,
+                        browser_viewport,
+                        browser_user_agent,
+                        partition_key=interactive_browser_partition_key,
+                        state_dir=interactive_browser_state_dir,
+                    )
+                    owns_browser = False
+                    owns_context = True
+                else:
+                    browser = await p.chromium.launch(
+                        headless=headless,
+                        ignore_default_args=["--enable-automation"],
+                        args=[
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-blink-features=AutomationControlled",
+                            "--disable-infobars",
+                            "--disable-features=IsolateOrigins,site-per-process",
+                        ],
+                    )
+                    context = await browser.new_context(
+                        viewport=browser_viewport,
+                        user_agent=browser_user_agent,
+                        locale="en-US",
+                    )
+                    await context.add_init_script(
+                        """
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                        window.chrome = window.chrome || { runtime: {} };
+                        """
+                    )
+                    page = await context.new_page()
+
+                async def finalize_success(reason: str, screenshot_step: int) -> Dict[str, Any]:
+                    protected_validation = await validate_protected_resource_session(
+                        page,
+                        protected_resource_url,
+                        login_url=login_url,
+                        page_load_strategy=page_load_strategy,
+                        timeout_ms=max(post_submit_load_timeout_ms, 10000),
+                        settle_ms=max(initial_render_wait_ms, 1000),
+                        agent=agent,
+                    )
+                    if parameters.get('protectedResourceUrlNote'):
+                        protected_validation['protected_resource_url_note'] = parameters.get('protectedResourceUrlNote')
+                        protected_validation['original_protected_resource_url'] = parameters.get('originalProtectedResourceUrl')
+                    if not protected_validation.get("valid"):
+                        error = protected_validation.get("reason") or "protected resource validation failed"
+                        print(f"[AI Login] Protected resource validation FAILED: {error}")
+                        return {
+                            'success': False,
+                            'status': 'FAILED',
+                            'session_valid': False,
+                            'error': error,
+                            'protected_resource_validation': protected_validation,
+                            'cookies': [],
+                            'storage_state': {},
+                        }
+
+                    execution_time = time.time() - start_time
+                    cookies = await context.cookies()
+                    await save_debug_screenshot(page, screenshot_step, "final_state", debug_screenshots)
+                    await persist_partitioned_browser_state(context)
+
+                    print(
+                        f"[AI Login] Login completed in {execution_time:.1f}s with "
+                        f"{actions_count} AI actions ({reason})"
+                    )
+                    print(f"[AI Login] Cookies extracted: {len(cookies)}")
+                    print(f"[AI Login] Cookie names: {[c['name'] for c in cookies]}")
+
+                    return {
+                        'success': True,
+                        'cookies': cookies,
+                        # Do not forward Playwright storage_state; it may contain
+                        # OAuth/OIDC intermediary storage that downstream tools do
+                        # not need.
+                        'storage_state': {},
+                        'execution_time': execution_time,
+                        'actions_count': actions_count,
+                        'protected_resource_validation': protected_validation,
+                        'completion_reason': reason,
+                    }
+
+                async def try_operator_browser_recovery(reason: str) -> bool:
+                    if not interactive_mfa or not agent or not job_id:
+                        return False
+                    if sso_provider == "google" and not use_trusted_interactive_browser:
+                        print(
+                            "[AI Login] Skipping managed browser recovery for Google SSO "
+                            "because no trusted Chrome/CDP endpoint is configured"
+                        )
+                        return False
+                    print(f"[AI Login] Starting operator-managed browser recovery: {reason}")
+                    agent.report_progress(
+                        current_operation="Waiting for operator to complete login in managed browser",
+                        current_target=page.url or login_url,
+                    )
+                    return await request_operator_browser_interaction(
+                        page,
+                        agent,
+                        job_id,
+                        login_url=login_url,
+                        protected_resource_url=protected_resource_url,
+                        label="Interactive browser action required",
+                        prompt=(
+                            "Use the managed browser view to finish the login. "
+                            "Click the screenshot, type text, send keys, then finish "
+                            "capture after the protected app is loaded."
+                        ),
+                        helper_text=(
+                            "This keeps the browser inside xASM so cookies can be "
+                            "captured automatically. No extension, DevTools, or manual "
+                            "cookie copy is required."
+                        ),
+                        expires_in_seconds=max(mfa_auto_fill_timeout, 300),
+                        max_rounds=max(mfa_max_rounds * 3, 8),
+                        page_load_strategy=page_load_strategy,
+                        load_timeout_ms=max(post_submit_load_timeout_ms, 10000),
+                    )
 
                 try:
                     # Step 1: Navigate to login page
@@ -2565,6 +3763,21 @@ class BrowserLoginAiTool(ToolPlugin):
                         agent.report_progress(
                             current_operation="Opened login form from page trigger",
                             current_target=entry_url,
+                        )
+                    clicked_provider_entrypoint = await click_sso_entrypoint_if_needed(
+                        page,
+                        login_url=login_url,
+                        login_flow=login_flow,
+                        sso_provider=sso_provider,
+                        wait_ms=max(initial_render_wait_ms, post_submit_wait_ms, 1000),
+                        page_load_strategy=page_load_strategy,
+                        load_timeout_ms=post_submit_load_timeout_ms,
+                        agent=agent,
+                    )
+                    if clicked_provider_entrypoint and agent:
+                        agent.report_progress(
+                            current_operation="Provider SSO entrypoint selected",
+                            current_target=page.url or login_url,
                         )
                     await save_debug_screenshot(page, 1, "page_loaded", debug_screenshots)
 
@@ -2627,10 +3840,22 @@ class BrowserLoginAiTool(ToolPlugin):
                         username_strategies = (selectors.get("usernameField", []) or []) + USERNAME_FALLBACK_STRATEGIES
                         ok = await fill_field(page, username_strategies, username, "username")
                         if not ok:
+                            if use_trusted_interactive_browser and protected_resource_url:
+                                print(
+                                    "[AI Login] Username field was not found in trusted browser; "
+                                    "checking whether this auth profile already has an active session"
+                                )
+                                await save_debug_screenshot(page, 4, "username_missing_check_session", debug_screenshots)
+                                return await finalize_success(
+                                    "trusted_interactive_session_reuse",
+                                    4,
+                                )
                             print("[AI Login] FATAL: Could not fill username field with any strategy")
                             await save_debug_screenshot(page, 4, "username_failed", debug_screenshots)
                             return {
                                 'success': False,
+                                'status': 'FAILED',
+                                'session_valid': False,
                                 'error': 'Could not fill username field - all locator strategies failed',
                                 'cookies': [],
                                 'storage_state': {}
@@ -2706,6 +3931,46 @@ class BrowserLoginAiTool(ToolPlugin):
                                     debug_screenshots,
                                 )
 
+                                blocking_state = await classify_idp_blocking_state(
+                                    page,
+                                    sso_provider,
+                                    username,
+                                    interactive_browser_configured=use_trusted_interactive_browser,
+                                )
+                                if blocking_state:
+                                    print(
+                                        "[AI Login] IdP rejected automated login before password entry - "
+                                        f"{blocking_state.get('message')}"
+                                    )
+                                    await save_debug_screenshot(
+                                        page,
+                                        5,
+                                        f"idp_rejected_{stage_attempt + 1}",
+                                        debug_screenshots,
+                                    )
+                                    if should_attempt_managed_browser_recovery(
+                                        blocking_state,
+                                        interactive_browser_configured=use_trusted_interactive_browser,
+                                    ) and await try_operator_browser_recovery(
+                                        "identity provider rejected automated staged login before password entry"
+                                    ):
+                                        return await finalize_success(
+                                            "operator_interactive_browser_idp_block",
+                                            98,
+                                        )
+                                    return {
+                                        'success': False,
+                                        'status': 'MANUAL_CAPTURE_REQUIRED'
+                                        if blocking_state.get("manual_capture_required")
+                                        else 'FAILED',
+                                        'session_valid': False,
+                                        'error': _format_idp_blocking_error(blocking_state),
+                                        'idp_blocking_state': blocking_state,
+                                        'manual_capture_required': blocking_state.get("manual_capture_required", False),
+                                        'cookies': [],
+                                        'storage_state': {},
+                                    }
+
                                 # Refresh selectors after navigation/modal
                                 # changes. Try deterministic IdP selectors
                                 # first so Microsoft/Okta flows do not spend
@@ -2761,10 +4026,46 @@ class BrowserLoginAiTool(ToolPlugin):
                                     break
 
                         if not ok:
+                            blocking_state = await classify_idp_blocking_state(
+                                page,
+                                sso_provider,
+                                username,
+                                interactive_browser_configured=use_trusted_interactive_browser,
+                            )
+                            if blocking_state:
+                                print(
+                                    "[AI Login] IdP rejected automated login before password entry - "
+                                    f"{blocking_state.get('message')}"
+                                )
+                                await save_debug_screenshot(page, 5, "idp_rejected", debug_screenshots)
+                                if should_attempt_managed_browser_recovery(
+                                    blocking_state,
+                                    interactive_browser_configured=use_trusted_interactive_browser,
+                                ) and await try_operator_browser_recovery(
+                                    "identity provider rejected automated login before password entry"
+                                ):
+                                    return await finalize_success(
+                                        "operator_interactive_browser_idp_block",
+                                        98,
+                                    )
+                                return {
+                                    'success': False,
+                                    'status': 'MANUAL_CAPTURE_REQUIRED'
+                                    if blocking_state.get("manual_capture_required")
+                                    else 'FAILED',
+                                    'session_valid': False,
+                                    'error': _format_idp_blocking_error(blocking_state),
+                                    'idp_blocking_state': blocking_state,
+                                    'manual_capture_required': blocking_state.get("manual_capture_required", False),
+                                    'cookies': [],
+                                    'storage_state': {}
+                                }
                             print("[AI Login] FATAL: Could not fill password field with any strategy")
                             await save_debug_screenshot(page, 5, "password_failed", debug_screenshots)
                             return {
                                 'success': False,
+                                'status': 'FAILED',
+                                'session_valid': False,
                                 'error': (
                                     'Could not fill password field after staged SSO/login advances - '
                                     'all locator strategies failed'
@@ -2783,6 +4084,8 @@ class BrowserLoginAiTool(ToolPlugin):
                         await save_debug_screenshot(page, 6, "submit_failed", debug_screenshots)
                         return {
                             'success': False,
+                            'status': 'FAILED',
+                            'session_valid': False,
                             'error': 'Could not click submit button - all locator strategies failed',
                             'cookies': [],
                             'storage_state': {}
@@ -2864,8 +4167,39 @@ class BrowserLoginAiTool(ToolPlugin):
 
                         if status == "error":
                             error_msg = post_result.get("message", "Login error detected by AI")
+                            blocking_state = await classify_idp_blocking_state(
+                                page,
+                                sso_provider,
+                                username,
+                                interactive_browser_configured=use_trusted_interactive_browser,
+                            )
+                            if blocking_state:
+                                error_msg = _format_idp_blocking_error(blocking_state)
                             print(f"[AI Login]   Login error: {error_msg}")
                             await save_debug_screenshot(page, step_num, "login_error", debug_screenshots)
+                            if blocking_state:
+                                if should_attempt_managed_browser_recovery(
+                                    blocking_state,
+                                    interactive_browser_configured=use_trusted_interactive_browser,
+                                ) and await try_operator_browser_recovery(
+                                    "identity provider reported a post-submit automation block"
+                                ):
+                                    return await finalize_success(
+                                        "operator_interactive_browser_login_error",
+                                        step_num + 20,
+                                    )
+                                return {
+                                    'success': False,
+                                    'status': 'MANUAL_CAPTURE_REQUIRED'
+                                    if blocking_state.get("manual_capture_required")
+                                    else 'FAILED',
+                                    'session_valid': False,
+                                    'error': error_msg,
+                                    'idp_blocking_state': blocking_state,
+                                    'manual_capture_required': blocking_state.get("manual_capture_required", False),
+                                    'cookies': [],
+                                    'storage_state': {}
+                                }
                             if not registration_fallback_attempted:
                                 registration_fallback_attempted = True
                                 recovered = await attempt_registration_then_login(
@@ -2874,6 +4208,8 @@ class BrowserLoginAiTool(ToolPlugin):
                                     username=username,
                                     password=password,
                                     login_instructions=login_instructions,
+                                    auto_register=auto_register,
+                                    registration_fields=registration_fields,
                                     page_load_strategy=page_load_strategy,
                                     timeout_ms=timeout_seconds * 1000,
                                     post_submit_wait_ms=post_submit_wait_ms,
@@ -2891,6 +4227,8 @@ class BrowserLoginAiTool(ToolPlugin):
                                     continue
                             return {
                                 'success': False,
+                                'status': 'FAILED',
+                                'session_valid': False,
                                 'error': f'Login error: {error_msg}',
                                 'cookies': [],
                                 'storage_state': {}
@@ -2906,6 +4244,8 @@ class BrowserLoginAiTool(ToolPlugin):
                             if login_test_mode:
                                 return {
                                     'success': False,
+                                    'status': 'FAILED',
+                                    'session_valid': False,
                                     'error': (
                                         f"AI could not confirm login success (status={status}) "
                                         "and no protectedResourceUrl was configured for validation."
@@ -2983,6 +4323,10 @@ class BrowserLoginAiTool(ToolPlugin):
                             )
                             if interactive_mfa:
                                 request_id = f"{job_id or 'local'}-mfa-{mfa_round}-number"
+                                browser_snapshot = await capture_operator_browser_snapshot(
+                                    page,
+                                    f"Number matching MFA round {mfa_round}",
+                                )
                                 await request_operator_input(
                                     agent,
                                     job_id,
@@ -3003,6 +4347,7 @@ class BrowserLoginAiTool(ToolPlugin):
                                     challenge_code=challenge_code,
                                     display_value=number_challenge.get("displayValue"),
                                     challenge_prompt=number_challenge.get("challengePrompt"),
+                                    browser_snapshot=browser_snapshot,
                                 )
                                 for elapsed in range(mfa_auto_fill_timeout):
                                     operator_response = await consume_operator_input(
@@ -3024,6 +4369,8 @@ class BrowserLoginAiTool(ToolPlugin):
                                 if not number_matching_approved:
                                     return {
                                         'success': False,
+                                        'status': 'FAILED',
+                                        'session_valid': False,
                                         'error': (
                                             f'Number matching MFA was not approved within '
                                             f'{mfa_auto_fill_timeout} seconds'
@@ -3039,6 +4386,10 @@ class BrowserLoginAiTool(ToolPlugin):
                             otp_filled = False
                             request_id = f"{job_id or 'local'}-mfa-{mfa_round}"
                             if interactive_mfa:
+                                browser_snapshot = await capture_operator_browser_snapshot(
+                                    page,
+                                    f"OTP MFA round {mfa_round}",
+                                )
                                 await request_operator_input(
                                     agent,
                                     job_id,
@@ -3053,6 +4404,7 @@ class BrowserLoginAiTool(ToolPlugin):
                                     current_target=page.url or login_url,
                                     expires_in_seconds=mfa_auto_fill_timeout,
                                     mfa_round=mfa_round,
+                                    browser_snapshot=browser_snapshot,
                                 )
                             for elapsed in range(mfa_auto_fill_timeout):
                                 if interactive_mfa and elapsed % 2 == 0:
@@ -3113,6 +4465,10 @@ class BrowserLoginAiTool(ToolPlugin):
                             print("[AI Login]   No OTP code field (method selection, WebAuthn, or push confirmation page)")
                             if interactive_mfa:
                                 request_id = f"{job_id or 'local'}-mfa-{mfa_round}-action"
+                                browser_snapshot = await capture_operator_browser_snapshot(
+                                    page,
+                                    f"Push/WebAuthn MFA round {mfa_round}",
+                                )
                                 await request_operator_input(
                                     agent,
                                     job_id,
@@ -3127,6 +4483,7 @@ class BrowserLoginAiTool(ToolPlugin):
                                     current_target=page.url or login_url,
                                     expires_in_seconds=mfa_auto_fill_timeout,
                                     mfa_round=mfa_round,
+                                    browser_snapshot=browser_snapshot,
                                 )
                                 for elapsed in range(mfa_auto_fill_timeout):
                                     operator_response = await consume_operator_input(
@@ -3245,56 +4602,30 @@ class BrowserLoginAiTool(ToolPlugin):
                         print(f"[AI Login]   MFA round {mfa_round} submitted, re-analyzing...")
                         step_num += 1
 
-                    protected_validation = await validate_protected_resource_session(
-                        page,
-                        protected_resource_url,
-                        login_url=login_url,
-                        page_load_strategy=page_load_strategy,
-                        timeout_ms=max(post_submit_load_timeout_ms, 10000),
-                        settle_ms=max(initial_render_wait_ms, 1000),
-                        agent=agent,
-                    )
-                    if parameters.get('protectedResourceUrlNote'):
-                        protected_validation['protected_resource_url_note'] = parameters.get('protectedResourceUrlNote')
-                        protected_validation['original_protected_resource_url'] = parameters.get('originalProtectedResourceUrl')
-                    if not protected_validation.get("valid"):
-                        error = protected_validation.get("reason") or "protected resource validation failed"
-                        print(f"[AI Login] Protected resource validation FAILED: {error}")
-                        return {
-                            'success': False,
-                            'error': error,
-                            'protected_resource_validation': protected_validation,
-                            'cookies': [],
-                            'storage_state': {}
-                        }
-
-                    # Extract cookies and storage state
-                    execution_time = time.time() - start_time
-                    cookies = await context.cookies()
-                    storage_state = await context.storage_state()
-                    await save_debug_screenshot(page, step_num + 1, "final_state", debug_screenshots)
-
-                    print(f"[AI Login] Login completed in {execution_time:.1f}s with {actions_count} AI actions")
-                    print(f"[AI Login] Cookies extracted: {len(cookies)}")
-                    print(f"[AI Login] Cookie names: {[c['name'] for c in cookies]}")
-
-                    return {
-                        'success': True,
-                        'cookies': cookies,
-                        'storage_state': storage_state,
-                        'execution_time': execution_time,
-                        'actions_count': actions_count,
-                        'protected_resource_validation': protected_validation,
-                    }
+                    return await finalize_success("login_completed", step_num + 1)
 
                 finally:
-                    await browser.close()
+                    # #519/#571 — bound + shield cleanup: when the overall budget
+                    # cancels this coroutine, a wedged browser.close() must neither
+                    # re-wedge the cancellation nor be abandoned mid-close. Persist
+                    # profile-partitioned CDP state before closing the context we
+                    # created for trusted SSO capture.
+                    if context and owns_context:
+                        try:
+                            await persist_partitioned_browser_state(context)
+                            await asyncio.wait_for(context.close(), timeout=10)
+                        except Exception:
+                            pass
+                    if browser and owns_browser:
+                        await close_browser_safe(browser, timeout=10)
 
         except Exception as e:
             import traceback
             error_details = f"{str(e)}\n{traceback.format_exc()}"
             return {
                 'success': False,
+                'status': 'FAILED',
+                'session_valid': False,
                 'error': error_details,
                 'cookies': [],
                 'storage_state': {}

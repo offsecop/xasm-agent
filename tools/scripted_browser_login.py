@@ -176,7 +176,7 @@ class ScriptedBrowserLoginTool(ToolPlugin):
             # Launch Playwright browser
             with sync_playwright() as p:
                 print(f"[Scripted Login] Launching browser (headless={headless})")
-                browser = p.chromium.launch(headless=headless)
+                browser = p.chromium.launch(headless=headless, args=['--no-sandbox', '--disable-dev-shm-usage'])
                 context = browser.new_context()
                 page = context.new_page()
 
@@ -271,7 +271,12 @@ class ScriptedBrowserLoginTool(ToolPlugin):
                         'execution_time_seconds': time.time() - start_time,
                     }
                 finally:
-                    browser.close()
+                    # #571 — a wedged/failed close() must not mask the result or
+                    # leak the browser; the periodic reaper collects any remnant.
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
                     print(f"[Scripted Login] Browser closed")
 
         except Exception as e:

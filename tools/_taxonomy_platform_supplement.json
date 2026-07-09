@@ -1,0 +1,260 @@
+{
+  "_comment": "Platform-only tools that have NO agent/tools/*.py file (executed platform/engine-side) but must appear in the tool taxonomy (#559). The generator merges these into docs/tool-taxonomy.md and tool-taxonomy.generated.json. Keys mirror the backend ToolRegistryEntry taxonomy shape.",
+  "nessus:launch_scan": {
+    "displayName": "Nessus Scan",
+    "category": "recon-infra",
+    "description": "Tenable Nessus / Nessus Expert vulnerability scan launched and polled platform-side via the Nessus integration. Multi-purpose: infrastructure (network/host) vuln scanning and Web Application Scanning (WAS) depending on the chosen policy/template.",
+    "taxonomyDomain": "infra",
+    "taxonomyDomains": [
+      "infra",
+      "web"
+    ],
+    "lifecyclePhase": "scan",
+    "purposeCount": "multi",
+    "primaryPurpose": "infrastructure vulnerability scan (network/host)",
+    "secondaryPurposes": [
+      {
+        "mode": "infra",
+        "purpose": "network/host vulnerability scan (Basic Network Scan / Advanced policies)"
+      },
+      {
+        "mode": "was",
+        "purpose": "Web Application Scanning \u2014 crawl + active web vuln checks against an app target"
+      }
+    ]
+  },
+  "code:repo_search": {
+    "displayName": "Code Repo Search (ripgrep)",
+    "category": "code.search",
+    "description": "Code Repo Search (ripgrep) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:file_read": {
+    "displayName": "Code File Read",
+    "category": "code.read",
+    "description": "Code File Read \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:route_extract": {
+    "displayName": "Code Route Extract",
+    "category": "code.surface",
+    "description": "Code Route Extract \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:dependency_inventory": {
+    "displayName": "Code Dependency Inventory",
+    "category": "code.deps",
+    "description": "Code Dependency Inventory \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:git_log_inspect": {
+    "displayName": "Code Git Log Inspect",
+    "category": "code.history",
+    "description": "Code Git Log Inspect \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:state_machine_extract": {
+    "displayName": "Code State Machine Extract",
+    "category": "code.analysis",
+    "description": "Code State Machine Extract \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "assessment",
+    "purposeCount": "single",
+    "primaryPurpose": "code assessment",
+    "secondaryPurposes": []
+  },
+  "code:authz_decision_map": {
+    "displayName": "Code Authz Decision Map",
+    "category": "code.analysis",
+    "description": "Code Authz Decision Map \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "assessment",
+    "purposeCount": "single",
+    "primaryPurpose": "code assessment",
+    "secondaryPurposes": []
+  },
+  "code:concurrency_audit": {
+    "displayName": "Code Concurrency Audit",
+    "category": "code.analysis",
+    "description": "Code Concurrency Audit \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "assessment",
+    "purposeCount": "single",
+    "primaryPurpose": "code assessment",
+    "secondaryPurposes": []
+  },
+  "code:taint_sketch": {
+    "displayName": "Code Taint Sketch (LLM-mediated)",
+    "category": "code.taint",
+    "description": "Code Taint Sketch (LLM-mediated) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "assessment",
+    "purposeCount": "single",
+    "primaryPurpose": "code assessment",
+    "secondaryPurposes": []
+  },
+  "code:sink_scan": {
+    "displayName": "Code Sink Scan",
+    "category": "code.analysis",
+    "description": "Code Sink Scan \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "assessment",
+    "purposeCount": "single",
+    "primaryPurpose": "code assessment",
+    "secondaryPurposes": []
+  },
+  "code:route_to_urls": {
+    "displayName": "Code Route \u2192 URLs (DAST bridge)",
+    "category": "code.surface",
+    "description": "Code Route \u2192 URLs (DAST bridge) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:propose_dast_probes": {
+    "displayName": "Code \u2192 DAST Probe Proposals (operator-approval-gated)",
+    "category": "code.surface",
+    "description": "Code \u2192 DAST Probe Proposals (operator-approval-gated) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:apply_dast_confirmation": {
+    "displayName": "Apply DAST Confirmation Decisions (HYBRID elevation + FP dismissal)",
+    "category": "code.surface",
+    "description": "Apply DAST Confirmation Decisions (HYBRID elevation + FP dismissal) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:mutate_flow": {
+    "displayName": "Flow Mutator (BLT bridge \u2014 operator-approval-gated)",
+    "category": "code.surface",
+    "description": "Flow Mutator (BLT bridge \u2014 operator-approval-gated) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "code:semgrep_run": {
+    "displayName": "Code Semgrep Run (curated rulesets)",
+    "category": "code.secrets",
+    "description": "Code Semgrep Run (curated rulesets) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-passive",
+    "purposeCount": "single",
+    "primaryPurpose": "code passive recon",
+    "secondaryPurposes": []
+  },
+  "code:gitleaks_run": {
+    "displayName": "Code Gitleaks Run (secret scan)",
+    "category": "code.secrets",
+    "description": "Code Gitleaks Run (secret scan) \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-passive",
+    "purposeCount": "single",
+    "primaryPurpose": "code passive recon",
+    "secondaryPurposes": []
+  },
+  "code:symbol_xref": {
+    "displayName": "code:symbol_xref",
+    "category": "code.xref",
+    "description": "code:symbol_xref \u2014 code-assisted pentest transform (backend/MCP; no agent plugin).",
+    "taxonomyDomain": "code",
+    "taxonomyDomains": [
+      "code"
+    ],
+    "lifecyclePhase": "recon-active",
+    "purposeCount": "single",
+    "primaryPurpose": "code active recon",
+    "secondaryPurposes": []
+  },
+  "analysis:ai_advisor_assess": {
+    "displayName": "AI Advisor Assess",
+    "category": "analysis",
+    "description": "LLM-mediated advisor that assesses/triages findings (backend TRANSFORM; no agent plugin).",
+    "taxonomyDomain": "meta",
+    "taxonomyDomains": [
+      "meta"
+    ],
+    "lifecyclePhase": "assessment",
+    "purposeCount": "single",
+    "primaryPurpose": "AI-assisted finding assessment / triage",
+    "secondaryPurposes": []
+  }
+}

@@ -3,10 +3,10 @@ DNS Resolution tool
 Resolves FQDNs to IP addresses
 """
 
-import asyncio
 import ipaddress
 import json
 from plugin_interface import ToolPlugin
+from lib.dns_async import resolve_records
 from typing import Dict, Any
 from urllib.parse import urlparse
 
@@ -18,7 +18,7 @@ class DNSResolveTool(ToolPlugin):
 
     @property
     def description(self) -> str:
-        return "Resolves FQDN to IP addresses using dig"
+        return "Resolves FQDN to IP addresses"
 
     @property
     def schema(self) -> Dict[str, Any]:
@@ -130,47 +130,26 @@ class DNSResolveTool(ToolPlugin):
 
         for idx, target in enumerate(targets_list):
             try:
-                # Resolve A records (IPv4)
-                process = await asyncio.create_subprocess_exec(
-                    'dig', '+short', target,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                # Resolve A records (IPv4) — UDP with TCP fallback for
+                # TCP-only / UDP-blocked resolver environments (use-vc).
+                stdout_text, stderr_text, a_returncode = await self._dig_short(
+                    target, timeout=30
                 )
-
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(),
-                        timeout=30
-                    )
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+                if stderr_text == 'timeout' and not stdout_text.strip():
                     all_results.append({'target': target, 'ips': [], 'error': 'timeout'})
                     continue
 
-                stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ''
-
-                # Resolve AAAA records (IPv6)
+                # Resolve AAAA records (IPv6) — best effort, same TCP fallback
                 aaaa_text = ''
                 try:
-                    aaaa_process = await asyncio.create_subprocess_exec(
-                        'dig', '+short', 'AAAA', target,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    aaaa_stdout, _ = await asyncio.wait_for(
-                        aaaa_process.communicate(),
-                        timeout=30
-                    )
-                    aaaa_text = aaaa_stdout.decode('utf-8', errors='replace') if aaaa_stdout else ''
-                except (asyncio.TimeoutError, Exception):
+                    aaaa_text, _, _ = await self._dig_short(target, 'AAAA', timeout=30)
+                except Exception:
                     pass
 
                 combined_text = stdout_text + '\n' + aaaa_text
                 all_raw.append(f"# {target}\n{combined_text}")
 
-                if process.returncode != 0:
-                    stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ''
+                if a_returncode != 0 and not stdout_text.strip():
                     all_results.append({'target': target, 'ips': [], 'error': stderr_text})
                     continue
 
@@ -201,20 +180,6 @@ class DNSResolveTool(ToolPlugin):
                         total_items=len(targets_list)
                     )
 
-            except FileNotFoundError:
-                return {
-                    'success': False,
-                    'error': 'dig command not found',
-                    'output': {
-                        'results': [],
-                        'ips': [],
-                        'targets': [],
-                        'total': 0,
-                        'tool': 'dig',
-                        'scan_type': 'dns_resolve'
-                    },
-                    'raw_output': ''
-                }
             except Exception as e:
                 all_results.append({'target': target, 'ips': [], 'error': str(e)})
 
@@ -290,6 +255,22 @@ class DNSResolveTool(ToolPlugin):
             return True
         except ValueError:
             return False
+
+    async def _dig_short(self, target, rrtype=None, timeout=30):
+        """Resolve a name in-process (dnspython) — NO ``dig`` subprocess.
+
+        Mirrors the prior ``dig +short`` contract, returning
+        ``(stdout_text, stderr_text, returncode)`` so callers are unchanged.
+        A non-existent name (NXDOMAIN) is an empty answer with rc 0 (not an
+        error); only a resolver failure (SERVFAIL/timeout) returns rc 1. The
+        shared resolver does the UDP-first/TCP-fallback for UDP-blocked hosts
+        (see ``lib.dns_async``). ``timeout`` is accepted for call-site
+        compatibility; the resolver enforces its own per-query lifetime.
+        """
+        records, status = await resolve_records(target, (rrtype or 'A'))
+        if status in ('NOERROR', 'NXDOMAIN'):
+            return '\n'.join(records), '', 0
+        return '', 'timeout', 1
 
 
 def get_tool():

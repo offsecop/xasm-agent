@@ -125,7 +125,9 @@ class TestQueryGithubQuota(unittest.IsolatedAsyncioTestCase):
             # Use simple patterns list; _extract_search_terms uses domain by default.
             results = await tool._query_github(session, 'example.com', patterns=[])
 
-        mock_checkout.assert_awaited_once_with('GITHUB_SEARCH', requested_units=1)
+        # #348 — checkout reserves the per-scan call ceiling (_GH_MAX_UNITS_PER_SCAN
+        # = 4 terms × (1 repo + 2 keyword + 4 qualifier) = 28), not a hardcoded 1.
+        mock_checkout.assert_awaited_once_with('GITHUB_SEARCH', requested_units=28)
         mock_reconcile.assert_awaited_once()
         rc = mock_reconcile.await_args
         self.assertEqual(rc.args[0], 'GITHUB_SEARCH')

@@ -134,6 +134,16 @@ class SqlmapDetectionScanTool(ToolPlugin):
                 # Apply exclusion filtering
                 if exclusion_url_patterns:
                     targets = filter_excluded_urls(targets, exclusion_url_patterns, "SQLMap Detection")
+                # Heavy scanner: cap the chained target count. --forms × --level=3 × payloads
+                # (incl. time-based, which sleeps) per URL is the dominant cost, so a crawler's
+                # full URL list (e.g. 21 URLs) blows past sqlmap's 15-minute scan timeout even
+                # with --crawl disabled (observed: katana(21)→sqlmap FAILED at 15m). Cap to a
+                # breadth-sane default; a focused deep scan uses single-target (-u) mode, which
+                # stays uncapped. Override via maxTargets.
+                max_targets = parameters.get("maxTargets", 5)
+                if len(targets) > max_targets:
+                    print(f"[SQLMap Detection] Capping {len(targets)} targets to maxTargets={max_targets} (avoid 15m scan timeout)")
+                    targets = targets[:max_targets]
                 target_count = len(targets)
                 target_file = f"{output_dir}/targets_{timestamp}.txt"
                 with open(target_file, 'w') as f:
@@ -193,7 +203,12 @@ class SqlmapDetectionScanTool(ToolPlugin):
             if parameters.get("testForms", True):
                 cmd.append("--forms")
             
-            crawl_depth = parameters.get("crawlDepth", 2)
+            # Multi-target (`-m` list) mode means the URLs were already discovered upstream
+            # (e.g. chained from a crawler). Re-crawling EACH of N URLs with --crawl makes
+            # sqlmap fan out to N×(crawl) requests and hit the scan timeout — observed:
+            # 21 chained URLs → the 15-minute cap, step FAILED. --crawl only makes sense for
+            # a single seed target (`-u`), so disable it in list mode regardless of the param.
+            crawl_depth = 0 if targets else parameters.get("crawlDepth", 2)
             if crawl_depth > 0:
                 cmd.append(f"--crawl={crawl_depth}")
             

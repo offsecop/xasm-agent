@@ -12,9 +12,11 @@ Output keys are stable and consumed by Phase 5c ingestion
 (`processScrapecreatorsRedditSearchOutput`). Do not rename without
 coordinating the backend handler.
 
-Auth + quota:
-  - `checkout_provider('SCRAPECREATORS', requested_units=1)` — SC bills 1
-    credit per call. Reconcile units=0 on cache hit, units=1 on miss.
+Auth + quota (#1143 — bounded pagination):
+  - ONE lease per PAGE via `lib/sc_paginated_search.paginated_sc_search`
+    (checkout → call → reconcile). SC bills 1 credit per call including error
+    responses; cache hits bill 0; a quota cap mid-run parks the sweep and
+    returns the pages already collected.
   - Stub mode is DISABLED at the production dispatch path (per the 2026-05-18
     "no fabricated data" directive). If a stub API key is leased, the tool
     refuses with `error: 'stub_mode_blocked'`.
@@ -34,17 +36,14 @@ _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent_dir not in sys.path:
     sys.path.append(_parent_dir)
 
-import aiohttp
-
 from plugin_interface import ToolPlugin
-from lib.integration_credentials import (
-    checkout_provider,
-    reconcile_call,
-    upstream_request,
-    QuotaExceededError,
-    IntegrationCredentialsError,
-)
 from lib.wrapper_helpers import first as _first
+from lib.search_recency import (
+    parse_search_knobs,
+    reddit_sort,
+    reddit_timeframe,
+)
+from lib.sc_paginated_search import paginated_sc_search
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +182,36 @@ class ScrapeCreatorsRedditSearchTool(ToolPlugin):
                 },
                 'cursor': {
                     'type': 'string',
-                    'description': 'Opaque pagination cursor from a prior response.',
+                    'description': (
+                        'Opaque pagination cursor from a prior response (the '
+                        "vendor's `after` post id). Seeds the pagination loop."
+                    ),
+                },
+                # #1143 — semantic recency/pagination knobs (mapped to the
+                # vendor's real params: sort/timeframe/after). Defensive:
+                # missing/garbage values degrade to single-page vendor defaults.
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Max posts to accumulate across pages (default 50, cap 200).',
+                },
+                'sort': {
+                    'type': 'string',
+                    'enum': ['new', 'relevance', 'top'],
+                    'description': 'Result ordering (vendor `sort`; omit = vendor default relevance).',
+                },
+                'window_days': {
+                    'type': 'integer',
+                    'description': (
+                        'Recency window in days — bucketed to the vendor '
+                        '`timeframe` enum (day/week/month/year/all).'
+                    ),
+                },
+                'max_pages': {
+                    'type': 'integer',
+                    'description': (
+                        'Bounded pagination depth for sitewide search (default 1, '
+                        'hard cap 5). Each page is one billed vendor call.'
+                    ),
                 },
                 'brand_monitor_id': {
                     'type': 'string',
@@ -207,6 +235,16 @@ class ScrapeCreatorsRedditSearchTool(ToolPlugin):
             'output_type': ['posts'],
             'chainable_after': [],
             'chainable_before': ['scrapecreators:reddit_thread_enrichment'],
+            # --- canonical taxonomy (#559) ---
+            'taxonomy_domain': ['brand-drp', 'osint'],
+            'lifecycle_phase': 'discovery',
+            'purpose_count': 'multi',
+            'primary_purpose': 'brand/DRP Reddit discovery via keyword and subreddit search',
+            'secondary_purposes': [
+                {'mode': 'sitewide', 'purpose': 'keyword search across all of Reddit'},
+                {'mode': 'subreddit', 'purpose': 'keyword search within a specific subreddit'},
+                {'mode': 'listing', 'purpose': 'latest posts in a subreddit (no keyword filter)'},
+            ],
         }
 
     def _empty_output(self, mode: str) -> Dict[str, Any]:
@@ -267,186 +305,102 @@ class ScrapeCreatorsRedditSearchTool(ToolPlugin):
 
         empty_out = self._empty_output(mode)
 
-        try:
-            lease = await checkout_provider(PROVIDER_KEY, requested_units=1)
-        except QuotaExceededError as qe:
+        # #1143 — semantic recency/pagination knobs (defensive parsing; garbage
+        # degrades to the pre-#1143 single-page vendor-default behavior).
+        knobs = parse_search_knobs(parameters)
+        limit = knobs['limit']
+        # Pagination is verified for the SITEWIDE endpoint only (`after`
+        # cursor); subreddit/listing stay single-call.
+        max_pages = knobs['max_pages'] if mode == _MODE_SITEWIDE else 1
+        sort = reddit_sort(knobs['sort']) if mode != _MODE_LISTING else None
+        timeframe = (
+            reddit_timeframe(knobs['window_days'])
+            if mode != _MODE_LISTING
+            else None
+        )
+
+        # Build the per-mode endpoint + base params. Vendor param names
+        # verified 2026-07: sitewide pagination is `after` (the old `cursor`
+        # param was silently ignored upstream — pagination never advanced).
+        if mode == _MODE_SITEWIDE:
+            path = '/v1/reddit/search'
+            base_params: Dict[str, Any] = {'query': query}
+            if sort:
+                base_params['sort'] = sort
+            if timeframe:
+                base_params['timeframe'] = timeframe
+            cursor_param: Optional[str] = 'after'
+        elif mode == _MODE_SUBREDDIT:
+            path = '/v1/reddit/subreddit/search'
+            base_params = {'subreddit': subreddit, 'query': query}
+            if sort:
+                base_params['sort'] = sort
+            if timeframe:
+                base_params['timeframe'] = timeframe
+            cursor_param = None  # pagination unverified for this endpoint
+            if cursor:
+                base_params['after'] = cursor
+        else:  # listing
+            path = '/v1/reddit/subreddit'
+            base_params = {'name': subreddit}
+            cursor_param = None
+
+        def _items(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+            return [p for p in (_build_post(rp) for rp in _extract_list(data)) if p]
+
+        res = await paginated_sc_search(
+            tool_name=self.name,
+            path=path,
+            base_params=base_params,
+            cache_namespace='reddit',
+            extract_items=_items,
+            cursor_param=cursor_param,
+            initial_cursor=cursor if cursor_param else None,
+            max_pages=max_pages,
+            limit=limit,
+            logger=logger,
+        )
+
+        if res['kind'] == 'quota_exceeded':
             return {
                 'success': False, 'error': 'quota_exceeded',
-                'retryAfter': qe.retry_after, 'providerKey': PROVIDER_KEY,
+                'retryAfter': res.get('retry_after'), 'providerKey': PROVIDER_KEY,
                 'output': empty_out,
             }
-        except IntegrationCredentialsError as ce:
-            logger.error("[%s] credentials error: %s", self.name, ce)
+        if res['kind'] == 'no_credentials':
             return {
                 'success': False, 'error': 'no_credentials',
-                'message': str(ce), 'providerKey': PROVIDER_KEY,
+                'message': res.get('message'), 'providerKey': PROVIDER_KEY,
                 'output': empty_out,
             }
-
-        api_key = lease.get('apiKey')
-        lease_token = lease.get('leaseToken')
-        if not api_key or not lease_token:
+        if res['kind'] == 'stub_mode_blocked':
+            return {
+                'success': False, 'error': 'stub_mode_blocked',
+                'message': res.get('message'), 'providerKey': PROVIDER_KEY,
+                'output': empty_out,
+            }
+        if res['kind'] == 'checkout_returned_empty':
             return {
                 'success': False, 'error': 'checkout_returned_empty',
                 'output': empty_out,
             }
 
-        base_url = lease.get('baseUrl') or BASE_URL
-        timeout_seconds = lease.get('timeoutSeconds') or DEFAULT_TIMEOUT
-        is_stub = api_key == STUB_API_KEY
-        tenant_id = lease.get('tenantId')
-        stale_grace = lease.get('staleGraceSeconds')
-        ns_ttls = lease.get('cacheNamespaceTtls') or {}
-        base_ttl = lease.get('cacheTtlSeconds')
-
-        success = False
-        error_code: Optional[str] = None
-        posts: List[Dict[str, Any]] = []
-        next_cursor: Optional[str] = None
-        has_more = False
-        sc_credits_remaining: Optional[int] = None
-        call_meta: Optional[Dict[str, Any]] = None
-
-        try:
-            if is_stub:
-                logger.error(
-                    "[%s] stub API key detected; refusing to synthesize fake "
-                    "Reddit search results.", self.name,
-                )
-                await reconcile_call(
-                    PROVIDER_KEY, lease_token,
-                    units=0, success=False,
-                    error_code='stub_mode_blocked',
-                    cache_hit=None, cache_stale=None,
-                )
-                return {
-                    'success': False, 'error': 'stub_mode_blocked',
-                    'message': (
-                        'SCRAPECREATORS integration is using a stub API key. '
-                        'Synthetic fixtures are disabled. Provision a real key.'
-                    ),
-                    'providerKey': PROVIDER_KEY,
-                    'output': empty_out,
-                }
-
-            # Build the per-mode endpoint + params.
-            if mode == _MODE_SITEWIDE:
-                path = '/v1/reddit/search'
-                params: Dict[str, Any] = {'query': query}
-                if cursor:
-                    params['cursor'] = cursor
-            elif mode == _MODE_SUBREDDIT:
-                path = '/v1/reddit/subreddit/search'
-                params = {'subreddit': subreddit, 'query': query}
-                if cursor:
-                    params['cursor'] = cursor
-            else:  # listing
-                path = '/v1/reddit/subreddit'
-                params = {'name': subreddit}
-
-            ns_ttl = ns_ttls.get('reddit', base_ttl)
-            headers = {'x-api-key': api_key}
-            timeout = aiohttp.ClientTimeout(total=timeout_seconds + 5)
-
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                resp, call_meta = await upstream_request(
-                    session, 'GET', f"{base_url}{path}",
-                    headers=headers, params=params,
-                    provider_label='scrapecreators',
-                    timeout_seconds=timeout_seconds,
-                    cache_namespace='reddit',
-                    cache_ttl_seconds=ns_ttl,
-                    stale_grace_seconds=stale_grace,
-                    tenant_id=tenant_id,
-                )
-                # `upstream_request` returns a real aiohttp response on miss or
-                # a CachedResponse on hit. Both expose `status` and `json()`.
-                status = getattr(resp, 'status', 0)
-                if status == 429:
-                    raise QuotaExceededError(
-                        provider_key=PROVIDER_KEY, retry_after=5,
-                        period_resets_at=None, cap=None, current_usage=None,
-                    )
-                if status >= 400:
-                    body = await resp.text() if hasattr(resp, 'text') else ''
-                    error_code = f'http_{status}'
-                    logger.warning(
-                        "[%s] upstream %s returned %d: %s",
-                        self.name, path, status, body[:200],
-                    )
-                    raise RuntimeError(f"upstream_{status}")
-
-                data = await resp.json()
-
-            raw_posts = _extract_list(data)
-            posts = [_build_post(p) for p in raw_posts]
-            posts = [p for p in posts if p]
-            sc_credits_remaining = _credits_remaining(data)
-            nc_raw = data.get('cursor') or data.get('next_cursor') or data.get('after')
-            next_cursor = str(nc_raw) if nc_raw else None
-            has_more = bool(data.get('has_more')) or bool(next_cursor)
-
-            success = True
-        except QuotaExceededError as qe:
-            error_code = 'quota_exceeded'
-            await reconcile_call(
-                PROVIDER_KEY, lease_token,
-                units=0, success=False, error_code=error_code,
-                cache_hit=None, cache_stale=None,
-            )
-            return {
-                'success': False, 'error': error_code,
-                'retryAfter': qe.retry_after, 'providerKey': PROVIDER_KEY,
-                'output': empty_out,
-            }
-        except Exception as e:
-            error_code = type(e).__name__
-            logger.warning(
-                "[%s] upstream call failed (mode=%s): %s",
-                self.name, mode, e,
-            )
-
-        # Reconcile (always runs; cache-hit -> units=0).
-        cache_hit = bool(call_meta and call_meta.get('cache_hit'))
-        cache_stale = bool(call_meta and call_meta.get('cache_stale'))
-        # ScrapeCreators bills per call INCLUDING error responses, so bill a
-        # unit whenever the call actually fired (call_meta set, not a cache hit)
-        # — not only on success. Under-billing failed-but-fired calls drifts the
-        # per-tenant quota ledger below real provider usage (provider-ban risk).
-        call_fired = call_meta is not None and not cache_hit
-        eff_units = 0 if cache_hit else (1 if call_fired else 0)
-        try:
-            await reconcile_call(
-                PROVIDER_KEY, lease_token,
-                units=eff_units, success=success,
-                error_code=error_code,
-                cache_hit=cache_hit, cache_stale=cache_stale,
-            )
-        except Exception as rec_err:
-            logger.warning(
-                "[%s] reconcile failed: %s", self.name, rec_err,
-            )
-
-        fetched_at = (call_meta or {}).get('fetched_at')
+        posts = res['items']
         out = {
             'items': posts,
             'total': len(posts),
             'mode': mode,
             'query': query,
             'subreddit': subreddit,
-            'next_cursor': next_cursor,
-            'has_more': has_more,
-            'sc_credits_remaining': sc_credits_remaining,
-            '_meta': {
-                'cacheHit': cache_hit,
-                'cacheStale': cache_stale,
-                **({'fetchedAt': fetched_at} if fetched_at else {}),
-            },
+            'next_cursor': res['next_cursor'],
+            'has_more': res['has_more'],
+            'sc_credits_remaining': res['credits_remaining'],
+            '_meta': res['meta'],
         }
-        if not success:
+        if res['kind'] != 'ok':
             return {
                 'success': False,
-                'error': error_code or 'unknown',
+                'error': res.get('error_code') or 'unknown',
                 'providerKey': PROVIDER_KEY,
                 'output': out,
             }

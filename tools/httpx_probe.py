@@ -9,7 +9,56 @@ import json
 import os
 import time
 from plugin_interface import ToolPlugin
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from urllib.parse import urlparse, urlunparse
+
+
+_DEFAULT_PORTS = {'http': '80', 'https': '443'}
+
+
+def _normalize_httpx_target(raw: Any) -> Optional[str]:
+    """Normalize a probe target so httpx reliably emits a result (#523).
+
+    httpx (v1.6.x) silently emits NOTHING for a scheme-qualified URL that lacks
+    an explicit port (e.g. `http://host`), while the same host as a bare name or
+    with an explicit port (`http://host:80`) probes fine. URL-style inputs from
+    upstream steps therefore produced empty `urls`/`targets` with success=true,
+    breaking downstream web chains. We add the scheme's default port to any
+    scheme-qualified URL missing one; bare hosts are left for httpx auto-probe.
+    """
+    t = str(raw or '').strip()
+    if not t:
+        return None
+    if '://' not in t:
+        return t  # bare host[:port] — httpx auto-probes the scheme
+    try:
+        p = urlparse(t)
+        if not p.scheme or not p.hostname:
+            return t
+        if p.port is None and p.scheme in _DEFAULT_PORTS:
+            userinfo = ''
+            if p.username:
+                userinfo = p.username + ((':' + p.password) if p.password else '') + '@'
+            netloc = f'{userinfo}{p.hostname}:{_DEFAULT_PORTS[p.scheme]}'
+            return urlunparse(p._replace(netloc=netloc))
+        return t
+    except ValueError:
+        return t
+
+
+def _strip_default_port(url: str) -> str:
+    """Drop a scheme-default port from an emitted URL so URL-input and host-input
+    chains produce identical, clean downstream targets (#523)."""
+    try:
+        p = urlparse(url)
+        if p.port is not None and str(p.port) == _DEFAULT_PORTS.get(p.scheme):
+            netloc = p.hostname or ''
+            if p.username:
+                netloc = p.username + ((':' + p.password) if p.password else '') + '@' + netloc
+            return urlunparse(p._replace(netloc=netloc))
+        return url
+    except ValueError:
+        return url
 
 
 class HttpxProbeTool(ToolPlugin):
@@ -93,6 +142,17 @@ class HttpxProbeTool(ToolPlugin):
                     'tool': 'httpx',
                     'scan_type': 'probe'
                 },
+                'raw_output': ''
+            }
+
+        # #523 — normalize targets so URL-style inputs probe as reliably as bare
+        # hosts (httpx silently drops scheme-qualified URLs that lack a port).
+        targets_list = [n for n in (_normalize_httpx_target(t) for t in targets_list) if n]
+        if not targets_list:
+            return {
+                'success': False,
+                'error': 'No valid targets after normalization',
+                'output': {'results': [], 'urls': [], 'targets': [], 'total': 0, 'tool': 'httpx', 'scan_type': 'probe'},
                 'raw_output': ''
             }
 
@@ -262,19 +322,33 @@ class HttpxProbeTool(ToolPlugin):
                 lines = raw_output.split('\n')
                 raw_output = '\n'.join(lines[:1000]) + f"\n... (truncated, total {len(lines)} lines)"
 
-            # Build urls array for easy workflow chaining (downstream tools expect 'urls' or 'targets')
-            urls = [r['url'] for r in results if r.get('url')]
+            # Build urls array for easy workflow chaining (downstream tools expect 'urls' or 'targets').
+            # #523 — strip scheme-default ports so URL-input and host-input chains
+            # emit identical, clean downstream targets.
+            urls = [_strip_default_port(r['url']) for r in results if r.get('url')]
+
+            output_payload = {
+                'results': results,
+                'urls': urls,  # Flat URL array for workflow chaining (katana, nuclei, dalfox, etc.)
+                'targets': urls,  # Alias for tools that expect 'targets'
+                'total': len(results),
+                'tool': 'httpx',
+                'scan_type': 'probe'
+            }
+            # #523 — never return an empty result set as a silent success: make
+            # "0 of N targets responded" visible so downstream skips are explained
+            # rather than masked behind a green step.
+            if not urls and targets_list:
+                output_payload['warning'] = (
+                    f"httpx probed {len(targets_list)} target(s) but none returned a live HTTP "
+                    f"response — downstream URL/target chaining will be empty. Verify the target is "
+                    f"reachable and serving HTTP on the probed scheme/port."
+                )
+                print(f"[httpx] {output_payload['warning']}")
 
             return {
                 'success': True,
-                'output': {
-                    'results': results,
-                    'urls': urls,  # Flat URL array for workflow chaining (katana, nuclei, dalfox, etc.)
-                    'targets': urls,  # Alias for tools that expect 'targets'
-                    'total': len(results),
-                    'tool': 'httpx',
-                    'scan_type': 'probe'
-                },
+                'output': output_payload,
                 'raw_output': raw_output
             }
 

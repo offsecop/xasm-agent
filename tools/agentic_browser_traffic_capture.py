@@ -97,6 +97,7 @@ class BrowserTrafficCaptureTool(ToolPlugin):
 
         try:
             from playwright.async_api import async_playwright
+            from lib.process_reaper import close_browser_safe
         except Exception as exc:
             return await self._http_fallback(target, parameters, f"Playwright unavailable: {exc}")
 
@@ -213,17 +214,13 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                     })"""
                 )
                 await context.close()
-                await browser.close()
+                await close_browser_safe(browser)
 
             output = self._build_output(target, html_map, records, storage, agent)
             await self._enrich_with_site_metadata(output, target, parameters)
             return output
         except Exception as exc:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+            await close_browser_safe(browser)
             return await self._http_fallback(target, parameters, f"browser traffic capture failed: {exc}")
 
     async def _quiet_network(self, page: Any, timeout_seconds: int) -> None:

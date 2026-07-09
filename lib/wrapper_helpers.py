@@ -21,6 +21,69 @@ import re
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
+# G6 (#455) — UTS #39 confusables skeleton for display-name homoglyph detection.
+# Degrade gracefully if the vendored snapshot is somehow unavailable (the social
+# classifier must never hard-fail on an optional enrichment signal).
+try:  # pragma: no cover - import guard
+    from lib.confusables import skeleton as _skeleton, is_mixed_script as _is_mixed_script
+except Exception:  # pragma: no cover
+    _skeleton = None
+    _is_mixed_script = None
+
+
+# #875 — eTLD+1 registrable-domain extraction, mirroring the backend
+# `registrableDomain()` (brand-handle.ts). Used to compare a HikerAPI account's
+# declared profile website (`external_url`) against the monitor's ownedDomains.
+# Degrades to a last-two-labels split if the `tldextract` PSL snapshot is
+# unavailable, so the social classifier never hard-fails on this signal.
+try:  # pragma: no cover - import guard
+    import tldextract as _tldextract  # type: ignore
+
+    _TLD_EXTRACT = _tldextract.TLDExtract(suffix_list_urls=())
+except Exception:  # pragma: no cover
+    _TLD_EXTRACT = None
+
+
+def registrable_domain(value: Any) -> str:
+    """Return the eTLD+1 registrable domain of a URL / host, or '' if none.
+
+    Tolerant of a scheme, path, query, port, trailing dot, and surrounding
+    whitespace — the raw HikerAPI `external_url` is passed through verbatim. A
+    bare label with no dot (e.g. 'localhost') returns '' (not a registrable
+    domain) so it can never spuriously match an owned domain.
+    """
+    if not isinstance(value, str):
+        return ''
+    s = value.strip().lower()
+    if not s:
+        return ''
+    s = re.sub(r'^[a-z]+://', '', s)
+    s = s.split('/')[0].split('?')[0].split('#')[0]
+    s = s.split(':')[0]  # strip a :port
+    s = s.rstrip('.')
+    if not s or '.' not in s:
+        return ''
+    if _TLD_EXTRACT is not None:
+        try:
+            ext = _TLD_EXTRACT(s)
+            # A known public suffix (`brand.co.uk` → domain='brand', suffix='co.uk').
+            if ext.domain and ext.suffix:
+                return f'{ext.domain}.{ext.suffix}'
+            # No public suffix resolved (an unlisted/reserved TLD, depending on
+            # the tldextract snapshot version): fall through to the last-two-labels
+            # heuristic — which matches the backend `tldts` behavior of treating an
+            # unlisted TLD as a single-label registrable suffix (`brand.test`).
+        except Exception:  # pragma: no cover
+            pass
+    # Fallback: last two dotted labels. Correct for single-label suffixes (the
+    # `.test` fixture case, and any unlisted TLD tldts also collapses this way);
+    # imperfect only for a genuine multi-part TLD that tldextract failed to
+    # resolve, which the PSL-backed path above already handles.
+    labels = [p for p in s.split('.') if p]
+    if len(labels) < 2:
+        return ''
+    return '.'.join(labels[-2:])
+
 
 def first(d: Dict[str, Any], *keys: str) -> Any:
     """Return the first non-None value among `d[keys[0]]`, `d[keys[1]]`, ...
@@ -71,6 +134,11 @@ def build_account(raw: Dict[str, Any]) -> Dict[str, Any]:
         'handle': username,
         'display_name': first(inner, 'full_name', 'name') or '',
         'profile_url': profile_url,
+        # #875 — the account's declared profile website. The one deterministic
+        # ownership signal a legitimate chapter/affiliate account carries; the
+        # backend compares its registrable domain against the monitor's
+        # ownedDomains. Absent-safe: '' when the vendor omits it.
+        'external_url': first(inner, 'external_url', 'website') or '',
         'profile_pic_url': first(inner, 'profile_pic_url', 'profile_pic_url_hd') or '',
         'follower_count': follower_count,
         'biography': biography,
@@ -88,6 +156,114 @@ B_LEGIT = 'legit'
 B_BRAND_ADJ = 'brand_adjacent'
 B_IMPERSONATOR = 'impersonator'
 B_SQUAT = 'squat_candidate'
+
+
+# G6 (#455) — per-platform handle-constraint rules. Generation runs against the
+# broadest charset (IG/TikTok: a-z 0-9 . _); each platform then FILTERS +
+# REMAPS so we don't waste paid vendor calls on candidates that platform can't
+# even host, and so an IG `your.brand` impostor is searched as the correct
+# cross-platform variant (`your_brand` on X, `yourbrand` on LinkedIn).
+# Sources: help.x.com/en/managing-your-account/x-username-rules, platform docs.
+_ALNUM = set('abcdefghijklmnopqrstuvwxyz0123456789')
+PLATFORM_HANDLE_RULES: Dict[str, Dict[str, Any]] = {
+    # IG/TikTok: letters, digits, period, underscore.
+    'instagram': {'allowed': _ALNUM | {'.', '_'}, 'min_len': 1, 'max_len': 30},
+    'tiktok': {'allowed': _ALNUM | {'.', '_'}, 'min_len': 2, 'max_len': 24},
+    # X: letters, digits, underscore only; max 15; no '.'/'-'.
+    'x': {'allowed': _ALNUM | {'_'}, 'min_len': 1, 'max_len': 15},
+    'twitter': {'allowed': _ALNUM | {'_'}, 'min_len': 1, 'max_len': 15},
+    # Telegram: letters, digits, underscore; must start with a letter, end
+    # alphanumeric; min 5.
+    'telegram': {'allowed': _ALNUM | {'_'}, 'min_len': 5, 'max_len': 32,
+                 'start_alpha': True, 'end_alnum': True},
+    # LinkedIn vanity: lowercase alphanumeric only (no separators).
+    'linkedin': {'allowed': _ALNUM, 'min_len': 3, 'max_len': 100},
+    # Facebook: letters, digits, period; min 5.
+    'facebook': {'allowed': _ALNUM | {'.'}, 'min_len': 5, 'max_len': 50},
+}
+
+# Separator each platform tolerates when remapping a handle from another platform
+# (the char a stripped '.'/'-' collapses to). None => strip the separator.
+_PLATFORM_REMAP_SEP: Dict[str, Optional[str]] = {
+    'instagram': '_', 'tiktok': '_', 'x': '_', 'twitter': '_',
+    'telegram': '_', 'linkedin': None, 'facebook': '.',
+}
+
+
+def is_valid_handle_for_platform(handle: str, platform: str) -> bool:
+    """True iff `handle` satisfies `platform`'s username constraints."""
+    rule = PLATFORM_HANDLE_RULES.get((platform or '').lower())
+    if not rule or not handle:
+        return False
+    h = handle.lower()
+    if not (rule['min_len'] <= len(h) <= rule['max_len']):
+        return False
+    if any(c not in rule['allowed'] for c in h):
+        return False
+    if rule.get('start_alpha') and not h[0].isalpha():
+        return False
+    if rule.get('end_alnum') and not h[-1].isalnum():
+        return False
+    return True
+
+
+def remap_handle(handle: str, to_platform: str) -> str:
+    """Remap a handle's separators to a target platform's allowed form.
+
+    An IG `your.brand` becomes `your_brand` on X/Telegram (no '.') and
+    `yourbrand` on LinkedIn (no separators). Non-separator characters are left
+    untouched; the result is NOT guaranteed valid (caller filters).
+    """
+    if not handle:
+        return ''
+    sep = _PLATFORM_REMAP_SEP.get((to_platform or '').lower(), '_')
+    replacement = sep if sep is not None else ''
+    return _HANDLE_SEP_RE.sub(replacement, handle.lower()).strip('._-')
+
+
+def filter_handles_for_platform(handles: List[str], platform: str) -> List[str]:
+    """Remap each handle to `platform` then keep only the platform-valid ones.
+
+    Order-preserving + deduped. The cross-platform remap means a candidate that
+    was valid on the generation platform still yields its correct variant here.
+    """
+    out: List[str] = []
+    seen: set = set()
+    for h in handles:
+        remapped = remap_handle(h, platform)
+        if remapped and remapped not in seen and is_valid_handle_for_platform(remapped, platform):
+            seen.add(remapped)
+            out.append(remapped)
+    return out
+
+
+def _is_confusable_display(
+    display_name: str, handle: str, subject: str, subject_handle: str
+) -> bool:
+    """True iff the display name or handle is a UTS #39 homoglyph of the brand.
+
+    A mixed-script string whose skeleton collapses to the brand's (e.g. display
+    name `Quеstrade` with a Cyrillic `е`) is a strong impersonation signal that
+    raw string-similarity misses — handles are forced ASCII on most platforms,
+    but display names are not. Requires the candidate to be mixed-script (so a
+    plain-ASCII near-match is left to the similarity path) and NOT literally
+    equal to the brand.
+    """
+    if _skeleton is None or _is_mixed_script is None:
+        return False
+    targets = [t for t in (subject, subject_handle) if t]
+    if not targets:
+        return False
+    target_skeletons = {_skeleton(t.lower()) for t in targets}
+    for cand in (display_name, handle):
+        if not cand or not _is_mixed_script(cand):
+            continue
+        cl = cand.lower()
+        if cl in (t.lower() for t in targets):
+            continue  # identical text is not a homoglyph
+        if _skeleton(cl) in target_skeletons:
+            return True
+    return False
 
 
 # Social-handle separators. Generalizes the typosquat SLD tokenizer
@@ -163,6 +339,7 @@ def classify_account(
     *,
     is_brand: bool,
     benign_tokens: Optional[List[str]] = None,
+    owned_domains: Optional[List[str]] = None,
 ) -> Tuple[str, str, float]:
     """3-bucket classifier from the Phase 4 SMM playbook §5. Order matters.
 
@@ -198,12 +375,45 @@ def classify_account(
     handle_tokens = _tokenize_handle(handle_lower)
     subj_handle_in_handle = bool(subj_lower) and subj_lower in handle_tokens
 
+    # #875 — deterministic ownership gate (highest precedence). An account whose
+    # declared profile website (`external_url`) resolves to one of the monitor's
+    # own registrable domains is an own/affiliate account, not an impersonator —
+    # bucket LEGIT so the agent-side verdict agrees with the backend's
+    # `profile_links_owned_domain` override. Mirrors the ad path (#687). The
+    # backend re-derives this from the carried `external_url`; classifying it
+    # here keeps the two verdicts in sync.
+    owned_set = {
+        registrable_domain(d)
+        for d in (owned_domains or [])
+        if isinstance(d, str) and registrable_domain(d)
+    }
+    if owned_set:
+        acct_reg = registrable_domain(acct.get('external_url'))
+        if acct_reg and acct_reg in owned_set:
+            return (
+                B_LEGIT,
+                f'profile website ({acct_reg}) is an owned domain — own/affiliate account',
+                sim,
+            )
+
     if is_verified:
         return (B_LEGIT, 'verified account (is_verified=true)', sim)
     if handle_lower == subj_lower:
         return (B_LEGIT, 'exact handle match (and unverified — likely canonical)', sim)
     if is_brand and subj_handle_in_handle and follower > 1000:
         return (B_LEGIT, 'brand stem in handle + significant follower count', sim)
+
+    # G6 (#455) — display-name / handle homoglyph (UTS #39). A mixed-script
+    # rendering whose skeleton collapses to the brand (e.g. display `Quеstrade`
+    # with a Cyrillic `е`) is a strong impersonation signal independent of raw
+    # string similarity. Checked AFTER the verified/exact LEGIT gates so a real
+    # verified account is never mislabelled.
+    if _is_confusable_display(display_lower, username, subject, subject_handle):
+        return (
+            B_IMPERSONATOR,
+            'display-name/handle homoglyph: UTS #39 skeleton matches the brand with mixed-script',
+            max(sim, 0.95),
+        )
 
     if is_brand:
         bio_contains = bool(bio and subject.lower() in bio.lower())
@@ -313,6 +523,7 @@ def resolve_targets(parameters: Dict[str, Any]) -> List[Any]:
 __all__ = [
     'first',
     'similarity',
+    'registrable_domain',
     'build_account',
     'classify_account',
     '_tokenize_handle',

@@ -22,8 +22,8 @@ KATANA_ADVANCED_SCHEMA: Dict[str, Any] = {
     },
     "jsCrawl": {
         "type": "boolean",
-        "description": "Parse and crawl JavaScript endpoints",
-        "default": True,
+        "description": "Parse and crawl JavaScript endpoints (headless/browser-driven; off by default — katana's bundled chrome fails in-container and yields 0 URLs, so standard HTTP crawling is the reliable default)",
+        "default": False,
     },
     "jsluice": {
         "type": "boolean",
@@ -112,7 +112,14 @@ def add_katana_options(
     if headless_enabled:
         cmd.extend(["-hl", "-nos"])
 
-    if parameters.get("jsCrawl", True):
+    # jsCrawl (-jc) enables katana's headless/browser-driven JS crawling, which relies on
+    # katana's bundled chrome. That chrome fails to launch inside the agent container, so
+    # -jc silently yields ZERO URLs (empty output, success=true) — starving every downstream
+    # DAST step. Standard HTTP crawling (no -jc) works reliably (it discovered 40 URLs on the
+    # real target where -jc found 0). Default to standard crawling; only opt into -jc when a
+    # caller explicitly sets jsCrawl=true AND has a working browser. (Root cause of the
+    # tester's "found nothing" alongside the step-wiring bug.)
+    if parameters.get("jsCrawl", False):
         cmd.append("-jc")
 
     if parameters.get("jsluice", False):

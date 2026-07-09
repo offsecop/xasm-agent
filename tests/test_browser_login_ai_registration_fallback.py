@@ -11,6 +11,7 @@ for d in (AGENT_DIR, TOOLS_DIR):
 
 from tools.browser_login_ai import (  # noqa: E402
     build_registration_candidate_urls,
+    normalize_registration_fields,
     registration_fallback_allowed,
 )
 
@@ -24,6 +25,29 @@ class TestBrowserLoginAiRegistrationFallback(unittest.TestCase):
                 'If the account does not exist, navigate to registration and create a new account.'
             )
         )
+
+    def test_registration_respects_explicit_auto_register_flag(self):
+        self.assertTrue(registration_fallback_allowed(None, True))
+        self.assertFalse(registration_fallback_allowed(None, False))
+        self.assertFalse(
+            registration_fallback_allowed(
+                'If the account does not exist, create a new account.',
+                False,
+            )
+        )
+
+    def test_registration_fields_normalize_defaults(self):
+        fields = normalize_registration_fields(
+            {
+                'displayName': ' Test User ',
+            },
+            username='test@example.com',
+            password='Secret123!',
+        )
+
+        self.assertEqual(fields['displayName'], 'Test User')
+        self.assertEqual(fields['email'], 'test@example.com')
+        self.assertEqual(fields['confirmPassword'], 'Secret123!')
 
     def test_registration_candidates_stay_same_origin_and_deduplicate(self):
         urls = build_registration_candidate_urls(

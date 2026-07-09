@@ -15,11 +15,66 @@ Covers:
 """
 
 import asyncio
+import io
 import sys
 
 import pytest
 
-from tools.brand_fingerprint_identity import BrandFingerprintIdentityTool
+from tools.brand_fingerprint_identity import BrandFingerprintIdentityTool, _phash_image_bytes
+
+
+def _multi_content_ico(images):
+    """Assemble a real .ico container with DISTINCT content per frame (PNG-encoded
+    entries). Unlike PIL's single-source ICO save, this lets each frame differ so
+    frame-SELECTION is observable in the phash."""
+    import struct
+    pngs = []
+    for im in images:
+        b = io.BytesIO()
+        im.save(b, format='PNG')
+        pngs.append(b.getvalue())
+    n = len(pngs)
+    out = struct.pack('<HHH', 0, 1, n)  # ICONDIR
+    offset = 6 + 16 * n
+    entries = b''
+    for im, png in zip(images, pngs):
+        w, h = im.size
+        entries += struct.pack('<BBBBHHII', w % 256, h % 256, 0, 0, 1, 32, len(png), offset)
+        offset += len(png)
+    return out + entries + b''.join(pngs)
+
+
+def _img(size, fill, paste=None):
+    from PIL import Image
+    im = Image.new('RGBA', (size, size), fill)
+    if paste:
+        im.paste(paste, (0, 0, size // 2, size))  # half-and-half pattern
+    return im
+
+
+class TestFaviconIcoDeterminism:
+    """FAV-4 — a multi-resolution .ico must hash by the LARGEST frame
+    deterministically (PIL's default frame choice is version-dependent)."""
+
+    def test_largest_frame_selected_not_a_smaller_one(self):
+        small_black = _img(16, (0, 0, 0, 255))
+        large_pattern = _img(64, (255, 255, 255, 255), paste=(0, 0, 0, 255))
+        multi = _multi_content_ico([small_black, large_pattern])
+        # Selecting the largest (64x64 pattern) frame → matches a 64-only icon …
+        assert _phash_image_bytes(multi) == _phash_image_bytes(
+            _multi_content_ico([large_pattern])
+        )
+        # … and is NOT the small black frame's hash (the no-op would pick it).
+        assert _phash_image_bytes(multi) != _phash_image_bytes(
+            _multi_content_ico([small_black])
+        )
+
+    def test_byte_identical_ico_equal_hash(self):
+        b = _multi_content_ico([_img(16, (10, 20, 30, 255)), _img(64, (200, 30, 30, 255))])
+        assert _phash_image_bytes(b) == _phash_image_bytes(b)
+
+    def test_non_image_bytes_returns_none(self):
+        assert _phash_image_bytes(b'not-an-image') is None
 
 
 class FakeAgent:
