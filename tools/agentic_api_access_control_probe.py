@@ -2,9 +2,10 @@
 Read-only API access-control probes for agentic exploration.
 
 The tool consumes endpoints observed by browser:traffic_capture and performs
-bounded GET/HEAD comparisons: authenticated vs anonymous visibility and simple
-object-id mutations. It does not run write verbs unless the operator explicitly
-adds future support.
+bounded GET/HEAD comparisons: authenticated vs anonymous visibility, simple
+object-id mutations, and a private replay of identifiers observed in JSON into
+matching OpenAPI path templates. It does not run write verbs unless the operator
+explicitly enables the lab-only privilege-mutation phase.
 """
 
 import json
@@ -12,7 +13,7 @@ import re
 import time
 from http import HTTPStatus
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 
@@ -30,6 +31,14 @@ from tools._agentic_exploration_common import (
 
 
 SAFE_METHODS = {"GET", "HEAD"}
+PATH_PARAM_RE = re.compile(r"\{([^{}]+)\}")
+TRUNCATED_JSON_SCALAR_RE = re.compile(
+    r'"(?P<key>[A-Za-z0-9_.-]{1,80})"\s*:\s*'
+    r'(?P<value>"(?:\\.|[^"\\])*"|-?\d{1,128})(?=\s*[,}\]])'
+)
+OBSERVED_IDENTIFIER_REQUEST_BUDGET = 6
+OBSERVED_IDENTIFIER_VALUES_PER_FIELD = 4
+OBSERVED_IDENTIFIER_FIELD_LIMIT = 24
 ID_PARAM_NAMES = {
     "id",
     "uid",
@@ -39,6 +48,7 @@ ID_PARAM_NAMES = {
     "account",
     "accountid",
     "account_id",
+    "account_number",
     "order",
     "orderid",
     "order_id",
@@ -69,6 +79,20 @@ ID_PARAM_NAMES = {
     "reservation_id",
     "reference",
     "ref",
+}
+IDENTIFIER_NUMBER_PREFIXES = {
+    "account",
+    "bill",
+    "card",
+    "customer",
+    "invoice",
+    "merchant",
+    "order",
+    "payment",
+    "reference",
+    "reservation",
+    "transaction",
+    "user",
 }
 SENSITIVE_PATH_MARKERS = {
     "admin",
@@ -146,6 +170,45 @@ SENSITIVE_BODY_MARKERS = {
     "secret_key",
     "session_token",
     "transaction",
+}
+ANONYMOUS_CRITICAL_JSON_KEYS = {
+    "api_key",
+    "apikey",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "connection_string",
+    "credential",
+    "credentials",
+    "database_access",
+    "password",
+    "password_hash",
+    "private_key",
+    "secret",
+    "secret_access_key",
+    "secret_key",
+    "session_token",
+    "ssn",
+    "system_prompt",
+}
+ANONYMOUS_FINANCIAL_JSON_KEYS = {
+    "account_number",
+    "balance",
+    "card_number",
+    "credit_card",
+    "from_account",
+    "routing_number",
+    "to_account",
+    "transactions",
+}
+ANONYMOUS_IDENTITY_OR_PRIVILEGE_JSON_KEYS = {
+    "admin",
+    "email",
+    "is_admin",
+    "role",
+    "user",
+    "user_id",
+    "username",
+    "users",
 }
 COMMON_READONLY_API_PATHS = [
     "/api",
@@ -267,6 +330,11 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 "maxEndpoints": {"type": "integer", "default": 80},
                 "maxRequests": {"type": "integer", "default": 160},
                 "includeAnonymousComparison": {"type": "boolean", "default": True},
+                "includeAnonymousBaselineAssessment": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Promote high-confidence sensitive JSON returned without authentication.",
+                },
                 "includeIdMutation": {"type": "boolean", "default": True},
                 "includeDiscoveredReadOnly": {"type": "boolean", "default": True},
                 "cookie": {"type": "string"},
@@ -371,6 +439,19 @@ class ApiAccessControlProbeTool(ToolPlugin):
         findings: List[Dict[str, Any]] = []
         probes: List[Dict[str, Any]] = []
         request_count = 0
+        observed_identifiers: Dict[str, List[Dict[str, str]]] = {}
+        templated_endpoints = [
+            endpoint
+            for endpoint in endpoints
+            if endpoint.get("method") == "GET" and self._template_parameter_names(endpoint)
+        ]
+        replay_reserve = 0
+        if templated_endpoints and max_requests >= 4:
+            replay_reserve = min(
+                OBSERVED_IDENTIFIER_REQUEST_BUDGET,
+                max(2, max_requests // 5),
+            )
+        baseline_request_limit = max_requests - replay_reserve
 
         connector = aiohttp.TCPConnector(ssl=False)
         # DummyCookieJar: pin the operator-supplied auth cookie for the whole probe.
@@ -384,18 +465,29 @@ class ApiAccessControlProbeTool(ToolPlugin):
             cookie_jar=aiohttp.DummyCookieJar(),
         ) as session:
             for endpoint in endpoints:
-                if request_count >= max_requests:
+                if request_count >= baseline_request_limit:
                     break
                 url = endpoint["url"]
                 method = endpoint["method"]
                 auth_response = await self._fetch(session, method, url, auth_headers)
                 request_count += 1
                 probes.append(self._probe_record("baseline_auth" if has_auth_context else "baseline", endpoint, auth_response))
+                anonymous_observation = auth_response if not has_auth_context else None
 
-                if bool(parameters.get("includeAnonymousComparison", True)) and has_auth_context and request_count < max_requests:
+                if not has_auth_context and bool(parameters.get("includeAnonymousBaselineAssessment", True)):
+                    finding = self._anonymous_sensitive_baseline_finding(endpoint, auth_response, anonymous_headers)
+                    if finding:
+                        findings.append(finding)
+
+                if (
+                    bool(parameters.get("includeAnonymousComparison", True))
+                    and has_auth_context
+                    and request_count < baseline_request_limit
+                ):
                     anon_response = await self._fetch(session, method, url, anonymous_headers)
                     request_count += 1
                     probes.append(self._probe_record("anonymous_compare", endpoint, anon_response))
+                    anonymous_observation = anon_response
                     finding = self._anonymous_visibility_finding(
                         endpoint,
                         auth_response,
@@ -406,10 +498,17 @@ class ApiAccessControlProbeTool(ToolPlugin):
                     if finding:
                         findings.append(finding)
 
-                if bool(parameters.get("includeIdMutation", True)) and request_count < max_requests:
+                if anonymous_observation is not None:
+                    self._collect_observed_identifiers(
+                        observed_identifiers,
+                        anonymous_observation,
+                        endpoint,
+                    )
+
+                if bool(parameters.get("includeIdMutation", True)) and request_count < baseline_request_limit:
                     mutations = self._mutated_urls(url)
                     for mutated_url in mutations[:4]:
-                        if request_count >= max_requests:
+                        if request_count >= baseline_request_limit:
                             break
                         mutated_response = await self._fetch(session, method, mutated_url, auth_headers)
                         request_count += 1
@@ -421,6 +520,19 @@ class ApiAccessControlProbeTool(ToolPlugin):
 
                 if agent:
                     agent.report_progress("Running API access-control probes", url, request_count, max_requests)
+
+            replay_findings, replay_probes, replay_requests = await self._run_observed_identifier_replay(
+                session=session,
+                target=target,
+                endpoints=templated_endpoints,
+                observed_identifiers=observed_identifiers,
+                anonymous_headers=anonymous_headers,
+                request_budget=min(replay_reserve, max_requests - request_count),
+                agent=agent,
+            )
+            findings.extend(replay_findings)
+            probes.extend(replay_probes)
+            request_count += replay_requests
 
             if privilege_phase_enabled:
                 mutation_findings = await self._run_privilege_mutation_phase(
@@ -448,6 +560,8 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 "findingTypes": self._finding_type_counts(findings),
                 "authContextDetected": has_auth_context,
                 "privilegeMutationRan": privilege_phase_enabled,
+                "observedIdentifierFields": sorted(observed_identifiers.keys()),
+                "observedIdentifierRequests": replay_requests,
             },
         }
 
@@ -500,18 +614,18 @@ class ApiAccessControlProbeTool(ToolPlugin):
 
         deduped: List[Dict[str, str]] = []
         seen = set()
-        for endpoint in endpoints:
+        for endpoint in sorted(endpoints, key=self._endpoint_sort_key, reverse=True):
             key = f"{endpoint['method']} {endpoint['path']}"
             if key in seen:
                 continue
             seen.add(key)
             deduped.append(endpoint)
-        return sorted(deduped, key=self._endpoint_priority, reverse=True)
+        return sorted(deduped, key=self._endpoint_sort_key, reverse=True)
 
     def _dedupe_endpoints(self, endpoints: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
         output: List[Dict[str, str]] = []
         seen = set()
-        for endpoint in sorted(endpoints, key=self._endpoint_priority, reverse=True):
+        for endpoint in sorted(endpoints, key=self._endpoint_sort_key, reverse=True):
             key = f"{endpoint.get('method', 'GET')} {endpoint.get('path') or self._path_shape(endpoint.get('url', ''))}"
             if key in seen:
                 continue
@@ -593,14 +707,18 @@ class ApiAccessControlProbeTool(ToolPlugin):
         except Exception:
             pass
 
-        endpoints = [
+        generic_endpoints = [
             {"method": "GET", "url": normalize_url(url), "path": self._path_shape(normalize_url(url))}
             for url in urls
         ]
-        endpoints.extend(spec_endpoints)
+        # Prefer the OpenAPI-rich record when the same concrete URL was also
+        # collected as a generic URL. Its originalPath is required for a safe,
+        # name-matched identifier replay.
+        endpoints = list(spec_endpoints)
+        endpoints.extend(generic_endpoints)
         output: List[Dict[str, str]] = []
         seen = set()
-        for endpoint in sorted(endpoints, key=self._endpoint_priority, reverse=True):
+        for endpoint in sorted(endpoints, key=self._endpoint_sort_key, reverse=True):
             if not same_origin(target, endpoint["url"]):
                 continue
             key = endpoint["path"]
@@ -611,6 +729,327 @@ class ApiAccessControlProbeTool(ToolPlugin):
             if len(output) >= max_endpoints:
                 break
         return output
+
+    def _collect_observed_identifiers(
+        self,
+        output: Dict[str, List[Dict[str, str]]],
+        response: Dict[str, Any],
+        endpoint: Dict[str, str],
+    ) -> None:
+        if not self._is_success(response):
+            return
+        # A value returned by the same path template after its OpenAPI sample
+        # was materialized (typically `1`) is not an independently observed
+        # identifier. Replaying it would only reinforce the synthetic seed and
+        # can crowd real identifiers from list/index responses out of the cap.
+        if self._template_parameter_names(endpoint):
+            return
+        source_path = urlparse(str(endpoint.get("url") or "")).path or "/"
+        total_values = sum(len(values) for values in output.values())
+        visited = 0
+
+        def add_identifier(field_name: str, value: Any) -> None:
+            nonlocal total_values
+            canonical = self._canonical_identifier_name(field_name)
+            identifier = self._safe_identifier_value(value)
+            if not canonical or not identifier or not self._is_identifier_name(canonical):
+                return
+            bucket = output.setdefault(canonical, [])
+            if any(item.get("value") == identifier for item in bucket):
+                return
+            if len(bucket) >= OBSERVED_IDENTIFIER_VALUES_PER_FIELD:
+                return
+            bucket.append({"value": identifier, "sourcePath": source_path})
+            total_values += 1
+
+        def walk(value: Any, field_name: str = "", depth: int = 0) -> None:
+            nonlocal total_values, visited
+            if depth > 8 or visited >= 300 or total_values >= OBSERVED_IDENTIFIER_FIELD_LIMIT:
+                return
+            visited += 1
+            if isinstance(value, dict):
+                for key, child in list(value.items())[:80]:
+                    walk(child, str(key), depth + 1)
+                return
+            if isinstance(value, list):
+                for child in value[:20]:
+                    walk(child, field_name, depth + 1)
+                return
+
+            add_identifier(field_name, value)
+
+        body = str(response.get("body") or "")
+        try:
+            walk(json.loads(body))
+            return
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        # _fetch deliberately caps bodies at 250 KB. A large JSON list can be
+        # cut mid-document, so parse only complete key/scalar pairs from the
+        # bounded prefix instead of raising the cap or accepting arbitrary text.
+        for match in TRUNCATED_JSON_SCALAR_RE.finditer(body):
+            if total_values >= OBSERVED_IDENTIFIER_FIELD_LIMIT:
+                break
+            raw_value = match.group("value")
+            try:
+                parsed_value = json.loads(raw_value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            add_identifier(match.group("key"), parsed_value)
+
+    async def _run_observed_identifier_replay(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        target: str,
+        endpoints: List[Dict[str, str]],
+        observed_identifiers: Dict[str, List[Dict[str, str]]],
+        anonymous_headers: Dict[str, str],
+        request_budget: int,
+        agent: Any,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+        findings: List[Dict[str, Any]] = []
+        probes: List[Dict[str, Any]] = []
+        requests_run = 0
+        if request_budget < 2 or not observed_identifiers:
+            return findings, probes, requests_run
+
+        for endpoint in endpoints:
+            if requests_run + 2 > request_budget:
+                break
+            candidates = self._observed_identifier_candidates(endpoint, observed_identifiers)
+            for candidate in candidates:
+                if requests_run + 2 > request_budget:
+                    break
+                observed_url = candidate["url"]
+                control_url = candidate["controlUrl"]
+                if not same_origin(target, observed_url) or not same_origin(target, control_url):
+                    continue
+
+                observed_response = await self._fetch(session, "GET", observed_url, anonymous_headers)
+                control_response = await self._fetch(session, "GET", control_url, anonymous_headers)
+                requests_run += 2
+
+                public_endpoint = {
+                    **endpoint,
+                    "method": "GET",
+                    "url": candidate["publicUrl"],
+                }
+                public_control = {
+                    **endpoint,
+                    "method": "GET",
+                    "url": candidate["publicControlUrl"],
+                }
+                observed_probe = self._probe_record(
+                    "observed_identifier_replay",
+                    public_endpoint,
+                    observed_response,
+                )
+                observed_probe["identifierFields"] = candidate["fields"]
+                observed_probe["sourcePaths"] = candidate["sourcePaths"]
+                if observed_probe.get("error"):
+                    observed_probe["error"] = self._redact_sensitive_values(
+                        str(observed_probe["error"]),
+                        candidate["values"],
+                    )
+                control_probe = self._probe_record(
+                    "observed_identifier_control",
+                    public_control,
+                    control_response,
+                )
+                control_probe["identifierFields"] = candidate["fields"]
+                probes.extend([observed_probe, control_probe])
+
+                finding = self._observed_identifier_finding(
+                    endpoint=public_endpoint,
+                    control_url=candidate["publicControlUrl"],
+                    observed_response=observed_response,
+                    control_response=control_response,
+                    anonymous_headers=anonymous_headers,
+                    identifier_fields=candidate["fields"],
+                    identifier_values=candidate["values"],
+                    source_paths=candidate["sourcePaths"],
+                )
+                if finding:
+                    findings.append(finding)
+
+                if agent:
+                    agent.report_progress(
+                        "Replaying observed API identifiers",
+                        candidate["publicUrl"],
+                        requests_run,
+                        request_budget,
+                    )
+
+        return findings, probes, requests_run
+
+    def _observed_identifier_candidates(
+        self,
+        endpoint: Dict[str, str],
+        observed_identifiers: Dict[str, List[Dict[str, str]]],
+    ) -> List[Dict[str, Any]]:
+        original_path = str(endpoint.get("originalPath") or "")
+        parameter_names = self._template_parameter_names(endpoint)
+        if not original_path or not parameter_names:
+            return []
+
+        value_sets: List[List[Dict[str, str]]] = []
+        canonical_names: List[str] = []
+        for name in parameter_names:
+            canonical = self._canonical_identifier_name(name)
+            values = observed_identifiers.get(canonical) or []
+            if not values:
+                return []
+            canonical_names.append(canonical)
+            value_sets.append(values)
+
+        candidates: List[Dict[str, Any]] = []
+        candidate_count = min(2, max(len(values) for values in value_sets))
+        endpoint_url = urlparse(str(endpoint.get("url") or ""))
+        origin = self._origin(str(endpoint.get("url") or ""))
+        if not origin:
+            return []
+
+        for index in range(candidate_count):
+            concrete_path = original_path
+            public_path = original_path
+            control_path = original_path
+            selected_values: List[str] = []
+            source_paths: List[str] = []
+            for raw_name, canonical, values in zip(parameter_names, canonical_names, value_sets):
+                selected = values[index % len(values)]
+                selected_value = selected["value"]
+                selected_values.append(selected_value)
+                source_paths.append(selected["sourcePath"])
+                token = "{" + raw_name + "}"
+                concrete_path = concrete_path.replace(token, quote(selected_value, safe="-._~"))
+                public_path = public_path.replace(token, f"redacted-{canonical}")
+                control_path = control_path.replace(token, "xasm-invalid-id")
+
+            observed_url = normalize_url(urljoin(origin + "/", concrete_path.lstrip("/")))
+            public_url = normalize_url(urljoin(origin + "/", public_path.lstrip("/")))
+            control_url = normalize_url(urljoin(origin + "/", control_path.lstrip("/")))
+            if endpoint_url.query:
+                observed_url = urlunparse(urlparse(observed_url)._replace(query=endpoint_url.query))
+                control_url = urlunparse(urlparse(control_url)._replace(query=endpoint_url.query))
+                public_query = urlencode(
+                    [
+                        (name, "redacted-value" if value else "")
+                        for name, value in parse_qsl(endpoint_url.query, keep_blank_values=True)
+                    ]
+                )
+                public_url = urlunparse(urlparse(public_url)._replace(query=public_query))
+                public_control_url = urlunparse(urlparse(control_url)._replace(query=public_query))
+            else:
+                public_control_url = control_url
+            if observed_url == str(endpoint.get("url") or ""):
+                continue
+            candidates.append(
+                {
+                    "url": observed_url,
+                    "publicUrl": public_url,
+                    "controlUrl": control_url,
+                    "publicControlUrl": public_control_url,
+                    "fields": canonical_names,
+                    "values": selected_values,
+                    "sourcePaths": dedupe_keep_order(source_paths, 8),
+                }
+            )
+        return candidates
+
+    def _observed_identifier_finding(
+        self,
+        *,
+        endpoint: Dict[str, str],
+        control_url: str,
+        observed_response: Dict[str, Any],
+        control_response: Dict[str, Any],
+        anonymous_headers: Dict[str, str],
+        identifier_fields: List[str],
+        identifier_values: List[str],
+        source_paths: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._is_success(observed_response) or observed_response.get("bodyLength", 0) < 20:
+            return None
+        if not self._sensitive_endpoint(endpoint["url"]) and not observed_response.get("sensitiveBodyMarkers"):
+            return None
+        control_similarity = self._shape_similarity(observed_response, control_response)
+        if self._is_success(control_response) and control_similarity >= 0.35:
+            return None
+
+        severity = "high" if observed_response.get("sensitiveBodyMarkers") else "medium"
+        return self._finding(
+            template_id="xasm-api-anonymous-observed-object-read",
+            name="Anonymous Object Read via Observed Identifier",
+            severity=severity,
+            matched_at=endpoint["url"],
+            description=(
+                "A read-only API path accepted an identifier learned from a separate anonymous JSON response "
+                "and returned sensitive object data, while an invalid control did not return an equivalent object."
+            ),
+            remediation=(
+                "Require object-level authorization on every resource lookup and avoid exposing reusable object "
+                "identifiers through anonymous discovery endpoints."
+            ),
+            matcher_name="anonymous-observed-identifier-control-diff",
+            extracted=[
+                f"identifier_fields={','.join(identifier_fields)}",
+                f"source_paths={','.join(source_paths)}",
+                f"observed_status={observed_response.get('status')}",
+                f"control_status={control_response.get('status')}",
+                f"control_shape_similarity={control_similarity:.2f}",
+                f"sensitive_markers={','.join(observed_response.get('sensitiveBodyMarkers') or [])}",
+            ],
+            evidence={
+                "request": self._format_http_request("GET", endpoint["url"], anonymous_headers),
+                "response": self._format_http_response(
+                    observed_response,
+                    identifier_fields=identifier_fields,
+                    identifier_values=identifier_values,
+                ),
+                "controlRequest": self._format_http_request("GET", control_url, anonymous_headers),
+                "controlResponse": self._format_http_response(control_response),
+                "observedIdentifierFields": identifier_fields,
+                "sourcePaths": source_paths,
+                "observedStatus": observed_response.get("status"),
+                "controlStatus": control_response.get("status"),
+                "controlShapeSimilarity": round(control_similarity, 3),
+                "evidenceNote": (
+                    "The identifier was retained only in agent memory. Public evidence preserves the route, "
+                    "status, and response shape with identifier values redacted."
+                ),
+            },
+        )
+
+    def _template_parameter_names(self, endpoint: Dict[str, str]) -> List[str]:
+        original_path = str(endpoint.get("originalPath") or "")
+        return dedupe_keep_order(PATH_PARAM_RE.findall(original_path), 8)
+
+    def _canonical_identifier_name(self, value: str) -> str:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or "").strip())
+        return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+    def _is_identifier_name(self, canonical: str) -> bool:
+        compact = canonical.replace("_", "")
+        known_compact = {name.replace("_", "") for name in ID_PARAM_NAMES}
+        if canonical in ID_PARAM_NAMES or compact in known_compact:
+            return True
+        if canonical.endswith(("_id", "_uid", "_uuid")):
+            return True
+        if canonical.endswith("_number"):
+            return canonical[: -len("_number")] in IDENTIFIER_NUMBER_PREFIXES
+        return False
+
+    def _safe_identifier_value(self, value: Any) -> Optional[str]:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return None
+        text = str(value).strip()
+        if not text or len(text) > 128 or text.lower() in {"none", "null", "undefined"}:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,127}", text):
+            return None
+        return text
 
     def _is_authorized_endpoint(self, target: str, endpoint: Dict[str, str]) -> bool:
         method = str(endpoint.get("method") or "GET").upper()
@@ -693,6 +1132,70 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 similarity,
                 sensitive_markers,
             ),
+        )
+
+    def _anonymous_sensitive_baseline_finding(
+        self,
+        endpoint: Dict[str, str],
+        response: Dict[str, Any],
+        anonymous_headers: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._is_success(response) or response.get("bodyLength", 0) < 20:
+            return None
+
+        json_keys = [str(key).lower() for key in response.get("jsonKeys") or []]
+        if not json_keys:
+            return None
+        key_parts = {
+            part
+            for key in json_keys
+            for part in re.split(r"[^a-z0-9_]+", key)
+            if part
+        }
+        critical = sorted(key_parts & ANONYMOUS_CRITICAL_JSON_KEYS)
+        financial = sorted(key_parts & ANONYMOUS_FINANCIAL_JSON_KEYS)
+        identity_or_privilege = sorted(key_parts & ANONYMOUS_IDENTITY_OR_PRIVILEGE_JSON_KEYS)
+        if not critical and not (financial and identity_or_privilege):
+            return None
+
+        matched_keys = dedupe_keep_order(critical + financial + identity_or_privilege, 20)
+        severity = "high" if critical else "medium"
+        method = endpoint.get("method") or "GET"
+        url = endpoint["url"]
+        redacted_response = self._format_http_response(response, redact_json_fields=matched_keys)
+        evidence = {
+            "request": self._format_http_request(method, url, anonymous_headers),
+            "response": redacted_response,
+            "anonymousRequest": self._format_http_request(method, url, anonymous_headers),
+            "anonymousResponse": redacted_response,
+            "anonymousStatus": response.get("status"),
+            "sensitiveJsonKeys": matched_keys,
+            "evidenceNote": (
+                "A request without authentication returned a successful JSON response containing "
+                "high-confidence sensitive field names. Values are redacted where required."
+            ),
+        }
+        return self._finding(
+            template_id="xasm-api-anonymous-sensitive-data-exposure",
+            name="Anonymous Sensitive API Data Exposure",
+            severity=severity,
+            matched_at=url,
+            description=(
+                "An unauthenticated API request returned a successful JSON response containing "
+                "credential, configuration, identity, privilege, or financial data fields."
+            ),
+            remediation=(
+                "Require authentication and object/function authorization before returning sensitive API data. "
+                "Return only the minimum fields required by authorized clients."
+            ),
+            matcher_name="anonymous-sensitive-json-baseline",
+            extracted=[
+                f"anonymous_status={response.get('status')}",
+                f"sensitive_json_keys={','.join(matched_keys)}",
+            ],
+            evidence=evidence,
+            tags=["agentic", "api", "exposure", "authorization"],
+            classification={"cwe-id": ["CWE-200", "CWE-862"], "owasp": ["API1:2023", "API3:2023"]},
         )
 
     def _idor_candidate_finding(
@@ -1174,6 +1677,14 @@ class ApiAccessControlProbeTool(ToolPlugin):
             score += 20
         return score
 
+    def _endpoint_sort_key(self, endpoint: Dict[str, str]) -> Tuple[int, int, int]:
+        original_path = str(endpoint.get("originalPath") or "")
+        return (
+            self._endpoint_priority(endpoint),
+            1 if PATH_PARAM_RE.search(original_path) else 0,
+            1 if str(endpoint.get("source") or "").lower() == "openapi" else 0,
+        )
+
     def _looks_api_path(self, url: str) -> bool:
         return bool(re.search(r"/(?:api|rest|graphql|v\d+|rpc)(?:/|$)", urlparse(str(url)).path, re.I))
 
@@ -1219,7 +1730,14 @@ class ApiAccessControlProbeTool(ToolPlugin):
         try:
             parsed = json.loads(body)
         except Exception:
-            return []
+            # Responses are intentionally bounded before analysis. Large JSON
+            # documents therefore arrive as a valid prefix but cannot be parsed
+            # as a complete document. Recover only structural key names from
+            # that prefix; never retain values in this fallback path.
+            return dedupe_keep_order(
+                re.findall(r'"((?:\\.|[^"\\]){1,120})"\s*:', body),
+                80,
+            )
         keys: List[str] = []
 
         def walk(value: Any, prefix: str = "") -> None:
@@ -1303,7 +1821,14 @@ class ApiAccessControlProbeTool(ToolPlugin):
             lines.append(f"{key}: {value}")
         return "\n".join(lines)
 
-    def _format_http_response(self, response: Dict[str, Any]) -> str:
+    def _format_http_response(
+        self,
+        response: Dict[str, Any],
+        redact_json_fields: Optional[Iterable[str]] = None,
+        *,
+        identifier_fields: Optional[List[str]] = None,
+        identifier_values: Optional[List[str]] = None,
+    ) -> str:
         status = int(response.get("status") or 0)
         reason = ""
         if status:
@@ -1314,13 +1839,57 @@ class ApiAccessControlProbeTool(ToolPlugin):
         lines = [f"HTTP/1.1 {status or 'N/A'}{f' {reason}' if reason else ''}"]
         headers = self._redact_headers(response.get("headers") or {})
         for key, value in list(headers.items())[:30]:
-            lines.append(f"{key}: {value}")
-        body = self._redact_body(str(response.get("body") or ""))
+            lines.append(f"{key}: {self._redact_sensitive_values(value, identifier_values or [])}")
+        body = str(response.get("body") or "")
+        if redact_json_fields:
+            body = self._redact_json_fields(body, redact_json_fields)
+        body = self._redact_identifier_body(
+            body,
+            identifier_fields or [],
+            identifier_values or [],
+        )
+        body = self._redact_body(body)
         if body:
             lines.extend(["", body])
         if response.get("error"):
             lines.extend(["", f"Error: {response.get('error')}"])
         return "\n".join(lines)
+
+    def _redact_json_fields(self, body: str, field_names: Iterable[str]) -> str:
+        fields = {
+            str(field).strip().lower()
+            for field in field_names
+            if str(field).strip()
+        }
+        if not body or not fields:
+            return body
+
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            # Large responses may be a bounded JSON prefix. Redact scalar field
+            # values in that prefix without attempting to repair or retain it.
+            alternation = "|".join(re.escape(field) for field in sorted(fields, key=len, reverse=True))
+            return re.sub(
+                rf'(?i)("(?:{alternation})"\s*:\s*)("(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?|true|false|null)',
+                r'\1"[REDACTED]"',
+                body,
+            )
+
+        def redact(value: Any) -> Any:
+            if isinstance(value, dict):
+                output: Dict[str, Any] = {}
+                for key, child in value.items():
+                    if str(key).lower() in fields and not isinstance(child, (dict, list)):
+                        output[key] = "[REDACTED]"
+                    else:
+                        output[key] = redact(child)
+                return output
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        return json.dumps(redact(parsed), ensure_ascii=False, separators=(",", ":"))
 
     def _redact_headers(self, headers: Dict[str, Any]) -> Dict[str, str]:
         sensitive = {
@@ -1339,13 +1908,55 @@ class ApiAccessControlProbeTool(ToolPlugin):
             redacted[str(key)] = "[REDACTED]" if str(key).lower() in sensitive else text[:500]
         return redacted
 
+    def _redact_identifier_body(
+        self,
+        body: str,
+        identifier_fields: List[str],
+        identifier_values: List[str],
+    ) -> str:
+        if not body or (not identifier_fields and not identifier_values):
+            return body
+        canonical_fields = {self._canonical_identifier_name(field) for field in identifier_fields}
+        sensitive_values = {str(value) for value in identifier_values if str(value)}
+
+        try:
+            document = json.loads(body)
+
+            def redact(value: Any, field_name: str = "") -> Any:
+                if isinstance(value, dict):
+                    return {key: redact(child, str(key)) for key, child in value.items()}
+                if isinstance(value, list):
+                    return [redact(child, field_name) for child in value]
+                canonical = self._canonical_identifier_name(field_name)
+                if canonical in canonical_fields or str(value) in sensitive_values:
+                    return "[REDACTED_ID]"
+                return value
+
+            body = json.dumps(redact(document), ensure_ascii=False)
+        except Exception:
+            pass
+
+        for value in sorted(sensitive_values, key=len, reverse=True):
+            body = self._redact_sensitive_values(body, [value])
+        return body
+
+    def _redact_sensitive_values(self, text: str, sensitive_values: List[str]) -> str:
+        output = str(text or "")
+        for value in sorted({str(value) for value in sensitive_values if str(value)}, key=len, reverse=True):
+            output = re.sub(
+                rf"(?<![A-Za-z0-9._~-]){re.escape(value)}(?![A-Za-z0-9._~-])",
+                "[REDACTED_ID]",
+                output,
+            )
+        return output
+
     def _redact_body(self, body: str, limit: int = 4000) -> str:
         if not body:
             return ""
         text = body.replace("\0", "")
         text = re.sub(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", "[REDACTED_JWT]", text)
         text = re.sub(
-            r"(?i)(\"?(?:password|passwd|pwd|token|access_token|refresh_token|api_?key|secret|ssn)\"?\s*[:=]\s*)(\"[^\"]*\"|[^,\s}\]]+)",
+            r"(?i)(\"?(?:password(?:_hash)?|passwd|pwd|token|access_token|refresh_token|api_?key|secret(?:_access_key|_key)?|session_token|aws_(?:access_key_id|secret_access_key)|credential(?:s)?|ssn|system_prompt|database_access|connection_string|private_key)\"?\s*[:=]\s*)(\"[^\"]*\"|[^,\s}\]]+)",
             r"\1[REDACTED]",
             text,
         )
@@ -1375,6 +1986,8 @@ class ApiAccessControlProbeTool(ToolPlugin):
         matcher_name: str,
         extracted: List[str],
         evidence: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        classification: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         finding = {
             "template-id": template_id,
@@ -1388,11 +2001,11 @@ class ApiAccessControlProbeTool(ToolPlugin):
             "info": {
                 "name": name,
                 "author": ["xasm-agentic"],
-                "tags": ["agentic", "api", "authorization", "idor"],
+                "tags": tags or ["agentic", "api", "authorization", "idor"],
                 "severity": severity,
                 "description": description,
                 "remediation": remediation,
-                "classification": {"cwe-id": ["CWE-862", "CWE-639"], "owasp": ["API1:2023", "API5:2023"]},
+                "classification": classification or {"cwe-id": ["CWE-862", "CWE-639"], "owasp": ["API1:2023", "API5:2023"]},
             },
             "severity": severity,
             "timestamp": int(time.time()),

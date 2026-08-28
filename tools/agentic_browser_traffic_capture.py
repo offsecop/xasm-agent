@@ -17,7 +17,9 @@ import aiohttp
 
 from plugin_interface import ToolPlugin
 from tools._agentic_exploration_common import (
+    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
     RISKY_CLICK_WORDS,
+    build_native_probe_form_contract,
     dedupe_keep_order,
     discover_site_metadata_urls,
     extract_html_map,
@@ -206,13 +208,26 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                       forms: Array.from(document.forms).map(f => ({
                         action: new URL(f.getAttribute('action') || location.href, location.href).href,
                         method: (f.getAttribute('method') || 'GET').toUpperCase(),
+                        contentType: (f.getAttribute('enctype') || 'application/x-www-form-urlencoded').toLowerCase(),
                         fields: Array.from(f.querySelectorAll('input, textarea, select')).map(i => ({
                           name: i.getAttribute('name') || i.id || '',
-                          type: (i.getAttribute('type') || i.tagName || 'text').toLowerCase()
+                          type: (i.getAttribute('type') || i.tagName || 'text').toLowerCase(),
+                          value: (!['checkbox', 'radio'].includes((i.getAttribute('type') || '').toLowerCase()) || i.checked)
+                            ? String(i.value || '').slice(0, 4096)
+                            : null,
+                          valueSource: i.tagName === 'SELECT' ? 'selected-option' : 'browser-default'
                         })).filter(i => i.name || ['password','email','search','file'].includes(i.type)),
                       })).slice(0, 100)
                     })"""
                 )
+                form_contract = build_native_probe_form_contract(
+                    html_map.get("forms", []),
+                    source="browser:traffic_capture",
+                )
+                html_map["forms"] = form_contract["forms"]
+                html_map[NATIVE_PROBE_PRIVATE_CANDIDATES_KEY] = form_contract[
+                    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY
+                ]
                 await context.close()
                 await close_browser_safe(browser)
 
@@ -329,6 +344,10 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             "siteMapUrls": site_map_urls,
             "parameterizedUrls": dedupe_keep_order(parameterized_urls, 300),
             "forms": mapped.get("forms", []),
+            NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: mapped.get(
+                NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
+                [],
+            ),
             "storage": {"localStorage": [], "sessionStorage": [], "cookieCount": 0, "cookieNames": []},
             "summary": {
                 "apiEndpoints": len(api_endpoints),
@@ -383,6 +402,10 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             "siteMapUrls": [],
             "parameterizedUrls": parameterized_urls,
             "forms": html_map.get("forms", []),
+            NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: html_map.get(
+                NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
+                [],
+            ),
             "storage": storage,
             "summary": {
                 "apiEndpoints": len(endpoints),

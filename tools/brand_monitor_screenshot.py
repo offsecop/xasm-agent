@@ -51,9 +51,45 @@ PARKING_HOSTS = frozenset({
     'dan.com',
     'parkingcrew.net',
     'bodis.com',
+    # #1464 — for-sale marketplaces observed serving lookalike landers that the
+    # original list missed (their kit-signature/cloaking noise drove false HIGHs).
+    'hugedomains.com',
+    'www.hugedomains.com',
+    'efty.com',
+    'trellian.com',
+    'above.com',
+    'sav.com',
 })
 PARKING_TITLE_RE = re.compile(
-    r'(domain (is )?for sale|parked free|this domain may be for sale|buy this domain)',
+    # #1464 — generalized beyond the literal "domain ... for sale" phrasing:
+    # HugeDomains/Efty-style titles read "<name>.com is for sale | HugeDomains".
+    # Title-only match (never body text), so "<anything> is/are for sale",
+    # "domain is available" and "make an offer" are safe parking tells.
+    r'(domain (is )?for sale|parked free|this domain may be for sale|buy this domain'
+    r'|\bis for sale\b|\bare for sale\b|domain (is )?available|make an offer'
+    # #1556 — aftermarket vendors GEO-LOCALIZE their landers (an observed
+    # GoDaddy lander titled "<name> está à venda"), so the English-only
+    # fingerprint missed non-English for-sale titles. Verb-anchored phrases
+    # only (never a bare "sale"/"venta"/"koop" noun), diacritic-tolerant where
+    # vendor templates drop accents. Twin of the backend
+    # PARKING_PAGE_TITLE_RE (parking-infra.util.ts) — extend BOTH together.
+    # Portuguese
+    r'|est[áa] [àa] venda|pode estar [àa] venda|dom[íi]nio [àa] venda'
+    r'|fa[çc]a uma oferta|compre este dom[íi]nio'
+    # Spanish
+    r'|est[áa] en venta|puede estar en venta|dominio en venta'
+    r'|ha(?:ga|cer) una oferta|compra(?:r)? este dominio'
+    # French
+    r'|est [àa] vendre|peut [êe]tre [àa] vendre|domaine [àa] vendre'
+    r'|faire une offre|acheter ce domaine'
+    # German
+    r'|steht zum verkauf|domain (ist )?zu verkaufen|angebot (machen|abgeben)'
+    # Italian
+    r'|[èe] in vendita|potrebbe essere in vendita|dominio in vendita'
+    r"|fai un'?offerta|acquista questo dominio"
+    # Dutch
+    r'|is te koop|staat te koop|koop dit domein|doe een bod'
+    r')',
     re.IGNORECASE,
 )
 
@@ -232,8 +268,14 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                 # Detect cloaking across UAs
                 cloaking = self._detect_cloaking(ua_results)
                 for result in ua_results:
-                    result['cloakingDetected'] = cloaking['detected']
-                    result['cloakingScore'] = cloaking['score']
+                    # UNKNOWN verdict (no successful bot-vs-human pair): omit the
+                    # cloaking fields entirely — ingestion skips absent verdicts
+                    # (ingestion.service.ts cloaking loop), so a failed bot
+                    # capture neither feeds the #1733 clean streak nor arms a
+                    # detection. Only a formed pair ships a true/false verdict.
+                    if cloaking['detected'] is not None:
+                        result['cloakingDetected'] = cloaking['detected']
+                        result['cloakingScore'] = cloaking['score']
                     # #880 — parking/for-sale fingerprint; ingestion stamps
                     # metadata.parkedFingerprint so computeLifecycleStage → 'parked'.
                     result['parkedFingerprint'] = cloaking.get('parked', False)
@@ -389,7 +431,9 @@ class BrandMonitorScreenshotTool(ToolPlugin):
         """Run gowitness for ONE url, locate + rename the output, hash it.
 
         Returns ``{ok, error, new_path, new_filename, file_hash, file_size,
-        perceptual_hash, has_content, stdout_text}``. ``ok=False`` with a
+        perceptual_hash, has_content, log_text, probe}`` — ``probe`` is the
+        parsed --write-jsonl record (#1554; page_title / http_status /
+        final_url / failed / failed_reason) or None. ``ok=False`` with a
         populated ``error`` means no usable screenshot file was produced (so the
         caller can fall back to the alternate protocol).
         """
@@ -403,66 +447,187 @@ class BrandMonitorScreenshotTool(ToolPlugin):
         except OSError:
             before = set()
 
+        # #1554 — per-run JSONL result file. gowitness v3 persists NO probe
+        # metadata (title / response code / final URL) unless a --write-* writer
+        # is configured, and it logs its human-readable result line to STDERR —
+        # the old stdout-scraping extractors parsed a permanently empty string,
+        # which is why 0 of 10,420 TyposquatScreenshot rows ever carried an
+        # httpStatusCode. The JSONL record is the reliable, structured source.
+        # Unique per invocation so sequential UA-profile runs never cross-read
+        # (gowitness APPENDS to an existing file); always removed in `finally`.
+        jsonl_path = os.path.join(
+            target_dir, f'.gw-{url_hash}{ua_suffix}-{time.time_ns()}.jsonl'
+        )
+
         gowitness_cmd = [
             'gowitness', 'scan', 'single', '--url', url,
             '--screenshot-path', target_dir,
             '--delay', GOWITNESS_DELAY, '--timeout', GOWITNESS_TIMEOUT,
+            '--write-jsonl', '--write-jsonl-file', jsonl_path,
+            # Keep the record small — the first response's HTML body is not used.
+            '--skip-html',
+            # #1559 — surface navigation-level failures. gowitness exits 0 with
+            # ZERO output (no screenshot, no JSONL record, empty stderr) when
+            # Chromium navigation itself fails (ERR_SSL_PROTOCOL_ERROR /
+            # ERR_BLOCKED_BY_CLIENT ...); this flag makes it log the
+            # `failed to witness target ... err="..."` line to stderr, which is
+            # captured below as log_text — the ONLY evidence carrier for this
+            # failure class (the JSONL failed/failed_reason record is written for
+            # probe-level failures only, never navigation-level ones).
+            '--log-scan-errors',
         ]
         if user_agent_string:
             gowitness_cmd.extend(['--chrome-user-agent', user_agent_string])
         if chrome_path:
             gowitness_cmd.extend(['--chrome-path', chrome_path])
 
-        # start_new_session=True makes gowitness a process-group leader so its
-        # Chromium children share its pgid and can be killed as a group on
-        # timeout (otherwise the Chromium tree orphans to PID 1 and burns CPU).
-        process = await asyncio.create_subprocess_exec(
-            *gowitness_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        # #571 — register the group so the job watchdog also tears it down if the
-        # OUTER per-job timeout fires while this inner communicate() is waiting.
-        register_group(process)
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=60)
-        except asyncio.TimeoutError:
-            await terminate_group(process)
-            # Best-effort: remove any partial screenshot gowitness left behind
-            # for this run so it can't be mistaken for a real capture later.
-            self._remove_partial_outputs(target_dir, before)
-            return {'ok': False, 'error': 'timeout', 'stdout_text': ''}
+            # start_new_session=True makes gowitness a process-group leader so its
+            # Chromium children share its pgid and can be killed as a group on
+            # timeout (otherwise the Chromium tree orphans to PID 1 and burns CPU).
+            process = await asyncio.create_subprocess_exec(
+                *gowitness_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            # #571 — register the group so the job watchdog also tears it down if the
+            # OUTER per-job timeout fires while this inner communicate() is waiting.
+            register_group(process)
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=60
+                )
+            except asyncio.TimeoutError:
+                await terminate_group(process)
+                # Best-effort: remove any partial screenshot gowitness left behind
+                # for this run so it can't be mistaken for a real capture later.
+                self._remove_partial_outputs(target_dir, before)
+                return {'ok': False, 'error': 'timeout', 'log_text': ''}
 
-        # Wait briefly for the file to appear
-        await asyncio.sleep(1)
+            # #1554 — gowitness logs to stderr; keep both streams for diagnostics.
+            log_text = (
+                (stdout.decode('utf-8', errors='replace') if stdout else '')
+                + (stderr.decode('utf-8', errors='replace') if stderr else '')
+            )
+            probe = self._parse_gowitness_jsonl(jsonl_path)
 
-        screenshot_file = self._find_recent_screenshot(target_dir, exclude=before)
-        if not screenshot_file:
+            # Wait briefly for the file to appear
+            await asyncio.sleep(1)
+
+            screenshot_file = self._find_recent_screenshot(target_dir, exclude=before)
+            if not screenshot_file:
+                # #1559 — report the REAL upstream reason when gowitness exposed
+                # one, instead of the misleading generic "file not found" (which
+                # conflated real capture bugs, TLS-dead hosts, and chromedp
+                # navigation blocks into one undiagnosable breaker string).
+                scan_error = self._extract_scan_error(log_text, probe)
+                return {
+                    'ok': False,
+                    'error': scan_error or 'Screenshot file not found after capture',
+                    'log_text': log_text,
+                    'probe': probe,
+                }
+
+            # Rename to a deterministic name with timestamp
+            timestamp = int(time.time())
+            ext = os.path.splitext(screenshot_file)[1] or '.jpeg'
+            new_filename = f"{timestamp}_{url_hash}{ua_suffix}{ext}"
+            old_path = os.path.join(target_dir, screenshot_file)
+            new_path = os.path.join(target_dir, new_filename)
+            os.rename(old_path, new_path)
+
             return {
-                'ok': False,
-                'error': 'Screenshot file not found after capture',
-                'stdout_text': stdout.decode('utf-8', errors='replace') if stdout else '',
+                'ok': True,
+                'error': None,
+                'new_path': new_path,
+                'new_filename': new_filename,
+                'file_hash': compute_sha256(new_path),
+                'file_size': os.path.getsize(new_path),
+                'perceptual_hash': self._compute_perceptual_hash(new_path),
+                'has_content': self._has_meaningful_content(new_path),
+                'log_text': log_text,
+                'probe': probe,
             }
+        finally:
+            try:
+                os.remove(jsonl_path)
+            except OSError:
+                pass
 
-        # Rename to a deterministic name with timestamp
-        timestamp = int(time.time())
-        ext = os.path.splitext(screenshot_file)[1] or '.jpeg'
-        new_filename = f"{timestamp}_{url_hash}{ua_suffix}{ext}"
-        old_path = os.path.join(target_dir, screenshot_file)
-        new_path = os.path.join(target_dir, new_filename)
-        os.rename(old_path, new_path)
+    # #1559 — the gowitness --log-scan-errors stderr shape for a navigation-level
+    # failure: `... failed to witness target ... err="could not navigate to
+    # target: page load error net::ERR_SSL_PROTOCOL_ERROR"`. The err= payload is
+    # the genuine upstream reason; nothing else records it (no JSONL record is
+    # written for this class).
+    _SCAN_ERR_RE = re.compile(r'err="([^"]+)"')
 
+    @classmethod
+    def _extract_scan_error(
+        cls, log_text: str, probe: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """#1559 — genuine failure reason for a zero-output gowitness run.
+
+        Preference order:
+          1. the structured JSONL ``failed_reason`` (probe-level failures — the
+             #1554 record, when gowitness wrote one);
+          2. the first ``err="..."`` payload from the --log-scan-errors stderr
+             (navigation-level failures — the class that produces NO record).
+        Returns ``None`` when neither carries a reason, so the caller keeps the
+        historical generic message. Truncated defensively: this string lands in
+        ``TyposquatDomain.lastScreenshotError`` (an operator-facing breaker
+        column), not a log file.
+        """
+        if probe and probe.get('failed') and probe.get('failed_reason'):
+            return str(probe['failed_reason']).strip()[:300] or None
+        if log_text:
+            m = cls._SCAN_ERR_RE.search(log_text)
+            if m:
+                reason = m.group(1).strip()
+                if reason:
+                    return reason[:300]
+        return None
+
+    @staticmethod
+    def _parse_gowitness_jsonl(jsonl_path: str) -> Optional[Dict[str, Any]]:
+        """#1554 — parse the single-record gowitness --write-jsonl output.
+
+        Returns ``{page_title, http_status, final_url, failed, failed_reason}``
+        (all keys present, values may be None) or ``None`` when the file is
+        missing/empty/unparseable — the caller treats that exactly like the
+        historical no-metadata case.
+        """
+        try:
+            with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as fh:
+                line = fh.readline().strip()
+        except OSError:
+            return None
+        if not line:
+            return None
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(record, dict):
+            return None
+
+        title = record.get('title')
+        response_code = record.get('response_code')
+        final_url = record.get('final_url')
         return {
-            'ok': True,
-            'error': None,
-            'new_path': new_path,
-            'new_filename': new_filename,
-            'file_hash': compute_sha256(new_path),
-            'file_size': os.path.getsize(new_path),
-            'perceptual_hash': self._compute_perceptual_hash(new_path),
-            'has_content': self._has_meaningful_content(new_path),
-            'stdout_text': stdout.decode('utf-8', errors='replace') if stdout else '',
+            'page_title': (str(title).strip()[:255] or None) if title else None,
+            'http_status': (
+                int(response_code)
+                if isinstance(response_code, (int, float)) and 100 <= int(response_code) <= 599
+                else None
+            ),
+            'final_url': (str(final_url).strip() or None) if final_url else None,
+            'failed': record.get('failed') is True,
+            'failed_reason': (
+                str(record.get('failed_reason')).strip() or None
+                if record.get('failed_reason')
+                else None
+            ),
         }
 
     async def _capture_screenshot(
@@ -526,15 +691,20 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                 candidates.append(alt_url)
 
             capture: Optional[Dict[str, Any]] = None  # best result so far
-            last_error = 'capture failed'
+            # #1559 — per-scheme failure reasons, accumulated so the final error
+            # carries BOTH candidates' genuine reasons (e.g. an https TLS failure
+            # AND the http fallback's navigation block), scheme-tagged. The old
+            # single last_error kept only the final attempt's string.
+            attempt_errors: List[str] = []
             for candidate_url in candidates:
+                scheme = urlparse(candidate_url).scheme or 'http'
                 # #574 — TCP-connect pre-check: skip the browser launch only for a
                 # port that DEFINITIVELY refuses (RST). An ambiguous timeout falls
                 # through to gowitness so a slow/CDN-fronted-but-live host is never
                 # dropped; the alternate-protocol retry is likewise only skipped on
                 # a definitive refusal.
                 if await self._port_definitely_closed(candidate_url):
-                    last_error = 'connection refused'
+                    attempt_errors.append(f'{scheme}: connection refused')
                     if candidate_url != url:
                         print(
                             f"[BrandMonitor:Screenshot] Alternate scheme "
@@ -547,7 +717,7 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                     chrome_path, user_agent_string,
                 )
                 if not attempt['ok']:
-                    last_error = attempt['error']
+                    attempt_errors.append(f"{scheme}: {attempt['error']}")
                     if candidate_url != url:
                         print(
                             f"[BrandMonitor:Screenshot] Protocol fallback "
@@ -582,7 +752,10 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                     )
 
             if capture is None:
-                # Every candidate (primary + alternate protocol) failed.
+                # Every candidate (primary + alternate protocol) failed. Join the
+                # scheme-tagged reasons (#1559) — this string becomes the
+                # operator-facing TyposquatDomain.lastScreenshotError.
+                last_error = '; '.join(attempt_errors)[:500] or 'capture failed'
                 return {
                     'target': url,
                     'success': False,
@@ -614,11 +787,13 @@ class BrandMonitorScreenshotTool(ToolPlugin):
                 'brand-monitoring', brand_monitor_id, subfolder, new_filename
             )
 
-            # Parse HTTP status from gowitness output
-            stdout_text = capture['stdout_text']
-            http_status = self._extract_http_status(stdout_text)
-            page_title = self._extract_page_title(stdout_text)
-            final_url = self._extract_final_url(stdout_text)  # #880
+            # #1554 — probe metadata comes from the structured gowitness JSONL
+            # record (the old stdout scraping read an always-empty stream and
+            # never populated these fields; see _parse_gowitness_jsonl).
+            probe = capture.get('probe') or {}
+            http_status = probe.get('http_status')
+            page_title = probe.get('page_title')
+            final_url = probe.get('final_url')  # #880
 
             result_entry = {
                 'target': url,
@@ -827,35 +1002,6 @@ class BrandMonitorScreenshotTool(ToolPlugin):
             # Fallback to file size check
             return os.path.getsize(file_path) > 5120
 
-    def _extract_http_status(self, output: str) -> Optional[int]:
-        """Try to extract HTTP status code from gowitness output."""
-        import re
-        matches = re.findall(r'\b(\d{3})\b', output)
-        # Use the last match (final status after redirects)
-        for m in reversed(matches):
-            code = int(m)
-            if 100 <= code <= 599:
-                return code
-        return None
-
-    def _extract_page_title(self, output: str) -> Optional[str]:
-        """Try to extract page title from gowitness output."""
-        match = re.search(r'title[=:]\s*"?([^"\n]+)"?', output, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()[:255]
-        return None
-
-    def _extract_final_url(self, output: str) -> Optional[str]:
-        """#880 — the FINAL navigated URL (post-redirect) from gowitness output,
-        so a redirect to a parking-service host can be fingerprinted. Prefers an
-        explicit final_url / location field; otherwise the LAST http(s) URL in the
-        output (gowitness logs the resolved URL after following redirects)."""
-        m = re.search(r'(?:final[_-]?url|location)[=:]\s*"?(https?://\S+?)"?[\s,\n]', output + '\n', re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        urls = re.findall(r'https?://[^\s"\'<>]+', output)
-        return urls[-1].strip() if urls else None
-
     def _is_parked_capture(self, results: List[Dict[str, Any]]) -> bool:
         """#880 — does ANY capture fingerprint a parking / for-sale landing page?
         A parking host (post-redirect final URL) or a for-sale title. Author
@@ -877,12 +1023,20 @@ class BrandMonitorScreenshotTool(ToolPlugin):
         Only bot-vs-human differences are cloaking candidates. Comparing
         desktop and mobile directly creates false positives for ordinary
         responsive layouts, especially parked-domain pages.
+
+        When multi-UA capture was requested but no bot-vs-human pair could be
+        formed (e.g. the bot capture timed out while the human captures
+        succeeded — gowitness has a 10s timeout, so this is common), the
+        verdict is UNKNOWN, not clean: `detected` is None and the caller must
+        OMIT the cloaking fields entirely. Reporting `false` here let three
+        flaky bot captures in a row masquerade as clean evidence and release
+        the #1733 ingestion-side cloaking latch on a still-cloaking domain.
         """
         successful = [r for r in results if r.get('success') and r.get('filePath')]
         human_results = [r for r in successful if r.get('userAgent') in ('desktop', 'mobile')]
         bot_results = [r for r in successful if r.get('userAgent') == 'bot']
         if not human_results or not bot_results:
-            return {'detected': False, 'score': 0.0}
+            return {'detected': None, 'score': None}
 
         max_distance = 0.0
         used_phash = False

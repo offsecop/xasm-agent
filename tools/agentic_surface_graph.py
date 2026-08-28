@@ -14,6 +14,7 @@ import aiohttp
 
 from plugin_interface import ToolPlugin
 from tools._agentic_exploration_common import (
+    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
     classify_parameters,
     dedupe_keep_order,
     extract_html_map,
@@ -119,6 +120,7 @@ class SurfaceGraphTool(ToolPlugin):
         all_urls: List[str] = []
         scripts: List[str] = []
         forms: List[Dict[str, Any]] = []
+        private_probe_candidates: List[Dict[str, Any]] = []
         js_routes: List[str] = []
         api_paths: List[str] = []
         graphql_hints: List[str] = []
@@ -155,6 +157,9 @@ class SurfaceGraphTool(ToolPlugin):
                 all_urls.extend([url, *page_links])
                 scripts.extend(page_scripts)
                 forms.extend(page_forms)
+                private_probe_candidates.extend(
+                    mapped.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+                )
                 queue.extend(page_links)
                 pages.append(
                     {
@@ -204,6 +209,7 @@ class SurfaceGraphTool(ToolPlugin):
             "surfaceGraph": graph,
             "urls": graph["urls"],
             "forms": graph["forms"],
+            NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_probe_candidates[:250],
             "hypotheses": hypotheses,
             "summary": {
                 "pagesFetched": len(pages),

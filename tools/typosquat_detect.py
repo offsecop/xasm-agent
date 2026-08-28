@@ -10,9 +10,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
 from typing import Dict, Any, List, Optional, Set, Tuple
-from urllib.parse import urlparse
 
 # Ensure agent/ is on sys.path so `from lib.integration_credentials import ...`
 # works when the plugin is loaded via spec_from_file_location.
@@ -300,7 +298,7 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
                 "customTlds": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Custom TLD list for TLD swap technique (overrides default)"
+                    "description": "Per-monitor custom TLDs merged into the built-in TLD-swap list (extends, de-duplicated — does not replace)"
                 }
             },
             "required": []
@@ -436,15 +434,28 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
             results.append((candidate + tld, 'HYPHEN_INSERTION'))
         return results
 
-    def _tld_swap(self, name: str, tld: str, custom_tlds: List[str] = None) -> List[Tuple[str, str]]:
-        """Replace TLD with common alternatives."""
+    def _tld_swap(self, name: str, tld: str, custom_tlds: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+        """Replace TLD with common alternatives.
+
+        #1200 — `custom_tlds` (per-monitor entropyConfig.customTlds) EXTENDS the
+        built-in ALTERNATIVE_TLDS list (de-duplicated, dot-normalized); it does
+        NOT replace it. A monitor adding `.ca` still gets the full default set.
+        """
         results: List[Tuple[str, str]] = []
-        tld_list = custom_tlds if custom_tlds else ALTERNATIVE_TLDS
-        for alt_tld in tld_list:
+        merged: List[str] = list(ALTERNATIVE_TLDS)
+        for raw in (custom_tlds or []):
+            if not isinstance(raw, str):
+                continue
+            alt = raw.strip().lower()
+            if alt:
+                merged.append(alt)
+        seen = set()
+        for alt_tld in merged:
             # Ensure TLD has leading dot
             if not alt_tld.startswith('.'):
                 alt_tld = '.' + alt_tld
-            if alt_tld != tld:
+            if alt_tld != tld and alt_tld not in seen:
+                seen.add(alt_tld)
                 results.append((name + alt_tld, 'TLD_SWAP'))
         return results
 
@@ -881,22 +892,17 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
         original: str,
         candidate: str,
         is_registered: bool,
-        has_web: bool,
-        has_ssl: bool,
-        page_title: Optional[str] = None,
         mx_records: Optional[List[str]] = None,
-        brand_keywords: Optional[List[str]] = None,
-        whois_created: Optional[str] = None,
-        vt_detections: Optional[Dict[str, Any]] = None,
-        final_url: Optional[str] = None,
-        phishtank_match: bool = False,
-        openphish_match: bool = False,
-        email_security: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, str]:
-        """Calculate structural risk score (0-75) and risk level for a candidate domain.
+        """Calculate the STRUCTURAL risk score (0-49) and band for a candidate.
 
-        CRITICAL is reserved for AI-confirmed phishing — structural scoring caps at HIGH.
-        Conservative scoring: only flag HIGH when actual threat indicators present.
+        #1751 — this scorer is structure-only BY DESIGN. Discovery (#1049) no
+        longer probes web/SSL/title/WHOIS/feeds/email-posture, so the weights
+        for those signals live in the BACKEND post-enrichment re-score
+        (backend/src/modules/brand-monitors/lookalike/typosquat-enrichment-score.ts),
+        which runs at enrich-ingest time against the merged row truth and owns
+        the HIGH band. Structure-only resemblance is hard-capped at 49 (the
+        MEDIUM ceiling); CRITICAL stays reserved for the AI vision verdict.
         """
         score = 0
         # Drop empty/blank MX entries (e.g. dig returning [""]) before any
@@ -905,10 +911,6 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
         mx_records = [m for m in (mx_records or []) if m and m.strip()]
         if is_registered:
             score += 10
-        if has_web:
-            score += 5
-        if has_ssl:
-            score += 3
 
         # String similarity: Damerau-Levenshtein on full domain (graduated
         # scoring). Damerau makes a transposition cost 1 (not 2), and the
@@ -980,164 +982,16 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
         if abs(len(original) - len(candidate)) <= 2:
             score += 2
 
-        # === ACTUAL THREAT INDICATORS (these justify HIGH) ===
-        # Page title contains brand keywords
-        if page_title and brand_keywords:
-            title_lower = page_title.lower()
-            if any(kw.lower() in title_lower for kw in brand_keywords):
-                score += 10
-
         # MX records present = email-capable phishing infrastructure
         if mx_records and len(mx_records) > 0:
             score += 8
 
-        # Recently registered (within 90 days). Track a tighter "fresh" window
-        # (<=30 days) separately to drive the interaction bonus below, and a
-        # wider <=90d window (is_fresh_90) that the brand-content/active-threat
-        # gate below uses as a positive recency signal. Unknown age leaves both
-        # False (fail-closed — consistent with the Phase 2 backend null-age cap).
-        is_fresh = False
-        is_fresh_90 = False
-        if whois_created:
-            try:
-                created_date = None
-                # Each entry is (format_string, expected_date_string_length).
-                # [:len(fmt)] was wrong — len(fmt) is the pattern length, not the
-                # rendered date length (e.g. '%Y-%m-%d' is 8 chars but dates are 10).
-                _fmt_widths = [
-                    ('%Y-%m-%dT%H:%M:%SZ', 20),
-                    ('%Y-%m-%d', 10),
-                    ('%d-%b-%Y', 11),
-                ]
-                for fmt, width in _fmt_widths:
-                    try:
-                        created_date = datetime.strptime(whois_created.strip()[:width], fmt)
-                        break
-                    except ValueError:
-                        continue
-                if created_date:
-                    age_days = (datetime.now() - created_date).days
-                    if age_days <= 90:
-                        score += 5
-                        is_fresh_90 = True
-                    if age_days <= 30:
-                        is_fresh = True
-            except Exception:
-                pass
+        # Structure-only ceiling: without the enrichment signals (threat feeds /
+        # brand-in-title / freshness — all backend-side post-enrichment, #1751)
+        # a resemblance can never justify HIGH on shape alone. Cap at 49.
+        score = min(score, 49)
 
-        # Interaction bonus: a registered, live (web-serving) near-miss
-        # (Damerau distance <= 2) that is ALSO freshly registered is the single
-        # highest-signal lookalike pattern — precisely the case the old additive
-        # scoring under-weighted (a fresh, live transposition could land LOW).
-        # Award a strong combined bonus. Still capped at HIGH below — CRITICAL
-        # stays reserved for AI-confirmed phishing.
-        if is_registered and has_web and dist <= 2 and is_fresh:
-            score += 20
-
-        # Suspicious external redirect: final URL domain differs from typosquat domain
-        if final_url:
-            try:
-                final_host = urlparse(final_url).hostname or ''
-                candidate_name = candidate.split('/')[0]  # strip any path
-                if final_host and final_host != candidate_name:
-                    score += 5
-            except Exception:
-                pass
-
-        # VirusTotal detections: +15 to +25 risk based on malicious count
-        if vt_detections and vt_detections.get('malicious', 0) > 0:
-            malicious = vt_detections['malicious']
-            if malicious >= 10:
-                score += 25
-            elif malicious >= 5:
-                score += 20
-            else:
-                score += 15
-
-        # PhishTank verified match: +25 risk, auto HIGH minimum
-        if phishtank_match:
-            score += 25
-
-        # OpenPhish match: +20 risk
-        if openphish_match:
-            score += 20
-
-        # Email security scoring (only relevant if MX records exist)
-        if mx_records and len(mx_records) > 0 and email_security:
-            spf = email_security.get('spf', {})
-            dmarc = email_security.get('dmarc', {})
-            # POST-1 — skip the "missing posture" weights when the lane is UNSWEPT
-            # (blind resolver / dig timeout); a non-answer must not inflate risk as
-            # if the record were confirmed absent.
-            if not spf.get('spf_unswept', False):
-                # Has MX + no SPF: email spoofing possible
-                if not spf.get('has_spf', False):
-                    score += 5
-                # Has MX + SPF +all: allows any sender
-                elif spf.get('spf_policy') == '+all':
-                    score += 8
-                # POST-2 — neutral (?all) / soft-fail (~all): effectively permits
-                # spoofing, previously scored as zero email-posture risk.
-                elif spf.get('spf_policy') in ('?all', '~all'):
-                    score += 5
-            if not dmarc.get('dmarc_unswept', False):
-                # Has MX + no DMARC
-                if not dmarc.get('has_dmarc', False):
-                    score += 3
-                # Has MX + DMARC p=none (monitoring only)
-                elif dmarc.get('dmarc_policy') == 'none':
-                    score += 2
-
-        # Hard cap: CRITICAL is reserved for AI-confirmed phishing only
-        score = min(score, 75)
-
-        # PhishTank match forces at least HIGH
-        if phishtank_match and score < 50:
-            score = 50
-
-        # === Brand-content / active-threat gate for HIGH (Phase 3) ===
-        # Structure-only resemblance (registration + web + SSL + lexical distance
-        # + brand-label/combosquat shape + suspicious TLD + email-security gaps)
-        # must NOT reach HIGH on its own. A HIGH band requires at least one
-        # POSITIVE brand-intent / active-threat / hard-intel signal. This composes
-        # with the Phase 2 backend null-age fail-closed cap — it is the agent-side
-        # "positive-signal-required-for-HIGH" half of the same calibration.
-        #
-        # Any ONE of these qualifies a HIGH:
-        #   - hard intel: VirusTotal malicious, PhishTank, or OpenPhish
-        #   - the brand keyword appears in the live page <title>
-        #   - email-capable (MX) AND freshly registered (<=90d)
-        #   - freshly registered (<=90d)
-        # NOTE: this function has NO kit/cloaking/login inputs (those are separate
-        # engines); recall for those is carried by the backend T4 re-promote, so we
-        # do NOT reference them here. Unknown registration age leaves is_fresh_90
-        # False → treated as NOT fresh (fail-closed). The gate applies to ALL
-        # brands regardless of token rarity — the Phase 4 rarity dampener
-        # (P1-4 #825) acts EARLIER, on the identity/containment bonuses above,
-        # so a common-word brand rarely reaches this gate on structure alone.
-        hard_intel = (
-            (bool(vt_detections) and vt_detections.get('malicious', 0) > 0)
-            or phishtank_match
-            or openphish_match
-        )
-        title_brand_hit = bool(
-            page_title and brand_keywords
-            and any(kw.lower() in page_title.lower() for kw in brand_keywords)
-        )
-        has_mx = len(mx_records) > 0
-        if (
-            score >= 50
-            and not hard_intel
-            and not title_brand_hit
-            and not (has_mx and is_fresh_90)
-            and not is_fresh_90
-        ):
-            # Cap to the MEDIUM ceiling: structure-only cannot reach HIGH.
-            score = 49
-
-        if score >= 50:
-            level = 'HIGH'
-        elif score >= 30:
+        if score >= 30:
             level = 'MEDIUM'
         elif score >= 15:
             level = 'LOW'
@@ -1145,6 +999,7 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
             level = 'INFO'
 
         return (score, level)
+
 
     # -- Main execution --------------------------------------------------------
 
@@ -1233,10 +1088,18 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
             'multiedit': 'multi_edit',
         }
 
+        # #1763 — the raw parameter lists are untyped JSON. Coerce to a genuine
+        # List[str] at construction (normalizing case/whitespace and dropping
+        # non-string entries) so `selected` does not widen to `str | Any | None`
+        # at the technique_map / EXEMPT_TECH_NAMES lookups below.
+        def _normalize_techniques(raw: Any) -> List[str]:
+            return [t.lower().strip() for t in (raw or []) if isinstance(t, str)]
+
+        selected: List[str]
         if enabled_techniques:
-            selected = [technique_aliases.get(t.lower().strip(), t.lower().strip()) for t in enabled_techniques]
+            selected = [technique_aliases.get(t, t) for t in _normalize_techniques(enabled_techniques)]
         elif techniques:
-            selected = [t.lower().strip() for t in techniques]
+            selected = _normalize_techniques(techniques)
         elif entropy_level == 'CUSTOM':
             # CUSTOM requires enabledTechniques; fall back to HIGH
             selected = all_techniques
@@ -1417,13 +1280,6 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
             results: List[Dict[str, Any]] = []
             registered_domains: List[str] = []
 
-            # Brand keywords from the primary domain name (structural scoring input).
-            primary_name, _ = self._split_domain(primary_domain)
-            brand_keywords = [primary_name]
-            # Also add parts split by hyphens (e.g. "my-brand" -> ["my-brand", "my", "brand"])
-            if '-' in primary_name:
-                brand_keywords.extend(p for p in primary_name.split('-') if len(p) >= 3)
-
             if check_dns and variations:
                 if agent:
                     agent.report_progress(
@@ -1469,16 +1325,16 @@ class TyposquatDetectTool(ToolPlugin, TyposquatEnrichmentMixin):
                     dist = self._damerau_levenshtein(primary_domain, var_domain)
                     max_len = max(len(primary_domain), len(var_domain))
                     similarity = round(1.0 - (dist / max_len), 2) if max_len > 0 else 0.0
-                    # Structural score from DNS/structural signals only. Enrichment
-                    # inputs (has_web/has_ssl/page_title/whois/VT/feeds/email-auth)
-                    # are absent → they degrade gracefully to no-bonus in
-                    # _score_result, and the HIGH gate caps structure-only at
-                    # MEDIUM (49) until the enrich queue supplies a positive signal.
+                    # Structural score from DNS/structural signals only, capped
+                    # at 49 (the MEDIUM ceiling). The enrichment weights
+                    # (web/SSL/title/WHOIS-age/VT/feeds/email-posture) and the
+                    # HIGH band live in the BACKEND post-enrichment re-score
+                    # (#1751 — typosquat-enrichment-score.ts), which runs when
+                    # the enrich queue delivers those signals.
                     score, level = self._score_result(
                         primary_domain, var_domain,
-                        is_registered, False, False,
+                        is_registered,
                         mx_records=mx,
-                        brand_keywords=brand_keywords,
                     )
                     results.append({
                         'domain': var_domain,

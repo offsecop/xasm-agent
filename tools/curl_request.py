@@ -5,9 +5,14 @@ Bounded curl request tool for agentic exploration.
 import json
 import re
 from typing import Any, Dict
+from urllib.parse import parse_qs, urlsplit
 
 from plugin_interface import ToolPlugin
-from tools._agentic_exploration_common import redact_headers, run_process
+from tools._agentic_exploration_common import (
+    forbidden_host_routing_header,
+    redact_headers,
+    run_process,
+)
 
 
 def _is_readonly_graphql_post(parameters: Dict[str, Any]) -> bool:
@@ -38,6 +43,20 @@ def _is_readonly_graphql_post(parameters: Dict[str, Any]) -> bool:
     if re.search(r"\b(mutation|subscription)\b", query, re.IGNORECASE):
         return False
     return True
+
+
+def _has_unsafe_graphql_get(url: Any) -> bool:
+    """Fail closed when a nominally safe GET carries a GraphQL write document."""
+    try:
+        values = parse_qs(urlsplit(str(url or "")).query, keep_blank_values=True).get(
+            "query", []
+        )
+    except (TypeError, ValueError):
+        return False
+    return any(
+        re.search(r"\b(?:mutation|subscription)\b", str(value), re.IGNORECASE)
+        for value in values
+    )
 
 
 class CurlRequestTool(ToolPlugin):
@@ -86,9 +105,28 @@ class CurlRequestTool(ToolPlugin):
         url = parameters.get("url") or parameters.get("target")
         if not url:
             return {"success": False, "error": "url or target is required"}
+        forbidden_header = forbidden_host_routing_header(parameters.get("headers"))
+        raw_cookie = parameters.get("cookie") or parameters.get("authCookies")
+        if raw_cookie and ("\r" in str(raw_cookie) or "\n" in str(raw_cookie)):
+            forbidden_header = "malformed-header"
+        if forbidden_header:
+            return {
+                "success": False,
+                "error": (
+                    f"header {forbidden_header} is reserved; use "
+                    "web:host_header_probe for bounded Host-routing tests"
+                ),
+                "code": "HOST_ROUTING_HEADER_FORBIDDEN",
+            }
         method = str(parameters.get("method") or "GET").upper()
         if method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
             return {"success": False, "error": f"unsupported method: {method}"}
+        if method == "GET" and _has_unsafe_graphql_get(url):
+            return {
+                "success": False,
+                "error": "GraphQL mutation/subscription over GET is forbidden; use a dedicated approval-gated native probe",
+                "code": "GRAPHQL_GET_WRITE_FORBIDDEN",
+            }
         if (
             method not in {"GET", "HEAD", "OPTIONS"}
             and not bool(parameters.get("allowUnsafeMethods", False))
@@ -127,7 +165,7 @@ class CurlRequestTool(ToolPlugin):
             cmd.append("--location")
 
         headers = parameters.get("headers") if isinstance(parameters.get("headers"), dict) else {}
-        cookie = parameters.get("cookie") or parameters.get("authCookies")
+        cookie = raw_cookie
         if cookie:
             headers = {**headers, "Cookie": str(cookie)}
         for key, value in headers.items():
@@ -178,4 +216,3 @@ class CurlRequestTool(ToolPlugin):
 
 def get_tool():
     return CurlRequestTool()
-

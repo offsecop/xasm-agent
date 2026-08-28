@@ -12,7 +12,9 @@ import aiohttp
 
 from plugin_interface import ToolPlugin
 from tools._agentic_exploration_common import (
+    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
     RISKY_CLICK_WORDS,
+    build_native_probe_form_contract,
     extract_html_map,
     fetch_text,
     normalize_url,
@@ -106,7 +108,17 @@ class BrowserMapAppTool(ToolPlugin):
                         forms: Array.from(document.forms).map(f => ({
                           action: new URL(f.getAttribute('action') || location.href, location.href).href,
                           method: (f.getAttribute('method') || 'GET').toUpperCase(),
-                          fields: Array.from(f.querySelectorAll('input, textarea, select')).map(i => ({name: i.getAttribute('name') || i.id || '', type: (i.getAttribute('type') || i.tagName || 'text').toLowerCase()})).filter(i => i.name || ['password','email','search','file'].includes(i.type)),
+                          contentType: (f.getAttribute('enctype') || 'application/x-www-form-urlencoded').toLowerCase(),
+                          fields: Array.from(f.querySelectorAll('input, textarea, select')).map(i => {
+                            const type = (i.getAttribute('type') || i.tagName || 'text').toLowerCase();
+                            const successful = !['checkbox', 'radio'].includes(type) || Boolean(i.checked);
+                            return {
+                              name: i.getAttribute('name') || i.id || '',
+                              type,
+                              value: successful ? String(i.value || '').slice(0, 4096) : null,
+                              valueSource: i.tagName === 'SELECT' ? 'selected-option' : 'browser-default',
+                            };
+                          }).filter(i => i.name || ['password','email','search','file'].includes(i.type)),
                         })).slice(0, 100),
                         buttons: Array.from(document.querySelectorAll('button, [role=button], input[type=button], input[type=submit], a')).map((b, index) => ({
                           index,
@@ -158,6 +170,10 @@ class BrowserMapAppTool(ToolPlugin):
                 await context.close()
                 await close_browser_safe(browser)
 
+                form_contract = build_native_probe_form_contract(
+                    snapshot.get("forms", []),
+                    source="browser:map_app",
+                )
                 same_origin_links = [u for u in snapshot.get("links", []) if same_origin(target, u)]
                 map_result = {
                     "success": True,
@@ -167,7 +183,10 @@ class BrowserMapAppTool(ToolPlugin):
                     "links": same_origin_links,
                     "externalLinks": [u for u in snapshot.get("links", []) if not same_origin(target, u)][:100],
                     "scripts": snapshot.get("scripts", []),
-                    "forms": snapshot.get("forms", []),
+                    "forms": form_contract["forms"],
+                    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: form_contract[
+                        NATIVE_PROBE_PRIVATE_CANDIDATES_KEY
+                    ],
                     "buttons": snapshot.get("buttons", []),
                     "inputs": snapshot.get("inputs", []),
                     "safeInteractions": interactions,
@@ -216,4 +235,3 @@ class BrowserMapAppTool(ToolPlugin):
 
 def get_tool():
     return BrowserMapAppTool()
-

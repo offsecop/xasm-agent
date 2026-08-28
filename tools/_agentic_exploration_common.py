@@ -3,11 +3,12 @@ Shared helpers for bounded agentic web exploration tools.
 """
 
 import asyncio
+import hashlib
 import json
 import re
 from html import unescape
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 
@@ -44,6 +45,37 @@ RISKY_CLICK_WORDS = {
     "confirm",
     "cancel subscription",
 }
+
+NATIVE_PROBE_PRIVATE_CANDIDATES_KEY = "_nativeProbePrivateCandidates"
+NATIVE_PROBE_QUERY_CANDIDATES_KEY = "queryCandidates"
+NATIVE_PROBE_PATH_CANDIDATES_KEY = "pathCandidates"
+_MAX_NATIVE_PROBE_FIELD_VALUE_CHARS = 4096
+FORBIDDEN_HOST_ROUTING_HEADERS = frozenset(
+    {
+        ":authority",
+        "forwarded",
+        "host",
+        "x-forwarded-host",
+        "x-forwarded-server",
+        "x-host",
+        "x-original-host",
+    }
+)
+
+
+def forbidden_host_routing_header(headers: Any) -> Optional[str]:
+    """Return the first Host-routing header reserved for the native probe."""
+    if not isinstance(headers, dict):
+        return None
+    for raw_name, raw_value in headers.items():
+        if "\r" in str(raw_name) or "\n" in str(raw_name):
+            return "malformed-header"
+        if "\r" in str(raw_value) or "\n" in str(raw_value):
+            return "malformed-header"
+        name = str(raw_name or "").strip().lower()
+        if name in FORBIDDEN_HOST_ROUTING_HEADERS:
+            return name
+    return None
 
 
 def normalize_url(value: str) -> str:
@@ -162,6 +194,413 @@ def extract_attr(tag: str, attr: str) -> Optional[str]:
     return None
 
 
+def _classify_form_default(value: Optional[str]) -> Dict[str, Any]:
+    """Return non-secret metadata for an HTML default without retaining it."""
+    if value is None:
+        return {"hasDefault": False}
+    normalized = unescape(str(value)).replace("\0", "")
+    metadata: Dict[str, Any] = {
+        "hasDefault": True,
+        "valueLength": min(len(normalized), 4096),
+    }
+    if not normalized:
+        metadata["valueKind"] = "empty"
+        return metadata
+    if any(char in normalized for char in ("\r", "\n")):
+        metadata["valueKind"] = "multiline"
+        return metadata
+    try:
+        parsed = urlparse(normalized)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+            and not parsed.fragment
+            and len(normalized) <= 512
+        ):
+            metadata["valueKind"] = "absolute-http-url"
+            return metadata
+    except Exception:
+        pass
+    if normalized.startswith("/") and len(normalized) <= 1024:
+        metadata["valueKind"] = "relative-url"
+    elif len(normalized) <= 512:
+        metadata["valueKind"] = "scalar"
+    else:
+        metadata["valueKind"] = "opaque"
+    return metadata
+
+
+def _form_field_metadata(
+    name: str,
+    field_type: str,
+    default_value: Optional[str],
+    value_source: Optional[str],
+) -> Dict[str, Any]:
+    field = {
+        "name": name[:160],
+        "type": field_type.lower()[:40],
+        **_classify_form_default(default_value),
+    }
+    if value_source and default_value is not None:
+        field["valueSource"] = value_source
+    return field
+
+
+def _native_probe_form_candidate_id(
+    url: str,
+    method: str,
+    content_type: str,
+    fields: Iterable[Dict[str, Any]],
+) -> str:
+    """Build the value-independent identifier shared with the backend store."""
+    field_types: Dict[str, str] = {}
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        name = str(field.get("name") or "").strip()
+        if name:
+            field_types[name] = str(field.get("type") or "text").lower()
+    field_signature = ",".join(
+        f"{name}:{field_types[name]}" for name in sorted(field_types)
+    )
+    canonical = "|".join(
+        [
+            str(method or "GET").upper(),
+            str(url or "").strip(),
+            str(content_type or "application/x-www-form-urlencoded").lower(),
+            field_signature,
+        ]
+    )
+    return f"cand-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]}"
+
+
+def sanitize_native_probe_public_url(value: str) -> str:
+    """Keep route/query names while removing query values and fragments."""
+    parsed = urlparse(str(value or "").strip())
+    redacted_query = urlencode(
+        [(name, "") for name, _value in parse_qsl(parsed.query, keep_blank_values=True)]
+    )
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            redacted_query,
+            "",
+        )
+    )
+
+
+def build_native_probe_form_contract(
+    forms: Iterable[Dict[str, Any]],
+    *,
+    source: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Split observed forms into a public metadata lane and a bounded private lane.
+
+    The private lane is a transport-only envelope. AgentEngine removes it before
+    Job.output/workflow output is written and persists it encrypted, tenant- and
+    workflow-bound. Callers must return both arrays at the top level so the
+    backend can perform that extraction atomically with job completion.
+    """
+    public_forms: List[Dict[str, Any]] = []
+    private_candidates: List[Dict[str, Any]] = []
+    for raw_form in list(forms or [])[:250]:
+        if not isinstance(raw_form, dict):
+            continue
+        raw_url = str(raw_form.get("action") or raw_form.get("url") or "").strip()
+        if not raw_url:
+            continue
+        public_url = sanitize_native_probe_public_url(raw_url)
+        method = str(raw_form.get("method") or "GET").upper()[:12]
+        content_type = str(
+            raw_form.get("contentType")
+            or raw_form.get("enctype")
+            or "application/x-www-form-urlencoded"
+        ).lower()[:120]
+        public_fields: List[Dict[str, Any]] = []
+        private_fields: Dict[str, str] = {}
+        for raw_field in list(raw_form.get("fields") or raw_form.get("inputs") or [])[:80]:
+            if not isinstance(raw_field, dict):
+                continue
+            name = str(raw_field.get("name") or raw_field.get("id") or "").strip()[:160]
+            if not name:
+                continue
+            field_type = str(raw_field.get("type") or "text").lower()[:40]
+            raw_value = raw_field.get("value")
+            value = (
+                str(raw_value).replace("\0", "")[:_MAX_NATIVE_PROBE_FIELD_VALUE_CHARS]
+                if raw_value is not None
+                else None
+            )
+            public_field = _form_field_metadata(
+                name,
+                field_type,
+                value,
+                str(raw_field.get("valueSource") or "observed-default")[:40],
+            )
+            public_fields.append(public_field)
+            if value is not None:
+                private_fields[name] = value
+
+        candidate_id = _native_probe_form_candidate_id(
+            public_url,
+            method,
+            content_type,
+            public_fields,
+        )
+        public_forms.append(
+            {
+                "action": public_url,
+                "method": method,
+                "contentType": content_type,
+                "fields": public_fields,
+                "fieldCount": len(public_fields),
+                "nativeProbeCandidateId": candidate_id,
+            }
+        )
+        private_candidates.append(
+            {
+                "candidateId": candidate_id,
+                "kind": "html-form",
+                "url": raw_url,
+                "publicUrl": public_url,
+                "method": method,
+                "contentType": content_type,
+                "fields": private_fields,
+                "fieldTypes": {
+                    str(field.get("name")): str(field.get("type") or "text")
+                    for field in public_fields
+                    if field.get("name")
+                },
+                "source": source[:120],
+            }
+        )
+    return {
+        "forms": public_forms,
+        NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_candidates,
+    }
+
+
+def build_native_probe_query_contract(
+    urls: Iterable[str],
+    *,
+    source: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Split observed GET query URLs into redacted metadata and private values."""
+    public_candidates: List[Dict[str, Any]] = []
+    private_candidates: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for raw_value in list(urls or [])[:300]:
+        raw_url = str(raw_value or "").strip()
+        if not raw_url:
+            continue
+        try:
+            parsed = urlparse(raw_url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+            ):
+                continue
+            query = parse_qsl(parsed.query, keep_blank_values=True)
+        except Exception:
+            continue
+        names = [str(name).strip() for name, _value in query]
+        if (
+            not query
+            or len(query) > 12
+            or len(set(names)) != len(names)
+            or any(not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", name) for name in names)
+        ):
+            continue
+
+        private_url = urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                "",
+            )
+        )
+        public_url = sanitize_native_probe_public_url(private_url)
+        public_fields = [
+            _form_field_metadata(name, "query", value, "observed-query")
+            for name, value in query
+        ]
+        candidate_id = _native_probe_form_candidate_id(
+            public_url,
+            "GET",
+            "application/x-www-form-urlencoded",
+            public_fields,
+        )
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        public_candidates.append(
+            {
+                "url": public_url,
+                "method": "GET",
+                "contentType": "application/x-www-form-urlencoded",
+                "fields": public_fields,
+                "parameterNames": names,
+                "nativeProbeCandidateId": candidate_id,
+            }
+        )
+        private_candidates.append(
+            {
+                "candidateId": candidate_id,
+                "kind": "request-candidate",
+                "url": private_url,
+                "publicUrl": public_url,
+                "method": "GET",
+                "contentType": "application/x-www-form-urlencoded",
+                "fields": {
+                    name: str(value).replace("\0", "")[:_MAX_NATIVE_PROBE_FIELD_VALUE_CHARS]
+                    for name, value in query
+                },
+                "fieldTypes": {name: "query" for name in names},
+                "source": source[:120],
+            }
+        )
+    return {
+        NATIVE_PROBE_QUERY_CANDIDATES_KEY: public_candidates,
+        NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_candidates,
+    }
+
+
+def build_native_probe_path_contract(
+    candidates: Iterable[Dict[str, Any]],
+    *,
+    source: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Split documented GET path templates from their concrete sample values."""
+    public_candidates: List[Dict[str, Any]] = []
+    private_candidates: List[Dict[str, Any]] = []
+    seen_ids = set()
+    placeholder_re = re.compile(r"^\{([A-Za-z0-9_.-]{1,80})\}$")
+
+    for raw_candidate in list(candidates or [])[:300]:
+        if not isinstance(raw_candidate, dict):
+            continue
+        raw_url = str(raw_candidate.get("url") or "").strip()
+        public_url = str(
+            raw_candidate.get("publicUrl")
+            or raw_candidate.get("pathTemplateUrl")
+            or ""
+        ).strip()
+        try:
+            raw_parsed = urlparse(raw_url)
+            public_parsed = urlparse(public_url)
+        except Exception:
+            continue
+        if (
+            raw_parsed.scheme not in {"http", "https"}
+            or public_parsed.scheme not in {"http", "https"}
+            or not raw_parsed.hostname
+            or not public_parsed.hostname
+            or raw_parsed.username
+            or raw_parsed.password
+            or public_parsed.username
+            or public_parsed.password
+            or raw_parsed.fragment
+            or public_parsed.fragment
+            or raw_parsed.query
+            or public_parsed.query
+            or (raw_parsed.scheme, raw_parsed.netloc)
+            != (public_parsed.scheme, public_parsed.netloc)
+        ):
+            continue
+
+        raw_segments = raw_parsed.path.split("/")
+        public_segments = public_parsed.path.split("/")
+        if len(raw_segments) != len(public_segments):
+            continue
+        names: List[str] = []
+        fields: Dict[str, str] = {}
+        valid = True
+        for raw_segment, public_segment in zip(raw_segments, public_segments):
+            match = placeholder_re.fullmatch(unquote(public_segment))
+            if not match:
+                if raw_segment != public_segment:
+                    valid = False
+                    break
+                continue
+            name = match.group(1)
+            value = unquote(raw_segment).replace("\0", "")
+            if (
+                name in fields
+                or not value
+                or len(value) > _MAX_NATIVE_PROBE_FIELD_VALUE_CHARS
+                or "/" in value
+            ):
+                valid = False
+                break
+            names.append(name)
+            fields[name] = value
+
+        expected_names = [
+            str(value).strip()
+            for value in list(raw_candidate.get("parameterNames") or [])[:80]
+        ]
+        if (
+            not valid
+            or not names
+            or names != expected_names
+            or len(set(names)) != len(names)
+        ):
+            continue
+
+        public_fields = [
+            _form_field_metadata(name, "path", fields[name], "documented-path")
+            for name in names
+        ]
+        candidate_id = _native_probe_form_candidate_id(
+            public_url,
+            "GET",
+            "application/x-www-form-urlencoded",
+            public_fields,
+        )
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        public_candidates.append(
+            {
+                "url": public_url,
+                "method": "GET",
+                "contentType": "application/x-www-form-urlencoded",
+                "fields": public_fields,
+                "parameterNames": names,
+                "nativeProbeCandidateId": candidate_id,
+            }
+        )
+        private_candidates.append(
+            {
+                "candidateId": candidate_id,
+                "kind": "request-candidate",
+                "url": raw_url,
+                "publicUrl": public_url,
+                "method": "GET",
+                "contentType": "application/x-www-form-urlencoded",
+                "fields": fields,
+                "fieldTypes": {name: "path" for name in names},
+                "source": source[:120],
+            }
+        )
+
+    return {
+        NATIVE_PROBE_PATH_CANDIDATES_KEY: public_candidates,
+        NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_candidates,
+    }
+
+
 def extract_html_map(html: str, base_url: str, max_items: int = 200) -> Dict[str, Any]:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
     title = re.sub(r"\s+", " ", unescape(title_match.group(1))).strip() if title_match else ""
@@ -169,9 +608,10 @@ def extract_html_map(html: str, base_url: str, max_items: int = 200) -> Dict[str
     links = []
     scripts = []
     stylesheets = []
-    forms = []
+    raw_forms = []
     buttons = []
     inputs = []
+    inline_query_parameters = []
 
     for tag in re.findall(r"<a\b[^>]*>", html, re.I | re.S):
         href = extract_attr(tag, "href")
@@ -183,6 +623,33 @@ def extract_html_map(html: str, base_url: str, max_items: int = 200) -> Dict[str
         if src:
             scripts.append(urljoin(base_url, src))
 
+    for script_tag, script_body in re.findall(
+        r"(<script\b[^>]*>)(.*?)</script>",
+        html,
+        re.I | re.S,
+    ):
+        if extract_attr(script_tag, "src"):
+            continue
+        search_param_variables = set(
+            re.findall(
+                r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+URLSearchParams\s*\(",
+                script_body,
+            )
+        )
+        inline_query_parameters.extend(
+            re.findall(
+                r"\.searchParams\.(?:get|set|has|append|delete)\s*\(\s*['\"]([A-Za-z0-9_.-]{1,80})['\"]",
+                script_body,
+            )
+        )
+        for variable in search_param_variables:
+            inline_query_parameters.extend(
+                re.findall(
+                    rf"\b{re.escape(variable)}\.(?:get|set|has|append|delete)\s*\(\s*['\"]([A-Za-z0-9_.-]{{1,80}})['\"]",
+                    script_body,
+                )
+            )
+
     for tag in re.findall(r"<link\b[^>]*>", html, re.I | re.S):
         href = extract_attr(tag, "href")
         rel = (extract_attr(tag, "rel") or "").lower()
@@ -193,18 +660,84 @@ def extract_html_map(html: str, base_url: str, max_items: int = 200) -> Dict[str
         open_tag = re.match(r"<form\b[^>]*>", form_html, re.I | re.S)
         action = extract_attr(open_tag.group(0), "action") if open_tag else None
         method = (extract_attr(open_tag.group(0), "method") if open_tag else None) or "GET"
-        field_names = []
-        for input_tag in re.findall(r"<(?:input|textarea|select)\b[^>]*>", form_html, re.I | re.S):
+        content_type = (
+            (extract_attr(open_tag.group(0), "enctype") if open_tag else None)
+            or "application/x-www-form-urlencoded"
+        ).lower()
+        field_names: List[Dict[str, Any]] = []
+        for input_tag in re.findall(r"<input\b[^>]*>", form_html, re.I | re.S):
             name = extract_attr(input_tag, "name")
-            field_type = extract_attr(input_tag, "type") or input_tag.split()[0].lstrip("<")
+            field_type = (extract_attr(input_tag, "type") or "text").lower()
             if name:
-                field_names.append({"name": name, "type": field_type.lower()})
-        forms.append(
+                value = extract_attr(input_tag, "value")
+                if field_type in {"checkbox", "radio"} and not re.search(
+                    r"\bchecked(?:\s*=\s*(?:[\"']?checked[\"']?|[\"']?true[\"']?))?(?:\s|/?>)",
+                    input_tag,
+                    re.I,
+                ):
+                    value = None
+                field_names.append(
+                    {
+                        "name": name,
+                        "type": field_type,
+                        "value": value,
+                        "valueSource": "html-default",
+                    }
+                )
+        for textarea_tag, body in re.findall(
+            r"(<textarea\b[^>]*>)(.*?)</textarea>",
+            form_html,
+            re.I | re.S,
+        ):
+            name = extract_attr(textarea_tag, "name")
+            if name:
+                field_names.append(
+                    {
+                        "name": name,
+                        "type": "textarea",
+                        "value": re.sub(r"<[^>]+>", "", body),
+                        "valueSource": "html-default",
+                    }
+                )
+        for select_tag, body in re.findall(
+            r"(<select\b[^>]*>)(.*?)</select>",
+            form_html,
+            re.I | re.S,
+        ):
+            name = extract_attr(select_tag, "name")
+            if not name:
+                continue
+            options = re.findall(
+                r"(<option\b[^>]*>)(.*?)</option>",
+                body,
+                re.I | re.S,
+            )
+            chosen: Optional[tuple[str, str]] = None
+            for option_tag, option_body in options:
+                if re.search(r"\bselected(?:\s*=\s*(?:[\"']?selected[\"']?|[\"']?true[\"']?))?", option_tag, re.I):
+                    chosen = (option_tag, option_body)
+                    break
+            if chosen is None and options:
+                chosen = options[0]
+            selected_value: Optional[str] = None
+            if chosen is not None:
+                selected_value = extract_attr(chosen[0], "value")
+                if selected_value is None:
+                    selected_value = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", chosen[1])).strip()
+            field_names.append(
+                {
+                    "name": name,
+                    "type": "select",
+                    "value": selected_value,
+                    "valueSource": "selected-option",
+                }
+            )
+        raw_forms.append(
             {
                 "action": urljoin(base_url, action or base_url),
                 "method": method.upper(),
+                "contentType": content_type[:120],
                 "fields": field_names,
-                "fieldCount": len(field_names),
             }
         )
 
@@ -218,14 +751,41 @@ def extract_html_map(html: str, base_url: str, max_items: int = 200) -> Dict[str
         if name or field_type in {"email", "password", "search", "file"}:
             inputs.append({"name": name, "type": field_type})
 
+    form_contract = build_native_probe_form_contract(
+        raw_forms[:max_items],
+        source="http:html-map",
+    )
+    inline_query_parameters = dedupe_keep_order(inline_query_parameters, max_items)
+    parameterized_urls = []
+    if inline_query_parameters:
+        parsed_base = urlparse(base_url)
+        existing_names = [name for name, _ in parse_qsl(parsed_base.query, keep_blank_values=True)]
+        query_names = dedupe_keep_order(existing_names + inline_query_parameters, max_items)
+        parameterized_urls.append(
+            urlunparse(
+                (
+                    parsed_base.scheme,
+                    parsed_base.netloc,
+                    parsed_base.path or "/",
+                    parsed_base.params,
+                    urlencode([(name, "") for name in query_names]),
+                    "",
+                )
+            )
+        )
     return {
         "title": title,
         "links": dedupe_keep_order(links, max_items),
         "scripts": dedupe_keep_order(scripts, max_items),
         "stylesheets": dedupe_keep_order(stylesheets, max_items),
-        "forms": forms[:max_items],
+        "forms": form_contract["forms"],
+        NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: form_contract[
+            NATIVE_PROBE_PRIVATE_CANDIDATES_KEY
+        ],
         "buttons": buttons[:max_items],
         "inputs": inputs[:max_items],
+        "inlineQueryParameters": inline_query_parameters,
+        "parameterizedUrls": parameterized_urls,
     }
 
 

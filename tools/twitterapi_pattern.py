@@ -45,6 +45,7 @@ from lib.integration_credentials import (
     QuotaExceededError,
     IntegrationCredentialsError,
 )
+from lib.search_recency import twitter_time_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,39 @@ def _tweet_id_of(t: Any) -> Optional[str]:
     return str(tid)
 
 
+def _knob_int(value: Any) -> Optional[int]:
+    """Defensive semantic-knob parse: int-ish → int; garbage (None, template
+    literals, floats-as-junk-strings) → None; <1 → None (like the SC tools)."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def resolve_time_bounds(parameters: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """#1144/#1506 X historical wiring — resolve the effective epoch
+    `(since, until)` for the vendor call. Semantic `window_days` +
+    `end_days_ago` knobs (templated `{{ json searchWindowDays }}` /
+    `{{ json searchEndDaysAgo }}` by the backend seed; the historical
+    backfill widens/slides them per-run) map through `twitter_time_bounds`.
+    Explicit `since`/`until` params EACH win over their derived value;
+    garbage degrades to the pre-existing behavior (defensive, like the
+    SC tools)."""
+    since = parameters.get('since')
+    until = parameters.get('until')
+    if since is None or until is None:
+        derived_since, derived_until = twitter_time_bounds(
+            _knob_int(parameters.get('window_days')),
+            end_days_ago=_knob_int(parameters.get('end_days_ago')),
+        )
+        if since is None:
+            since = derived_since
+        if until is None:
+            until = derived_until
+    return (since, until)
+
+
 class TwitterApiPatternScanTool(ToolPlugin):
     @property
     def name(self) -> str:
@@ -214,6 +248,25 @@ class TwitterApiPatternScanTool(ToolPlugin):
                 "until": {
                     "type": "integer",
                     "description": "Epoch seconds; only tweets before this time.",
+                },
+                "window_days": {
+                    "type": "integer",
+                    "description": (
+                        "Semantic recency window in days — mapped agent-side "
+                        "to the vendor's epoch `since_time`. Ignored when an "
+                        "explicit `since` is supplied. The vendor's archive "
+                        "reaches full history, so a backfill can widen this."
+                    ),
+                },
+                "end_days_ago": {
+                    "type": "integer",
+                    "description": (
+                        "Days before now the window ENDS (#1506) — mapped "
+                        "agent-side to the vendor's epoch `until_time`, "
+                        "sliding the whole window into the past: "
+                        "[now-end-window, now-end]. Ignored when an explicit "
+                        "`until` is supplied; 0/omitted = window ends at now."
+                    ),
                 },
                 "limit": {
                     "type": "integer",
@@ -269,8 +322,7 @@ class TwitterApiPatternScanTool(ToolPlugin):
         # resolver fallback), so emitting these at the run level gives precise
         # attribution without per-finding duplication.
         vip_id = (parameters.get('vip_id') or '').strip() or None
-        since = parameters.get('since')
-        until = parameters.get('until')
+        since, until = resolve_time_bounds(parameters)
         limit = int(parameters.get('limit', 50) or 50)
         limit = max(1, min(limit, 500))
 

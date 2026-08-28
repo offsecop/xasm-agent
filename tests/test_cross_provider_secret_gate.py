@@ -97,32 +97,35 @@ def test_gate_never_demotes_higher_base_score(tool):
     assert out['riskScore'] == 70       # max(55, 70)
 
 
-# ── GitLab leg ────────────────────────────────────────────────────────────────
+# ── GitLab leg (#1487 — now scope=blobs code-CONTENT search, token-gated) ─────
 
-def _gitlab_projects(description):
+def _gitlab_blobs(content):
+    # Mirrors GitLab's `GET /api/v4/search?scope=blobs` response shape: each hit
+    # is a blob with matched file CONTENT (`data`) + path/ref/project_id.
     return [{
-        'id': 42,
-        'path_with_namespace': 'lumenfield/config',
-        'name': 'config',
-        'description': description,
-        'web_url': 'https://gitlab.com/lumenfield/config',
-        'visibility': 'public',
-        'namespace': {'full_path': 'lumenfield'},
-        'last_activity_at': '2026-06-10T00:00:00Z',
+        'basename': 'prod',
+        'path': 'lumenfield/config/prod.py',
+        'filename': 'lumenfield/config/prod.py',
+        'project_id': 42,
+        'ref': 'main',
+        'startline': 3,
+        'data': content,
     }]
 
 
-def test_gitlab_secret_elevates_to_exposed_secret(tool):
-    desc = f"lumenfield prod config: aws_secret = {SYNTHETIC_SECRET}"
-    sess = _FakeSession(_FakeResp(200, _gitlab_projects(desc)))
+def test_gitlab_secret_elevates_to_exposed_secret(tool, monkeypatch):
+    monkeypatch.setenv('GITLAB_TOKEN', 'glpat-FAKEtoken0000000000')
+    content = f"lumenfield prod config\naws_secret = {SYNTHETIC_SECRET}\n"
+    sess = _FakeSession(_FakeResp(200, _gitlab_blobs(content)))
     out = _run(tool._query_gitlab(sess, DOMAIN, []))
-    assert out, 'expected the brand-matching project to be kept'
+    assert out, 'expected the brand-matching blob to be kept'
     assert all(r['matchType'] == 'EXPOSED_SECRET' for r in out)
     assert all(r['severity'] == 'HIGH' for r in out)
 
 
-def test_gitlab_benign_stays_brand_mention(tool):
-    sess = _FakeSession(_FakeResp(200, _gitlab_projects('lumenfield helper SDK for oauth')))
+def test_gitlab_benign_stays_brand_mention(tool, monkeypatch):
+    monkeypatch.setenv('GITLAB_TOKEN', 'glpat-FAKEtoken0000000000')
+    sess = _FakeSession(_FakeResp(200, _gitlab_blobs('lumenfield helper SDK for oauth')))
     out = _run(tool._query_gitlab(sess, DOMAIN, []))
     assert out
     assert all(r['matchType'] == 'BRAND_MENTION' for r in out)

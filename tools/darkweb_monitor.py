@@ -60,6 +60,11 @@ from lib.integration_credentials import (  # noqa: E402
     QuotaExceededError,
     IntegrationCredentialsError,
 )
+from lib.serper_search import (  # noqa: E402
+    dispatch_serper,
+    SerpNotConfigured,
+    SerpSweepFailed,
+)
 
 try:
     from playwright.async_api import async_playwright
@@ -80,7 +85,88 @@ ENABLE_OTX = os.environ.get("ENABLE_OTX", "false").lower() in ("true", "1", "yes
 ENABLE_INTELX = os.environ.get("ENABLE_INTELX", "false").lower() in ("true", "1", "yes")
 
 
+# #1611 — Phishing.Database ACTIVE-domains feed. A FREE, KEYLESS, MIT-licensed
+# global feed (mitchellkrogza/Phishing.Database) of community-verified ACTIVE
+# phishing domains, regenerated ~every 2h. Like the RansomLook leg it is a free
+# GLOBAL feed matched per-tenant in-process (NOT a per-tenant paid vendor), so
+# it leases NO ProviderQuotaService slot and needs no IntegrationProvider enum.
+# Cached process-wide with a TTL + conditional GET (ETag) so the five agent
+# containers do not re-pull ~11 MB on every scan.
+_PHISHING_DB_URL = (
+    "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/"
+    "master/phishing-domains-ACTIVE.txt"
+)
+_PHISHING_DB_TTL_SECONDS = 2 * 60 * 60  # matches the feed's ~2h regen cadence
+# Process-wide cache: the parsed set of active phishing domains + the ETag for
+# conditional GETs. Guarded by a lazily-created asyncio.Lock (created inside a
+# running loop so no event-loop is bound at import time).
+_phishing_db_cache: Dict[str, Any] = {"fetched_at": 0.0, "etag": None, "domains": None}
+_phishing_db_lock: Optional["asyncio.Lock"] = None
+
+
+def _get_phishing_db_lock() -> "asyncio.Lock":
+    global _phishing_db_lock
+    if _phishing_db_lock is None:
+        _phishing_db_lock = asyncio.Lock()
+    return _phishing_db_lock
+
+
+# #1617 — cap on emitted rows per scan. A cap is NOT an FP control (the gate
+# below is); it is a blast-radius bound. Exceeding it is reported, never
+# silently swallowed — see `swept_truncated`.
+PHISHING_DB_MAX_EMISSIONS = 25
+
+
+def _match_phishing_domains(
+    phishing_domains: Any, term_set: Any
+) -> List[tuple]:
+    """Boundary-anchored brand match against the Phishing.Database feed.
+
+    #1617 — extracted as a MODULE-LEVEL PURE function so the FP gate is
+    directly unit-testable (`agent/tests/test_phishing_database_gate.py`).
+    The original gate lived inline in an async method behind a network fetch,
+    so the only "coverage" it had was a backend replay cassette injected
+    DOWNSTREAM of this code — which could not reach it, and passed with the
+    gate deleted.
+
+    A term matches only when it EQUALS a whole `-`-delimited segment of a
+    `.`-delimited label of the REGISTRABLE NAME. The public suffix is excluded:
+    splitting the full domain made every `.cloud` / `.shop` / `.link` phishing
+    domain a hit for a same-named term (measured on the live 391,616-row feed:
+    `link` 6,667 hits of which 6,338 TLD-only, `site` 4,928/4,081,
+    `shop` 3,313/3,077). Substring matching is ALWAYS wrong here — raw
+    substring `trade` = 316 hits vs 6 boundary-gated.
+
+    Returns (domain, matched_term) pairs sorted by domain for determinism.
+    """
+    matched_pairs: List[tuple] = []
+    for pd in phishing_domains:
+        labels = str(pd).strip().lower().split(".")
+        if len(labels) < 2:
+            # No public suffix → not a resolvable domain; skip rather than
+            # match against a bare token.
+            continue
+        # Drop the TLD. Everything left is the registrable name + subdomains,
+        # which is the only region a brand can legitimately be impersonated in.
+        segments = [seg for label in labels[:-1] for seg in label.split("-")]
+        hit = next((t for t in segments if t in term_set), None)
+        if hit is not None:
+            matched_pairs.append((pd, hit))
+    matched_pairs.sort(key=lambda p: p[0])
+    return matched_pairs
+
+
 class DarkWebMonitorTool(ToolPlugin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-scan feed sweep status (FEED-2/HONESTY-1). execute() resets this
+        # at scan start — that stays the single reset point. Initialising it
+        # here means a leg invoked directly (Layer-A locks, and any future
+        # non-execute() caller) records its status instead of AttributeError-ing
+        # inside its own broad `except`, which would re-open the exact
+        # silent-failure hole the status field exists to close.
+        self._source_status: Dict[str, str] = {}
+
     def _get_env_int(self, name: str, default: int, minimum: int = 1, maximum: Optional[int] = None) -> int:
         raw_value = os.environ.get(name, '').strip()
         if not raw_value:
@@ -156,7 +242,7 @@ class DarkWebMonitorTool(ToolPlugin):
                 "sources": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Sources to query (default: all). Options: urlhaus, otx, github, gitlab, bitbucket, npm, stackoverflow, pastebin, leakcheck, threatfox, ransomware_leaksites, hibp, intelx, onion_forums, simulation"
+                    "description": "Sources to query (default: all). Options: urlhaus, otx, github, gitlab, bitbucket, npm, stackoverflow, pastebin, leakcheck, threatfox, ransomware_leaksites, phishing_database, hibp, intelx, onion_forums, simulation"
                 },
                 "maxResults": {
                     "type": "integer",
@@ -794,6 +880,15 @@ class DarkWebMonitorTool(ToolPlugin):
         # MonitorEngineState run timestamp here). Absent → no watermark (legacy
         # full-history behaviour preserved).
         dork_last_run = parameters.get('dorkLastRun')
+        # #1474 (P1.5) — on-demand full-cohort sweep. Default OFF; a manual
+        # validation / leak-hunt run sets it so ONE invocation exercises every
+        # GitHub dork cohort (incl. the budget-deferred overflow) instead of the
+        # single rotated cohort a cadence run issues. Bounded by the sweep lease.
+        dork_sweep_all = bool(parameters.get('dorkSweepAll', False))
+        # #1474 (P2.8) — per-scan budget-deferred dork telemetry, reset here and
+        # surfaced on the output so an operator can distinguish a clean result
+        # from an unsearched file type.
+        self._dork_coverage: List[Dict[str, Any]] = []
         # #889 — owned/defensive domains the credential legs (LeakCheck, HIBP)
         # must sweep in addition to the apex. Backend-supplied, already
         # tenant-scoped + deduped + capped + rotated per cycle; the agent only
@@ -818,11 +913,29 @@ class DarkWebMonitorTool(ToolPlugin):
             'gist',
             'stackoverflow',
             'pastebin',
+            # #1487 — serper `site:`-dork secret-hunting leg. Reaches the DARK
+            # code/paste hosts our native legs miss (Bitbucket, SourceForge,
+            # public GitLab, Codeberg, Pastebin) via Google, body-gated. Bounded
+            # + leased through the shared SERP_SEARCH quota.
+            'serper_dorks',
             'leakcheck',
             'threatfox',
             'ransomware_leaksites',
+            # #1611 — Phishing.Database ACTIVE feed (free, keyless, MIT); the
+            # first live producer of DarkWebSourceType.PHISHING_DATABASE.
+            # #1617 — deliberately NOT in the default set: it is opt-in via an
+            # explicit `sources` selection. Unlike every other always-on leg
+            # here, it has no per-tenant Integration row to self-disable on
+            # (it is keyless), so a default-on producer would arm itself for
+            # every tenant and monitor on the next agent deploy with no
+            # operator switch. Flood-control doctrine (#764-767) is
+            # kill-switch-default-ON; this is the equivalent for a new source.
             'hibp',
             'intelx',
+            # #1604 — Hudson Rock Cavalier infostealer-infection posture (free,
+            # keyless). Opt-in per tenant via the CAVALIER integration row; with
+            # no integration the leg reports `unswept_not_configured`.
+            'cavalier',
         ])
 
         if settings.get('enable_onion_sources') and 'onion_forums' not in sources:
@@ -861,7 +974,7 @@ class DarkWebMonitorTool(ToolPlugin):
             if 'otx' in sources:
                 tasks.append(self._query_otx(session, domain, agent))
             if 'github' in sources:
-                tasks.append(self._query_github(session, domain, normalized_patterns, agent, dork_cohort, dork_last_run))
+                tasks.append(self._query_github(session, domain, normalized_patterns, agent, dork_cohort, dork_last_run, dork_sweep_all))
             if 'gitlab' in sources:
                 tasks.append(self._query_gitlab(session, domain, normalized_patterns, agent))
             if 'bitbucket' in sources:
@@ -870,6 +983,8 @@ class DarkWebMonitorTool(ToolPlugin):
                 tasks.append(self._query_npm(session, domain, normalized_patterns, agent))
             if 'gist' in sources:
                 tasks.append(self._query_gist(session, domain, normalized_patterns, agent))
+            if 'serper_dorks' in sources:
+                tasks.append(self._query_serper_dorks(session, domain, normalized_patterns, agent))
             if 'stackoverflow' in sources:
                 tasks.append(self._query_stackoverflow(session, domain, normalized_patterns, agent))
             if 'pastebin' in sources:
@@ -878,10 +993,17 @@ class DarkWebMonitorTool(ToolPlugin):
                 tasks.append(self._query_threatfox(session, domain, agent))
             if 'ransomware_leaksites' in sources:
                 tasks.append(self._query_ransomware_leaksites(session, domain, keywords, agent))
+            if 'phishing_database' in sources:
+                tasks.append(self._query_phishing_database(session, domain, keywords, agent))
             if 'hibp' in sources:
                 tasks.append(self._query_hibp_breaches(session, domain, agent, extra_domains))
             if 'intelx' in sources:
                 tasks.append(self._query_intelx(session, domain, agent))
+            if 'cavalier' in sources:
+                # #1619 — ONE task that runs the two Cavalier legs in sequence.
+                # They must not be two concurrent gather entries: see
+                # _query_cavalier_sequenced for why.
+                tasks.append(self._query_cavalier_sequenced(session, domain, agent))
             if 'onion_forums' in sources:
                 tasks.append(self._query_onion_forums(domain, normalized_patterns, agent))
 
@@ -969,6 +1091,10 @@ class DarkWebMonitorTool(ToolPlugin):
                 # FEED-2/HONESTY-1 — per-source sweep status; an UNSWEPT/NEEDKEY/
                 # ERROR leg must not read as 'clean'.
                 'sourceStatus': dict(self._source_status),
+                # #1474 (P2.8) — GitHub dork cohorts whose dorks were
+                # budget-deferred this scan; an unsearched file type is NOT a
+                # clean result. Empty on a sweep-all run (nothing deferred).
+                'dorkCoverage': list(getattr(self, '_dork_coverage', []) or []),
             },
             'tool': 'darkweb',
             'scan_type': 'monitor',
@@ -1079,10 +1205,20 @@ class DarkWebMonitorTool(ToolPlugin):
         Feature-flagged via ENABLE_OTX (default off — DRP locked-decision
         #5). When disabled, returns [] immediately without leasing or
         calling OTX.
+
+        FEED-2/HONESTY-1: every exit path records `_mark_source_status('otx', …)`
+        so an empty result list is never ambiguous. This leg previously recorded
+        NOTHING, so a hard failure (it unpacked `upstream_request`'s (response,
+        meta) tuple as a bare response and raised AttributeError into the broad
+        `except`) was byte-identical to a genuinely clean sweep. Sibling legs
+        (`_query_urlhaus`, `_query_threatfox`, `_query_cavalier`) already follow
+        this discipline; OTX was the sole hold-out.
         """
         results: List[Dict] = []
 
         if not ENABLE_OTX:
+            # Off by default. NOT clean — the leg simply did not run.
+            self._mark_source_status('otx', 'unswept_disabled')
             if agent:
                 agent.report_progress(
                     "OTX query skipped: ENABLE_OTX is off (set ENABLE_OTX=true to enable)"
@@ -1098,10 +1234,14 @@ class DarkWebMonitorTool(ToolPlugin):
             otx_key = lease.get('apiKey') or ''
             lease_token = lease.get('leaseToken')
         except QuotaExceededError as e:
+            self._mark_source_status('otx', 'unswept_quota')
             if agent:
                 agent.report_progress(f"OTX quota exceeded: retry in {e.retry_after}s")
             return results
         except IntegrationCredentialsError:
+            # No OTX_API integration for this tenant — fall through to the
+            # anonymous / env-key free tier. The leg still runs, so no status is
+            # recorded here; the call below decides swept vs error.
             otx_key = os.environ.get('OTX_API_KEY', '')
 
         otx_success = False
@@ -1122,7 +1262,12 @@ class DarkWebMonitorTool(ToolPlugin):
             # the dark-web scan. Wrap upstream_request (Wave-Quota retry
             # policy) in wait_for to keep the per-call cap intact across
             # backoff attempts.
-            resp = await asyncio.wait_for(
+            #
+            # upstream_request returns a (response, meta) TUPLE — unpack it.
+            # Binding the tuple to a bare `resp` made every attribute access
+            # below raise AttributeError into the broad `except`, which is what
+            # took this leg 100% dark while still reporting success.
+            resp, _otx_meta = await asyncio.wait_for(
                 upstream_request(
                     session, 'GET', url,
                     headers=headers,
@@ -1130,7 +1275,19 @@ class DarkWebMonitorTool(ToolPlugin):
                 ),
                 timeout=20,
             )
-            if resp.status == 200:
+            if resp.status in (401, 403):
+                # Bad / rejected key — the leg is UNSWEPT, not clean.
+                self._mark_source_status('otx', 'unswept_needkey')
+                otx_error_code = f'http_{resp.status}'
+            elif resp.status == 429:
+                self._mark_source_status('otx', 'unswept_ratelimited')
+                otx_error_code = 'http_429'
+            elif resp.status != 200:
+                self._mark_source_status('otx', f'error_http_{resp.status}')
+                otx_error_code = f'http_{resp.status}'
+            else:
+                self._mark_source_status('otx', 'swept')
+                otx_success = True
                 data = await resp.json()
                 pulses = data.get('pulse_info', {}).get('pulses', [])
                 for pulse in pulses[:15]:
@@ -1168,12 +1325,15 @@ class DarkWebMonitorTool(ToolPlugin):
                             'targeted_countries': pulse.get('targeted_countries', []),
                         }
                     })
-            otx_success = True
         except asyncio.TimeoutError:
+            self._mark_source_status('otx', 'error_timeout')
+            otx_success = False
             otx_error_code = 'TimeoutError'
             if agent:
                 agent.report_progress("OTX query timed out after 20s")
         except Exception as e:
+            self._mark_source_status('otx', 'error')
+            otx_success = False
             otx_error_code = type(e).__name__
             if agent:
                 agent.report_progress(f"OTX query failed: {str(e)}")
@@ -1201,23 +1361,84 @@ class DarkWebMonitorTool(ToolPlugin):
     # repo that merely mentions the brand near a credential keyword does not flood
     # HIGH alerts. Paired with a Shannon-entropy check for opaque tokens.
     _SECRET_PATTERNS = [
+        # ── private keys + first-party cloud keys (pre-existing) ──────────────
         re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),
         re.compile(r'AKIA[0-9A-Z]{16}'),                       # AWS access key id
         re.compile(r'gh[pousr]_[A-Za-z0-9]{36,}'),             # GitHub token
         re.compile(r'xox[baprs]-[A-Za-z0-9-]{10,}'),           # Slack token
         re.compile(r'AIza[0-9A-Za-z_\-]{35}'),                 # Google API key
         re.compile(r'sk-[A-Za-z0-9]{20,}'),                    # OpenAI-style key
-        # generic `key/secret/token/password = "<QUOTED value>"` assignment — a
-        # hardcoded credential is almost always a string literal. Requiring the
-        # quotes excludes function-call / env-var / variable-name values
-        # (`password = get_password_from_env()`) that the unquoted form FP'd on;
-        # unquoted opaque blobs are still caught by the entropy check below and
-        # the vendor-specific patterns above.
+        # ── #1474 vendor-prefixed token families ──────────────────────────────
+        # Modelled on the GitLeaks / TruffleHog published detector rule sets and
+        # each provider's own token-prefix docs. Prefix-anchored on purpose: a
+        # stable vendor prefix is a far lower-FP signal than raw entropy for
+        # these shapes, and reaches keys the entropy gate cannot (short, or
+        # low-entropy vendor tokens).
+        # Stripe secret / restricted / webhook keys — `sk_live_`/`rk_live_`/
+        # `sk_test_`/`whsec_` (Stripe API-keys docs; gitleaks `stripe-access-token`).
+        re.compile(r'(?:sk|rk)_(?:live|test|prod)_[A-Za-z0-9]{10,}'),
+        re.compile(r'whsec_[A-Za-z0-9]{20,}'),
+        # Twilio Account SID / API-key SID — `AC`/`SK` + 32 hex (Twilio docs;
+        # gitleaks `twilio-api-key`). Prefix-anchored so this is reachable even
+        # though a bare 32-hex token cannot satisfy the entropy gate's alphabet.
+        re.compile(r'\b(?:AC|SK)[0-9a-fA-F]{32}\b'),
+        # SendGrid API key — `SG.<id>.<secret>` (SendGrid docs; gitleaks
+        # `sendgrid-api-token`). Segment bounds loosened below the canonical
+        # 22/43 so a shorter synthetic still anchors on the stable `SG.` prefix.
+        re.compile(r'SG\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{20,}'),
+        # GitLab personal / project access token — `glpat-` + 20 (GitLab docs;
+        # gitleaks `gitlab-pat`).
+        re.compile(r'glpat-[0-9A-Za-z_\-]{20}'),
+        # Google service-account JSON key descriptor (gitleaks `gcp-service-
+        # account`). The `"private_key"` body is already caught by the PRIVATE
+        # KEY pattern above; this fires on the account descriptor even when the
+        # key body is redacted/elided.
+        re.compile(r'(?i)"type"\s*:\s*"service_account"'),
+        # Azure storage account key inside a connection string (Azure docs;
+        # gitleaks `azure-storage-connection-string`).
+        re.compile(r'(?i)AccountKey\s*=\s*[A-Za-z0-9+/=]{40,}'),
+        # Generic JWT — three base64url segments, header begins `eyJ` (gitleaks
+        # `jwt`). Reachable independent of entropy (a JWT's `.`-delimited shape
+        # is the signal).
+        re.compile(r'eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,}'),
+        # Credential embedded in a connection URI — DB drivers plus any scheme
+        # carrying an inline `user:pass@` (gitleaks `*-connection-string`).
+        # Covers postgres/mysql/mongodb(+srv)/redis/amqp AND a leaked
+        # `.git-credentials` `https://user:token@host` line.
         re.compile(
-            r'(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|access[_-]?key)'
-            r'\s*[:=]\s*[\'"][A-Za-z0-9/+_\-]{12,}[\'"]'
+            r'(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|https?)'
+            r'://[^\s:@/]+:[^\s@/]{4,}@'
+        ),
+        # npm registry auth token in `.npmrc` — the `_authToken=` assignment or
+        # the `npm_` prefix (gitleaks `npm-access-token`).
+        re.compile(r'_authToken\s*=\s*["\']?[A-Za-z0-9_\-./=+]{8,}'),
+        re.compile(r'\bnpm_[A-Za-z0-9]{36,}'),
+        # ── generic keyword/quoted-assignment (a value is actually present) ────
+        # A hardcoded credential is almost always a quoted string literal.
+        # Requiring quotes excludes function-call / env-var values
+        # (`password = get_password_from_env()`) that the unquoted form FP'd on.
+        # #1474: the optional surrounding quotes match a JSON key
+        # (`"api_key": "…"`), and the optional identifier prefix/suffix match
+        # compound keys (`DJANGO_SECRET_KEY`, `DB_PASSWORD`, `SECRET_KEY = …`) —
+        # the two most common real config shapes the anchored form missed. The
+        # quoted, space-free, 12+ char value stays the precision guard.
+        re.compile(
+            r'(?i)["\']?[A-Za-z0-9_]*'
+            r'(?:api[_-]?key|secret|token|password|passwd|pwd|access[_-]?key)'
+            r'[A-Za-z0-9_]*["\']?\s*[:=]\s*[\'"][A-Za-z0-9/+_\-.]{12,}[\'"]'
         ),
     ]
+
+    # #1474 — credential-context words. A bare hex blob (git commit SHA, MD5/
+    # SHA digest, hex colour) is indistinguishable from a hex secret by entropy
+    # ALONE, so the hex entropy path only fires when one of these appears in the
+    # fragment. Non-hex (base64/mixed-alphabet) tokens keep the context-free
+    # entropy path — their alphabet richness is itself the discriminator.
+    _SECRET_CONTEXT_RE = re.compile(
+        r'(?i)(?:api[_-]?key|secret|token|passw|pwd|auth|credential|'
+        r'private[_-]?key|access[_-]?key|\bsid\b)'
+    )
+    _HEX_TOKEN_RE = re.compile(r'^[0-9a-fA-F]+$')
 
     @staticmethod
     def _shannon_entropy(s: str) -> float:
@@ -1230,30 +1451,183 @@ class DarkWebMonitorTool(ToolPlugin):
         n = len(s)
         return -sum((c / n) * log2(c / n) for c in counts.values())
 
+    # Ordered detector labels for `_SECRET_PATTERNS` — the `detectorName` a hit
+    # reports (#1477), mirroring the GitLeaks / TruffleHog rule-name convention
+    # each regex was modelled on. Index-aligned with `_SECRET_PATTERNS`; a stable
+    # unit test (test_darkweb_secret_detection) asserts the two stay the same
+    # length so a new pattern without a name fails the build rather than
+    # reporting a bare index.
+    _SECRET_PATTERN_NAMES = [
+        'private-key',
+        'aws-access-key-id',
+        'github-token',
+        'slack-token',
+        'google-api-key',
+        'openai-api-key',
+        'stripe-secret-key',
+        'stripe-webhook-secret',
+        'twilio-sid',
+        'sendgrid-api-key',
+        'gitlab-pat',
+        'gcp-service-account',
+        'azure-storage-key',
+        'jwt',
+        'connection-string',
+        'npmrc-auth-token',
+        'npm-access-token',
+        'generic-assignment',
+    ]
+
+    def _match_secret(self, text: str) -> Optional[Dict[str, Any]]:
+        """Return the FIRST secret match detail in `text`, or None (#1477).
+
+        Detail dict: `{ 'value': <matched substring>, 'detectorName': <str> }`.
+        `detectorName` is the `_SECRET_PATTERN_NAMES` label for a regex hit, or
+        `'high-entropy'` for the charset-aware entropy path. `value` is the exact
+        matched span the caller masks + fingerprints — it is NEVER surfaced raw
+        (the caller strips it after computing the masked preview + fingerprint).
+
+        Same detection logic + charset-aware entropy gate as the historical
+        `_fragment_has_secret` bool (which now delegates here), documented in
+        full on that method.
+        """
+        if not text:
+            return None
+        for pat, name in zip(self._SECRET_PATTERNS, self._SECRET_PATTERN_NAMES):
+            m = pat.search(text)
+            if m:
+                return {'value': m.group(0), 'detectorName': name}
+        has_context = bool(self._SECRET_CONTEXT_RE.search(text))
+        for token in re.findall(r'[A-Za-z0-9/+_\-]{20,}', text):
+            if self._HEX_TOKEN_RE.match(token):
+                if (
+                    has_context
+                    and len(token) >= 32
+                    and self._shannon_entropy(token) >= 3.5
+                ):
+                    return {'value': token, 'detectorName': 'high-entropy'}
+                continue
+            if len(set(token)) >= 18 and self._shannon_entropy(token) >= 4.2:
+                return {'value': token, 'detectorName': 'high-entropy'}
+        return None
+
     def _fragment_has_secret(self, text: str) -> bool:
         """True when a code fragment carries a credential-shaped token (regex) OR
         a high-entropy opaque token. The bare WORD 'password'/'secret' is NOT
         sufficient (GHSECRET-1).
 
-        Entropy gate: a token of length>=20 must have BOTH entropy>=4.2 bits/char
-        AND >=18 distinct characters. Measured over the restricted token alphabet,
-        long snake_case/SCREAMING_SNAKE/camelCase identifiers top out around 3.98
-        bits/char (e.g. `DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS` = 3.975, 19
-        distinct), whereas a real random base64 token runs ~4.6-4.7 with 27+
-        distinct — so 4.2 cleanly separates the two without losing recall on
-        genuine opaque secrets. Low-entropy/short or vendor-specific secrets are
-        caught by the regex patterns above; truly opaque unquoted blobs by this
-        check (an unrecognised low-entropy token is demoted to a LOW brand
-        mention, still surfaced, never a HIGH false positive)."""
-        if not text:
-            return False
-        for pat in self._SECRET_PATTERNS:
-            if pat.search(text):
-                return True
-        for token in re.findall(r'[A-Za-z0-9/+_\-]{20,}', text):
-            if len(set(token)) >= 18 and self._shannon_entropy(token) >= 4.2:
-                return True
-        return False
+        Entropy gate (charset-aware — #1474):
+        * A base64/mixed-alphabet token (length>=20) must have BOTH entropy>=4.2
+          bits/char AND >=18 distinct characters. Long snake_case/SCREAMING_SNAKE
+          identifiers top out ~3.98 bits/char (`DEFAULT_REFRESH_TOKEN_EXPIRY_
+          SECONDS` = 3.975), whereas a real random base64 token runs ~4.6-4.7
+          with 27+ distinct — 4.2 cleanly separates them without losing recall.
+        * A HEX-only token can never reach 18 distinct or 4.2 bits/char (the hex
+          alphabet caps distinct at 16 and entropy at 4.0), so the base64 rule
+          was UNSATISFIABLE for hex — 32/40-hex vendor secrets could never fire
+          via entropy. Hex tokens now use hex-scaled thresholds (length>=32,
+          entropy>=3.5) BUT only inside a credential context (`_SECRET_CONTEXT_RE`)
+          so a bare git commit SHA / digest / hex colour — which carries no
+          secret keyword — stays unflagged (no FP flood). Vendor-prefixed hex
+          secrets (Twilio `AC…`/`SK…`) are already caught by the regexes above,
+          context-free.
+
+        Vendor-specific / low-entropy secrets are caught by the regex patterns
+        above; truly opaque unquoted blobs by this check (an unrecognised
+        low-entropy token is demoted to a LOW brand mention, still surfaced,
+        never a HIGH false positive).
+
+        #1477 — thin bool wrapper over `_match_secret` so the two never diverge;
+        existing bool call-sites are unchanged."""
+        return self._match_secret(text) is not None
+
+    # ── #1477 — redacted exposed-secret evidence (agent-side masking) ─────────
+    # A detected secret is masked HERE, on the agent, so the raw value never
+    # leaves the process: only a partially-redacted preview + a non-reversible
+    # fingerprint are ever returned. Mirrors how GitHub secret-scanning /
+    # GitLeaks / TruffleHog present a finding (short prefix/suffix, mask the
+    # middle) and follows OWASP secret-handling (never persist recoverable
+    # secret material). The fingerprint is a truncated SHA-256 of the raw value,
+    # used for cross-scan / cross-repo DEDUPE only — the same key surfacing in
+    # two repos collapses to one fingerprint.
+    _SECRET_FINGERPRINT_LEN = 16     # truncated SHA-256 hex chars (dedupe key)
+    _SECRET_PREVIEW_PREFIX = 4       # revealed leading chars
+    _SECRET_PREVIEW_SUFFIX = 2       # revealed trailing chars
+    _SECRET_MIN_PREVIEW_LEN = 12     # below this the value is masked FULLY
+    _SECRET_MIN_PREVIEW_ENTROPY = 2.5  # low-entropy → mask fully
+    _SECRET_MASK_CHAR = '•'     # '•'
+
+    @classmethod
+    def _mask_secret_value(cls, value: str) -> str:
+        """Partially-redacted preview of `value` (#1477).
+
+        Reveals the first `_SECRET_PREVIEW_PREFIX` + last `_SECRET_PREVIEW_SUFFIX`
+        chars and masks the middle (`AKIA••••••••••••2F`). SHORT-SECRET GUARD:
+        a value shorter than `_SECRET_MIN_PREVIEW_LEN`, one where revealing
+        prefix+suffix would expose more than ~40% of the token, OR a low-entropy
+        token is masked FULLY — never leaking a reconstructable fraction of a
+        short/low-entropy secret. Fixed-width mask body (does not echo the true
+        length) so the preview leaks neither the secret nor its exact length."""
+        v = value or ''
+        n = len(v)
+        revealed = cls._SECRET_PREVIEW_PREFIX + cls._SECRET_PREVIEW_SUFFIX
+        low_entropy = cls._shannon_entropy(v) < cls._SECRET_MIN_PREVIEW_ENTROPY
+        # Fully mask: too short, low-entropy, or the revealed fraction would
+        # expose >40% of the token (a reconstructable slice).
+        if (
+            n < cls._SECRET_MIN_PREVIEW_LEN
+            or low_entropy
+            or revealed > n * 0.4
+        ):
+            return cls._SECRET_MASK_CHAR * 8
+        return (
+            v[: cls._SECRET_PREVIEW_PREFIX]
+            + cls._SECRET_MASK_CHAR * 8
+            + v[-cls._SECRET_PREVIEW_SUFFIX :]
+        )
+
+    @classmethod
+    def _secret_fingerprint(cls, value: str) -> str:
+        """Non-reversible truncated SHA-256 of the RAW secret (#1477).
+
+        DEDUPE-ONLY: stable across scans/repos so the same key collapses to one
+        fingerprint; two different secrets differ. Computed here then the raw
+        value is discarded — the fingerprint is NOT the value and cannot be
+        reversed to it."""
+        return hashlib.sha256((value or '').encode('utf-8', 'ignore')).hexdigest()[
+            : cls._SECRET_FINGERPRINT_LEN
+        ]
+
+    def _build_exposed_secret_evidence(self, match: Dict[str, Any]) -> Dict[str, Any]:
+        """Structured, redacted `exposedSecret` evidence object (#1477).
+
+        Input is a `_match_secret` detail dict (`value` + `detectorName`). The
+        returned dict carries ONLY masked / non-reversible fields — the raw
+        `value` is masked + fingerprinted here and then dropped; an assert
+        guards that it never appears verbatim in the output. This object is the
+        documented, stable contract an ASM TruffleHog liveness verifier consumes
+        (detectorName + secretType + maskedPreview + fingerprint, alongside the
+        repo/sha/path the emitter already ships)."""
+        raw = match.get('value') or ''
+        detector = match.get('detectorName') or 'unknown'
+        evidence = {
+            'maskedPreview': self._mask_secret_value(raw),
+            'detectorName': detector,
+            'secretType': detector,
+            'length': len(raw),
+            'entropyBits': round(self._shannon_entropy(raw), 2),
+            'fingerprint': self._secret_fingerprint(raw),
+        }
+        # Raw-value invariant (defense-in-depth): the full secret string appears
+        # in NONE of the returned fields. A short token whose entire body is
+        # revealed by an over-generous preview would trip this — the mask guard
+        # prevents it, and this assert makes a regression fail loudly.
+        if raw:
+            for k, val in evidence.items():
+                assert raw != val and (not isinstance(val, str) or raw not in val), (
+                    f'raw secret leaked into exposedSecret.{k}'
+                )
+        return evidence
 
     # ── Cross-provider EXPOSED_SECRET gate ────────────────────────────────────
     # The _fragment_has_secret gate historically ran ONLY in the GitHub path, so
@@ -1317,6 +1691,12 @@ class DarkWebMonitorTool(ToolPlugin):
     # settings.py, extension:cfg/bak) are intentionally deferred for budget —
     # documented here, not silently dropped at runtime. Cohorts 4/5 = commit/issue.
     _GH_LEGACY_COHORT = 0
+    # #1474 — high-signal filename/extension dorks. Each cohort's list may run
+    # LONGER than _GH_MAX_QUERIES_PER_TERM; the overflow is intentionally
+    # budget-DEFERRED at build time (sliced off, telemetry emitted) rather than
+    # silently absent. The first _GH_MAX_QUERIES_PER_TERM of each cohort are the
+    # searched set; the rest are covered by the on-demand `dorkSweepAll` mode or
+    # by rotating cohort membership in a future tuning pass.
     _GH_CODE_DORK_COHORTS = {
         0: [  # legacy keyword + config-file set (the pre-#436 behaviour)
             'password OR secret OR api_key OR token',
@@ -1326,13 +1706,37 @@ class DarkWebMonitorTool(ToolPlugin):
         1: [  # high-signal credential filenames
             'filename:.npmrc', 'filename:.git-credentials', 'filename:id_rsa',
             'filename:wp-config.php', 'filename:secrets.json',
+            'filename:credentials',
+            # deferred overflow (#1474):
+            'filename:settings.py', 'filename:serviceAccount.json',
+            'filename:.dockercfg',
+            # filename dorks relocated here from cohort 3 so the brand-specific
+            # `api.<domain>` dork survives cohort 3's per-term budget cap (they
+            # are filename dorks and belong with the filename cohort).
+            'filename:.pgpass', 'filename:.aws/credentials',
+            'filename:terraform.tfvars',
+            # #1487 net-new high-signal filenames (GitLeaks/TruffleHog rule
+            # filenames). Appended after the existing set so they land in the
+            # budget-DEFERRED overflow of THIS filename cohort — covered by
+            # dorkSweepAll — and never displace an already-searched dork.
+            'filename:.netrc', 'filename:.pypirc', 'filename:.htpasswd',
+            'filename:database.yml', 'filename:.env.local',
         ],
         2: [  # high-signal credential extensions
             'extension:pem', 'extension:sql', 'extension:json',
-            'extension:properties', 'extension:ini',
+            'extension:properties', 'extension:ini', 'extension:key',
+            # deferred overflow (#1474):
+            'extension:cfg', 'extension:bak', 'extension:pfx', 'extension:p12',
+            # #1487 net-new high-signal secret-bearing extensions (VPN profile,
+            # Java keystores). Deferred overflow of the extension cohort.
+            'extension:ovpn', 'extension:jks', 'extension:keystore',
         ],
         3: [  # brand-specific credential names (api.<domain> appended at build)
-            'consumer_key', 'refresh_token', 'client_secret',
+            # #1487 — `access_token` added as a 4th credential-name dork. With the
+            # build-time `api.<domain>` append that is 5 dorks, still inside the
+            # per-term cap of 6, so the appended `api.<domain>` dork is NOT
+            # crowded out (the exact #1480 regression this cohort guards against).
+            'consumer_key', 'refresh_token', 'client_secret', 'access_token',
         ],
     }
 
@@ -1417,17 +1821,48 @@ class DarkWebMonitorTool(ToolPlugin):
             for y in range(year, year - cls._GH_MAX_SLICES, -1)
         ]
 
+    # #1474 — on-demand full sweep. A manual/validation leak-hunt sets
+    # `dorkSweepAll` so ONE run exercises every cohort's dorks (including the
+    # budget-deferred overflow), instead of the single rotated cohort a normal
+    # cadence run issues. Bounded by _GH_SWEEP_MAX_UNITS so the (larger) sweep
+    # lease is never breached; uses fewer terms to keep the fan-out finite.
+    _GH_SWEEP_MAX_UNITS = 55
+    _GH_MAX_UNITS_SWEEP = 60
+    _GH_SWEEP_TERMS = 2
+
+    def _record_deferred_dorks(self, cohort: int, deferred: List[str]) -> None:
+        """#1474 (P2.8) — operator-visible skip telemetry for budget-deferred
+        dorks. Without this, an unsearched file type is indistinguishable from a
+        genuinely clean result. Recorded on `self._dork_coverage` (surfaced on
+        the scan output) and logged."""
+        if not deferred:
+            return
+        note = {'cohort': cohort, 'deferredDorks': list(deferred), 'reason': 'per_scan_budget'}
+        coverage = getattr(self, '_dork_coverage', None)
+        if coverage is None:
+            coverage = self._dork_coverage = []
+        coverage.append(note)
+        logger.info(
+            f"[GitHub] cohort {cohort} deferred {len(deferred)} dork(s) for budget "
+            f"(run with dorkSweepAll to cover): {', '.join(deferred)}"
+        )
+
     def _build_cohort_queries(
         self, search_terms: List[str], domain: str, cohort: int,
-        last_run_iso: Optional[str] = None,
+        last_run_iso: Optional[str] = None, sweep: bool = False,
     ) -> List[tuple]:
         """(term, endpoint, query, page) triples for this cycle's cohort (#436).
         endpoint ∈ {'code','commits','issues'}. The `"@<domain>"` email dork is
         prepended to EVERY cohort as the always-on employee-exposure leg (full
         domain → always carries a dot → passes the secret gate's verbatim path
         and the backend brand-relevance gate). The returned list is hard-capped
-        at _GH_MAX_COHORT_CODE_UNITS so the lease is never breached."""
-        terms = [t for t in search_terms[:4] if t]
+        at _GH_MAX_COHORT_CODE_UNITS so the lease is never breached.
+
+        #1474 — when `sweep` is set (on-demand full-cohort run) the per-term dork
+        slice is lifted so the budget-deferred overflow dorks are included; the
+        overall bound is enforced by the caller's _GH_SWEEP_MAX_UNITS cap."""
+        max_terms = self._GH_SWEEP_TERMS if sweep else 4
+        terms = [t for t in search_terms[:max_terms] if t]
         triples: List[tuple] = []
         c = cohort % self._GH_NUM_COHORTS
         # Always-on employee-exposure leg on every cohort EXCEPT the legacy
@@ -1454,9 +1889,14 @@ class DarkWebMonitorTool(ToolPlugin):
             suffixes = list(self._GH_CODE_DORK_COHORTS.get(c, []))
             if c == 3 and domain:
                 suffixes.append(f'api.{domain}')  # brand API host credential dork
+            per_term = len(suffixes) if sweep else self._GH_MAX_QUERIES_PER_TERM
+            searched = suffixes[:per_term]
+            deferred = suffixes[per_term:]
+            if deferred and not sweep:
+                self._record_deferred_dorks(c, deferred)
             for term in terms:
                 quoted = f'"{term}"'
-                for suffix in suffixes[: self._GH_MAX_QUERIES_PER_TERM]:
+                for suffix in searched:
                     triples.append((term, 'code', f'{quoted} {suffix}', 1))
         capped = triples[: self._GH_MAX_COHORT_CODE_UNITS]
         # #453 — watermark each query to the last run so we keep slices small and
@@ -1466,6 +1906,30 @@ class DarkWebMonitorTool(ToolPlugin):
             (term, endpoint, self._apply_watermark(query, endpoint, last_run_iso), page)
             for (term, endpoint, query, page) in capped
         ]
+
+    def _build_sweep_queries(
+        self, search_terms: List[str], domain: str,
+        last_run_iso: Optional[str] = None,
+    ) -> List[tuple]:
+        """#1474 (P1.5) — bounded 'sweep every cohort in one run' query set.
+        Iterates all cohorts (including their budget-deferred overflow dorks),
+        deduping identical (endpoint, query, page) triples, capped at
+        _GH_SWEEP_MAX_UNITS so the sweep lease budget is respected."""
+        seen: set = set()
+        out: List[tuple] = []
+        for c in range(self._GH_NUM_COHORTS):
+            for triple in self._build_cohort_queries(
+                search_terms, domain, c, last_run_iso, sweep=True
+            ):
+                term, endpoint, query, page = triple
+                key = (endpoint, query, page)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(triple)
+                if len(out) >= self._GH_SWEEP_MAX_UNITS:
+                    return out
+        return out
 
     def _emit_github_match(
         self, *, source_name: str, html_url: str, source_id: str,
@@ -1482,7 +1946,14 @@ class DarkWebMonitorTool(ToolPlugin):
         token-boundary checked (never the raw search term) to avoid the
         flexiti→flexitime / qt-bonds infix-FP class (#348)."""
         fragment_available = bool(fragment and fragment.strip())
-        has_secret = fragment_available and self._fragment_has_secret(fragment)
+        # #1477 — capture the match DETAIL (matched span + detectorName) so a
+        # redacted `exposedSecret` evidence object can be built agent-side. The
+        # raw span is masked + fingerprinted below and never returned verbatim.
+        secret_match = self._match_secret(fragment) if fragment_available else None
+        has_secret = secret_match is not None
+        exposed_secret = (
+            self._build_exposed_secret_evidence(secret_match) if secret_match else None
+        )
         # #879 — REAL keep/drop gate. `_text_matches_search_terms` is
         # token-boundary containment (empty on no match); a vendor row with NO
         # genuine match is DROPPED, not kept with the domain stamped as a phantom
@@ -1529,6 +2000,10 @@ class DarkWebMonitorTool(ToolPlugin):
                 'githubLeg': leg,
                 # owned-domain reference for the backend relevance gate.
                 'domain': domain,
+                # #1477 — redacted exposed-secret evidence (masked preview +
+                # non-reversible fingerprint + detector). Absent when no secret
+                # matched. verificationVerdict is folded in post-verify.
+                **({'exposedSecret': exposed_secret} if exposed_secret else {}),
             },
         }
 
@@ -1606,8 +2081,18 @@ class DarkWebMonitorTool(ToolPlugin):
         """Shallow-clone + TruffleHog full-history scan with --only-verified.
 
         Returns {verdict, detail, historyOnly}. verdict ∈ verified | unverified |
-        unknown | skipped_oversized | unavailable. NEVER raises — any failure
-        degrades to 'unknown' (recall-preserving: we just couldn't check).
+        unsupported-provider | unknown | skipped_oversized | unavailable. NEVER
+        raises — any failure degrades to 'unknown' (recall-preserving: we just
+        couldn't check).
+
+        #1474 — verdict split. Running WITHOUT `--only-verified` lets us tell
+        apart the two "not verified" outcomes TruffleHog otherwise flattens:
+        * `unverified` — a detector reached the provider and the provider
+          REJECTED the secret (invalid/revoked/placeholder) → safe to demote.
+        * `unsupported-provider` — a detector matched but verification could NOT
+          complete (no verifier for that provider, or a verification error). A
+          real live key of such a provider must NOT be silently demoted, so this
+          keeps the candidate severity.
         """
         if not shutil.which('trufflehog'):
             return {'verdict': 'unavailable', 'detail': 'trufflehog not installed'}
@@ -1629,16 +2114,44 @@ class DarkWebMonitorTool(ToolPlugin):
             ) / (1024 * 1024)
             if size_mb > self._GH_CLONE_MAX_MB:
                 return {'verdict': 'skipped_oversized', 'detail': f'{size_mb:.0f}MB > {self._GH_CLONE_MAX_MB}MB'}
+            # #1474 — scan WITHOUT `--only-verified` so unverified findings (and
+            # their VerificationError, if any) are visible, letting us split
+            # 'unverified' (provider rejected) from 'unsupported-provider'
+            # (verification could not run). Each JSON line is one finding.
             th = subprocess.run(
-                ['trufflehog', 'git', f'file://{tmp}', '--only-verified', '--json', '--no-update'],
+                ['trufflehog', 'git', f'file://{tmp}', '--json', '--no-update'],
                 capture_output=True, timeout=120, text=True, start_new_session=True,  # #571
             )
-            verified = [ln for ln in (th.stdout or '').splitlines() if ln.strip()]
+            findings: List[Dict[str, Any]] = []
+            for ln in (th.stdout or '').splitlines():
+                ln = ln.strip()
+                if not ln.startswith('{'):
+                    continue
+                try:
+                    findings.append(json.loads(ln))
+                except (ValueError, TypeError):
+                    continue
+            if not findings:
+                return {'verdict': 'unverified', 'detail': 'no secrets detected in history'}
+            verified = [f for f in findings if f.get('Verified') is True]
             if verified:
                 # historyOnly = the verified finding is not in the working tree HEAD.
-                history_only = any('"commit"' in ln and '"HEAD"' not in ln for ln in verified)
+                def _commit_not_head(f: Dict[str, Any]) -> bool:
+                    git = (((f.get('SourceMetadata') or {}).get('Data') or {}).get('Git') or {})
+                    return bool(git.get('commit')) and git.get('commit') != 'HEAD'
+                history_only = any(_commit_not_head(f) for f in verified)
                 return {'verdict': 'verified', 'detail': f'{len(verified)} verified', 'historyOnly': history_only}
-            return {'verdict': 'unverified', 'detail': 'no verified secrets in history'}
+            # Nothing verified. A detector matched but verification did not
+            # succeed — split "provider rejected" from "could not verify".
+            could_not_verify = any(
+                (f.get('VerificationError') or '').strip() for f in findings
+            )
+            if could_not_verify:
+                return {
+                    'verdict': 'unsupported-provider',
+                    'detail': 'detector matched but verification could not complete',
+                }
+            return {'verdict': 'unverified', 'detail': 'provider rejected candidate secret(s)'}
         except subprocess.TimeoutExpired:
             return {'verdict': 'unknown', 'detail': 'verify timeout'}
         except Exception as e:  # never sink the scan on a verify failure
@@ -1652,10 +2165,13 @@ class DarkWebMonitorTool(ToolPlugin):
     ) -> List[Dict]:
         """Promote/demote EXPOSED_SECRET candidates by live-verification verdict.
 
-        verified            → HIGH (confirmed live credential)
-        unverified          → demote to MEDIUM + honest 'unverified' marker
-        skipped_oversized   → keep severity + honest marker (couldn't fully check)
-        unknown/unavailable → keep severity + honest marker (recall-preserving)
+        verified              → HIGH (confirmed live credential)
+        unverified            → demote to LOW (provider rejected the candidate)
+        unsupported-provider  → keep severity + honest marker (#1474 — TruffleHog
+                                could not verify this provider; a real live key
+                                must NOT be silently demoted)
+        skipped_oversized     → keep severity + honest marker (couldn't fully check)
+        unknown/unavailable   → keep severity + honest marker (recall-preserving)
 
         `verifier` is an injectable `(clone_url) -> verdict-dict` for tests; in
         production it defaults to the blocking TruffleHog run (off-thread).
@@ -1666,12 +2182,18 @@ class DarkWebMonitorTool(ToolPlugin):
             if r.get('matchType') != 'EXPOSED_SECRET':
                 continue
             if budget <= 0:
-                r.setdefault('metadata', {})['verificationVerdict'] = 'unknown'
-                r['metadata']['verificationDetail'] = 'verify budget exhausted'
+                m = r.setdefault('metadata', {})
+                m['verificationVerdict'] = 'unknown'
+                m['verificationDetail'] = 'verify budget exhausted'
+                if isinstance(m.get('exposedSecret'), dict):
+                    m['exposedSecret']['verificationVerdict'] = 'unknown'
                 continue
             clone_url = self._derive_clone_url(r)
             if not clone_url:
-                r.setdefault('metadata', {})['verificationVerdict'] = 'unknown'
+                m = r.setdefault('metadata', {})
+                m['verificationVerdict'] = 'unknown'
+                if isinstance(m.get('exposedSecret'), dict):
+                    m['exposedSecret']['verificationVerdict'] = 'unknown'
                 continue
             budget -= 1
             if agent:
@@ -1684,6 +2206,13 @@ class DarkWebMonitorTool(ToolPlugin):
             meta = r.setdefault('metadata', {})
             meta['verificationVerdict'] = v
             meta['verificationDetail'] = (verdict or {}).get('detail')
+            # #1477 — fold the verdict into the redacted exposedSecret evidence
+            # object too, so the single structured contract the DRP UI / ASM
+            # liveness verifier reads carries the live-check outcome alongside
+            # the masked preview + fingerprint (still ALSO on metadata for the
+            # existing promote/demote branches below).
+            if isinstance(meta.get('exposedSecret'), dict):
+                meta['exposedSecret']['verificationVerdict'] = v
             if (verdict or {}).get('historyOnly'):
                 meta['secretInHistoryOnly'] = True
             if v == 'verified':
@@ -1701,11 +2230,18 @@ class DarkWebMonitorTool(ToolPlugin):
                 r['riskScore'] = min(int(r.get('riskScore') or 50), 40)
                 meta['unverifiedSecretCandidate'] = True
                 r['title'] = f"Unverified secret candidate (brand mention) in {meta.get('repository', 'unknown')}"
-            # unknown / unavailable / skipped_oversized → matchType + severity
-            # unchanged (recall-preserving) but honestly marked above.
+            elif v == 'unsupported-provider':
+                # #1474 — TruffleHog matched a candidate but has no working
+                # verifier for this provider. Do NOT demote (that would bury a
+                # real live leak of an unverifiable provider); keep the candidate
+                # EXPOSED_SECRET severity and mark it honestly so an analyst
+                # knows it was not live-confirmed.
+                meta['unsupportedProvider'] = True
+            # unknown / unavailable / skipped_oversized / unsupported-provider →
+            # matchType + severity unchanged (recall-preserving), honestly marked.
         return results
 
-    async def _query_github(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None, dork_cohort: Optional[int] = None, dork_last_run: Optional[str] = None) -> List[Dict]:
+    async def _query_github(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None, dork_cohort: Optional[int] = None, dork_last_run: Optional[str] = None, dork_sweep_all: bool = False) -> List[Dict]:
         """Search GitHub repositories and code for brand mentions and exposed secrets.
 
         DRP→ASM T2.8c: per-tenant lease via ProviderQuotaService.checkout for
@@ -1732,7 +2268,12 @@ class DarkWebMonitorTool(ToolPlugin):
         # checkout and reconcile the ACTUAL planned count below, so a future
         # GITHUB_SEARCH cap (see #350) fires on real usage rather than 1/28th of
         # it. Initialised before the try so it is always bound in `finally`.
-        _GH_MAX_UNITS_PER_SCAN = 28
+        # #1474 — a full-cohort sweep issues more code searches than a single
+        # rotated cohort, so it reserves the larger sweep ceiling. A normal
+        # cadence run keeps the 28-unit reservation.
+        _GH_MAX_UNITS_PER_SCAN = (
+            self._GH_MAX_UNITS_SWEEP if dork_sweep_all else 28
+        )
         gh_units = 1
         try:
             lease = await checkout_provider(
@@ -1829,14 +2370,20 @@ class DarkWebMonitorTool(ToolPlugin):
             # the rotated code/commit/issue dorks. The full dork set is covered
             # over _GH_NUM_COHORTS cycles. Keep the GHSECRET-1 entropy gate on
             # every returned fragment (in _emit_github_match).
-            cohort = self._resolve_dork_cohort(dork_cohort, domain)
-            cohort_queries = self._build_cohort_queries(search_terms, domain, cohort, dork_last_run)
+            # #1474 — sweep mode covers every cohort in one run; cadence mode
+            # runs this cycle's single rotated cohort.
+            if dork_sweep_all:
+                cohort = -1
+                cohort_queries = self._build_sweep_queries(search_terms, domain, dork_last_run)
+            else:
+                cohort = self._resolve_dork_cohort(dork_cohort, domain)
+                cohort_queries = self._build_cohort_queries(search_terms, domain, cohort, dork_last_run)
             # #453 — cross-run/within-scan dedup on (sha|url, secret-fingerprint).
             seen_fingerprints: set = set()
             if agent:
+                label = 'sweep-all' if dork_sweep_all else f"{cohort}/{self._GH_NUM_COHORTS - 1}"
                 agent.report_progress(
-                    f"GitHub dork cohort {cohort}/{self._GH_NUM_COHORTS - 1}: "
-                    f"{len(cohort_queries)} queries"
+                    f"GitHub dork cohort {label}: {len(cohort_queries)} queries"
                 )
 
             # Real GitHub API call count for quota reconciliation: one repo-search
@@ -1949,59 +2496,202 @@ class DarkWebMonitorTool(ToolPlugin):
         return results
 
     async def _query_gitlab(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
-        results = []
+        """Search GitLab.com for exposed secrets in public code CONTENT (#1487).
+
+        Upgraded from the metadata-only project search (which only ever saw a
+        project's name/description) to GitLab's Advanced-Search blob scope —
+        `GET /api/v4/search?scope=blobs&search=<term>` searches file CONTENTS +
+        filenames, so a credential pasted into a public repo file is now reachable
+        and runs through the same cross-provider secret gate as every other leg.
+
+        Token-aware, HONEST degrade (never a silent empty):
+          * `scope=blobs` global search on GitLab.com requires authentication AND
+            Advanced Search (Elasticsearch). With no token from either source we
+            cannot issue it at all → `unswept_needkey` (mirrors the GitHub
+            `GITHUB_TOKEN` fallback pattern).
+          * A 401/403 (bad/rejected token) → `unswept_needkey`.
+          * A scope error (instance lacks Advanced Search → GitLab replies with a
+            non-list error body / 400/422) → `degraded`.
+          * A 200 blob list → `swept`.
+        No compat shim: the metadata query is REPLACED, not aliased.
+
+        #1489: GITLAB_SEARCH is now a UI-managed DRP integration (DRP Vendors
+        tab) — the token is resolved via ProviderQuotaService.checkout
+        (per-tenant lease), exactly mirroring the GITHUB_SEARCH pattern in
+        _query_github. The env GITLAB_TOKEN remains a one-release fallback for
+        tenants that have not configured the integration yet. Reconciles with
+        the ACTUAL number of blob-search calls made so a GITLAB_SEARCH cap
+        fires on real usage."""
+        results: List[Dict] = []
+
+        # Lease GITLAB_SEARCH quota up front. The token from the lease
+        # supersedes the env var when present. This leg issues at most 4
+        # blob-search calls (one per search term); reserve that ceiling at
+        # checkout and reconcile the ACTUAL count below.
+        _GL_MAX_UNITS_PER_SCAN = 4
+        lease_token: Optional[str] = None
+        token = ''
+        gl_units = 0
+        try:
+            lease = await checkout_provider(
+                'GITLAB_SEARCH', requested_units=_GL_MAX_UNITS_PER_SCAN
+            )
+            token = (lease.get('apiKey') or '').strip()
+            lease_token = lease.get('leaseToken')
+        except QuotaExceededError as e:
+            # Leased-but-capped: cannot sweep this cycle — report honestly,
+            # never a silent false clean.
+            self._mark_source_status('gitlab', 'unswept_quota')
+            if agent:
+                agent.report_progress(
+                    f"GitLab search quota exceeded: retry in {e.retry_after}s"
+                )
+            return results
+        except IntegrationCredentialsError:
+            # No GITLAB_SEARCH integration configured (or credential service
+            # unavailable) — fall back to the env token below.
+            token = ''
+        if not token:
+            token = os.environ.get('GITLAB_TOKEN', '').strip()
+        if not token:
+            # blob (code-content) search is unauthenticated-unreachable on
+            # GitLab.com — report UNSWEPT/NEEDKEY, never a false clean.
+            self._mark_source_status('gitlab', 'unswept_needkey')
+            if agent:
+                agent.report_progress(
+                    "GitLab code search skipped: no GITLAB_SEARCH integration "
+                    "or GITLAB_TOKEN (scope=blobs requires an authenticated "
+                    "Advanced-Search token)"
+                )
+            if lease_token:
+                # Integration existed but carried no usable key and the env
+                # fallback is empty — close the lease with zero real calls.
+                await reconcile_call(
+                    'GITLAB_SEARCH',
+                    lease_token,
+                    units=0,
+                    success=False,
+                    error_code='no_token',
+                )
+            return results
+        headers = {'PRIVATE-TOKEN': token}
+        gate = self._code_gate_patterns(domain, patterns)
+        swept_any = False
+        success = True
+        error_code: Optional[str] = None
         try:
             if agent:
-                agent.report_progress(f"Searching GitLab for {domain}")
+                agent.report_progress(f"Searching GitLab code for {domain}")
 
             for search_term in self._extract_search_terms(domain, patterns)[:4]:
+                # #1489 — count the REAL blob-search call before issuing it so
+                # the reconcile reflects actual usage (mirrors gh_units).
+                gl_units += 1
                 async with session.get(
-                    'https://gitlab.com/api/v4/projects',
+                    'https://gitlab.com/api/v4/search',
                     params={
+                        'scope': 'blobs',
                         'search': search_term,
-                        'simple': 'true',
-                        'order_by': 'last_activity_at',
-                        'sort': 'desc',
-                        'per_page': 8,
+                        'per_page': 20,
                     },
+                    headers=headers,
                 ) as resp:
+                    if resp.status in (401, 403):
+                        # token missing/rejected — cannot sweep, say so honestly.
+                        self._mark_source_status('gitlab', 'unswept_needkey')
+                        success = False
+                        error_code = f'http_{resp.status}'
+                        return results
                     if resp.status != 200:
+                        # instance lacks Advanced Search / scope unsupported →
+                        # blob search returns 400/422 (or a non-list error body).
+                        self._mark_source_status('gitlab', 'degraded')
                         continue
-                    projects = await resp.json()
-                    for project in projects[:5]:
-                        description = project.get('description') or ''
-                        # #879 — REAL keep/drop gate: drop a vendor row with no
-                        # token-boundary match (no `or [domain]` phantom retention).
+                    blobs = await resp.json()
+                    if not isinstance(blobs, list):
+                        # scope error surfaced as an object, not a blob list.
+                        self._mark_source_status('gitlab', 'degraded')
+                        continue
+                    swept_any = True
+                    for blob in blobs[:10]:
+                        if not isinstance(blob, dict):
+                            continue
+                        # `data` = the matched content lines; `path`/`filename` =
+                        # the file. The secret gate runs over the actual content.
+                        content = blob.get('data') or ''
+                        path = blob.get('path') or blob.get('filename') or ''
+                        project_id = blob.get('project_id')
+                        # #879 — REAL keep/drop gate on filename + content: a blob
+                        # with no brand token-boundary match is dropped.
                         matched = self._text_matches_search_terms(
-                            f"{project.get('path_with_namespace', '')} {description}",
-                            self._code_gate_patterns(domain, patterns),
-                            'CODE_REPOSITORY',
+                            f"{path} {content}", gate, 'CODE_REPOSITORY',
                         )
                         if not matched:
                             continue
-                        results.append(self._apply_secret_gate({
+                        # Secret detection BEFORE building the row so a hit never
+                        # ships the raw secret in contentSnippet (masked preview
+                        # only — the raw value never leaves the process, #1477).
+                        secret_match = self._match_secret(content)
+                        if secret_match:
+                            evidence = self._build_exposed_secret_evidence(secret_match)
+                            snippet = (
+                                f"Exposed secret in GitLab blob {path} "
+                                f"(preview {evidence['maskedPreview']})"
+                            )
+                        else:
+                            evidence = None
+                            snippet = f"Public GitLab code matching '{search_term}' in {path}"
+                        row = {
                             'source': 'CODE_REPOSITORY',
                             'sourceName': 'GitLab',
-                            'sourceUrl': project.get('web_url', ''),
-                            'sourceId': f"gitlab-{project.get('id', '')}",
-                            'title': project.get('path_with_namespace') or project.get('name', f'GitLab project matching {search_term}'),
-                            'contentSnippet': description or f"Public GitLab project matching '{search_term}'",
+                            'sourceUrl': (
+                                f"https://gitlab.com/search?scope=blobs&search="
+                                f"{urllib.parse.quote(search_term)}"
+                            ),
+                            'sourceId': (
+                                f"gitlab-blob-{project_id}-"
+                                f"{hashlib.sha1((path + (blob.get('ref') or '')).encode()).hexdigest()[:12]}"
+                            ),
+                            'title': path or f'GitLab code matching {search_term}',
+                            'contentSnippet': snippet,
                             'matchType': 'BRAND_MENTION',
                             'matchedKeywords': matched,
                             'severity': 'LOW',
                             'relevanceScore': 68,
                             'riskScore': 45,
-                            'discoveredAt': project.get('last_activity_at') or project.get('created_at'),
+                            'discoveredAt': None,
                             'metadata': {
-                                'namespace': project.get('namespace', {}).get('full_path'),
-                                'visibility': project.get('visibility'),
+                                'projectId': project_id,
+                                'path': path,
+                                'ref': blob.get('ref'),
+                                'startline': blob.get('startline'),
                                 'searchTerm': search_term,
-                            }
-                        }, description))
+                            },
+                        }
+                        # Elevate to EXPOSED_SECRET/HIGH on a credential hit, then
+                        # attach the redacted evidence object (raw value dropped).
+                        self._apply_secret_gate(row, content)
+                        if evidence:
+                            row['metadata']['exposedSecret'] = evidence
+                        results.append(row)
                 await asyncio.sleep(0.5)
+            if swept_any:
+                self._mark_source_status('gitlab', 'swept')
         except Exception as e:
+            success = False
+            error_code = type(e).__name__
+            self._mark_source_status('gitlab', 'error')
             if agent:
                 agent.report_progress(f"GitLab search failed: {str(e)}")
+        finally:
+            if lease_token:
+                await reconcile_call(
+                    'GITLAB_SEARCH',
+                    lease_token,
+                    units=gl_units,  # real call count, not the reserved ceiling
+                    success=success,
+                    error_code=error_code,
+                )
         return results
 
     async def _query_bitbucket(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
@@ -2170,6 +2860,180 @@ class DarkWebMonitorTool(ToolPlugin):
             self._mark_source_status('gist', 'error')
             if agent:
                 agent.report_progress(f"Gist search failed: {str(e)}")
+        return results
+
+    # ── #1487 — serper `site:`-dork secret-hunting leg ────────────────────────
+    # Reaches the DARK code/paste hosts our native legs cannot enumerate for free
+    # (Bitbucket + SourceForge have no free cross-workspace search; public GitLab
+    # and Codeberg + Pastebin are only reachable via a general web search) by
+    # dorking Google through the sanctioned Serper.dev reseller interface. On our
+    # PAID tier `filetype:` IS supported, so the dorks target secret-bearing file
+    # types (`.env`, `.pem`, `.yml`, …) precisely, alongside credential keyword
+    # dorks (`client_secret` / `api_key` / …). Bounded + quota-safe: every page is
+    # metered through `checkout_provider('SERP_SEARCH')` inside `dispatch_serper`,
+    # and a conservative per-scan QUERY budget keeps this leg from starving the
+    # sentiment collector that shares the SERP_SEARCH cap.
+    _SERPER_DORK_HOSTS = [
+        'bitbucket.org', 'sourceforge.net', 'gitlab.com', 'codeberg.org',
+        'pastebin.com',
+    ]
+    # Secret-bearing file types (paid-tier `filetype:` — precise, high-signal).
+    _SERPER_DORK_FILETYPES = ['env', 'pem', 'yml', 'json', 'properties']
+    # Credential keyword dorks (no filetype — catch inline/embedded secrets).
+    _SERPER_DORK_KEYWORDS = [
+        'client_secret', 'consumer_key', 'refresh_token', 'api_key', 'credentials',
+    ]
+    # Conservative fixed per-scan query budget — paid tier means every query
+    # costs, and this leg shares the SERP_SEARCH daily cap with the brand-mention
+    # sentiment collector, so it gets a small dedicated slice.
+    _SERPER_DORK_MAX_QUERIES = 8
+    # Body fetches per query (mirror `_query_gist`'s bounded raw fetch).
+    _SERPER_DORK_BODY_FETCH_PER_QUERY = 3
+    _SERPER_DORK_BODY_MAX_BYTES = 20000
+
+    def _build_serper_dork_queries(self, terms: List[str]) -> List[tuple]:
+        """Build the bounded `(host, query)` dork list for this scan (#1487).
+
+        Interleaves `filetype:` dorks (paid-tier, precise) with credential keyword
+        dorks and rotates them across the dark hosts, so a small budget still gives
+        HOST + OPERATOR diversity. Every query is `site:<host> "<brand>" <op>` — no
+        `filetype:` on the free tier caveat no longer applies (paid). Capped at
+        `_SERPER_DORK_MAX_QUERIES`; the count deferred is returned so the caller
+        can report coverage honestly."""
+        brand = (terms[0] if terms else '').strip()
+        if not brand:
+            return []
+        quoted = f'"{brand}"'
+        # Interleave filetype + keyword operators for a precise+broad mix.
+        operators: List[str] = []
+        for i in range(max(len(self._SERPER_DORK_FILETYPES), len(self._SERPER_DORK_KEYWORDS))):
+            if i < len(self._SERPER_DORK_FILETYPES):
+                operators.append(f'filetype:{self._SERPER_DORK_FILETYPES[i]}')
+            if i < len(self._SERPER_DORK_KEYWORDS):
+                operators.append(self._SERPER_DORK_KEYWORDS[i])
+        queries: List[tuple] = []
+        for i, op in enumerate(operators):
+            host = self._SERPER_DORK_HOSTS[i % len(self._SERPER_DORK_HOSTS)]
+            queries.append((host, f'site:{host} {quoted} {op}'))
+        return queries
+
+    async def _fetch_dork_body(self, session: aiohttp.ClientSession, url: str) -> str:
+        """Fetch a SERP-hit's page BODY (bounded), or '' on any failure (#1487).
+
+        Split out so the body-gating leg is unit-testable without live HTTP: tests
+        stub this to return canned bodies. The BODY — not the 160-char SERP
+        snippet — is what the secret gate runs over, because snippet-gating
+        over-fires on high-entropy URL fragments (the 5/5 snippet-FP lesson)."""
+        try:
+            async with session.get(url) as rr:
+                if rr.status != 200:
+                    return ''
+                return (await rr.text())[: self._SERPER_DORK_BODY_MAX_BYTES]
+        except Exception:
+            return ''
+
+    async def _query_serper_dorks(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
+        """serper `site:`-dork secret-hunting leg (#1487).
+
+        Issues a small, budgeted set of `site:<host> "<brand>" <filetype/keyword>`
+        dorks via `dispatch_serper` (quota-safe, per-page-metered, never exposes
+        the key), then for each hit FETCHES THE PAGE BODY and runs the shared
+        `_apply_secret_gate` on the BODY. A hit is emitted ONLY when its body
+        carries a credential-shaped/high-entropy token — the raw secret is masked
+        into a redacted preview here and never stored (a snippet-only high-entropy
+        URL fragment whose body has no secret is NOT emitted: the FP guard). Honest
+        status: `unswept_no_provider` when SERP is unconfigured (fall-through, no
+        job fail), `error_*` on a configured-but-broken provider, `swept` otherwise."""
+        results: List[Dict] = []
+        terms = [t for t in self._extract_search_terms(domain, patterns) if self._is_specific_term(t)]
+        queries = self._build_serper_dork_queries(terms)
+        if not queries:
+            self._mark_source_status('serper_dorks', 'unswept_no_terms')
+            return results
+        budgeted = queries[: self._SERPER_DORK_MAX_QUERIES]
+        deferred = len(queries) - len(budgeted)
+        gate = self._code_gate_patterns(domain, patterns)
+        swept_any = False
+        seen_fps: set = set()
+        if agent:
+            agent.report_progress(
+                f"SERP secret dorks for {domain}: {len(budgeted)} queries"
+                + (f" ({deferred} deferred for budget)" if deferred else "")
+            )
+        try:
+            for host, query in budgeted:
+                try:
+                    page = await dispatch_serper(query, 1, session)
+                except SerpNotConfigured:
+                    # Not configured — fall through cleanly (never a false clean).
+                    self._mark_source_status('serper_dorks', 'unswept_no_provider')
+                    return results
+                except SerpSweepFailed as exc:
+                    # Configured but broken (401/402/403/429/5xx) — stop, report.
+                    self._mark_source_status('serper_dorks', f'error_{exc}')
+                    return results
+                if page.get('unswept'):
+                    # this query blocked (400/5xx) — don't count it clean.
+                    continue
+                swept_any = True
+                hits = page.get('hits') or []
+                for hit in hits[: self._SERPER_DORK_BODY_FETCH_PER_QUERY]:
+                    url = (hit or {}).get('url')
+                    if not url:
+                        continue
+                    # Body-gate: fetch the actual page, gate the BODY (NOT the
+                    # SERP snippet — snippet-gating 5/5-FPs on URL fragments).
+                    body = await self._fetch_dork_body(session, url)
+                    if not body:
+                        continue
+                    secret_match = self._match_secret(body)
+                    if not secret_match:
+                        continue
+                    evidence = self._build_exposed_secret_evidence(secret_match)
+                    fp = evidence.get('fingerprint')
+                    if fp and fp in seen_fps:
+                        continue
+                    if fp:
+                        seen_fps.add(fp)
+                    # Brand match on the body for the matched-keyword field (best
+                    # effort — the dork already pins the brand, so absence here
+                    # does not drop the secret finding).
+                    matched = self._text_matches_search_terms(
+                        body, gate, 'CODE_REPOSITORY',
+                    ) or [terms[0]]
+                    row = {
+                        'source': 'CODE_REPOSITORY',
+                        'sourceName': f'SERP dork ({host})',
+                        'sourceUrl': url,
+                        'sourceId': f"serper-dork-{hashlib.sha1(url.encode()).hexdigest()[:16]}",
+                        'title': (hit or {}).get('title') or f'Public code on {host}',
+                        # NO raw body — only a masked preview (raw secret invariant).
+                        'contentSnippet': (
+                            f"Exposed secret candidate on {host} "
+                            f"(preview {evidence['maskedPreview']})"
+                        ),
+                        'matchType': 'BRAND_MENTION',
+                        'matchedKeywords': matched,
+                        'severity': 'LOW',
+                        'relevanceScore': 62,
+                        'riskScore': 42,
+                        'discoveredAt': (hit or {}).get('date'),
+                        'metadata': {
+                            'host': host,
+                            'dorkQuery': query,
+                            'searchTerm': terms[0],
+                            'exposedSecret': evidence,
+                        },
+                    }
+                    # Elevate to EXPOSED_SECRET/HIGH via the shared gate on the BODY.
+                    self._apply_secret_gate(row, body)
+                    results.append(row)
+        except Exception as e:
+            self._mark_source_status('serper_dorks', 'error')
+            if agent:
+                agent.report_progress(f"SERP dork search failed: {str(e)}")
+            return results
+        self._mark_source_status('serper_dorks', 'swept' if swept_any else 'unswept')
         return results
 
     async def _query_stackoverflow(self, session: aiohttp.ClientSession, domain: str, patterns: List[Dict[str, Any]], agent=None) -> List[Dict]:
@@ -2341,6 +3205,558 @@ class DarkWebMonitorTool(ToolPlugin):
     # The native github / gitlab / npm / stackoverflow queries (_query_github
     # etc. above) provide direct coverage of the engines SearxNG was
     # meta-searching across, so no functionality is lost.
+
+    @staticmethod
+    def _sanitize_vendor_host(raw: Any) -> Optional[str]:
+        """Normalise a host/URL string taken from a VENDOR payload (#1604).
+
+        Hudson Rock's serialization leaks artifacts — a hostname was observed
+        live carrying an embedded quote + comma (`login.example.com",`). Never
+        trust a vendor host/URL field verbatim: strip quotes/commas/whitespace
+        and control characters, cap the length, and require a plausible host
+        or http(s) URL shape. Returns None when nothing usable survives, so
+        the caller simply omits the field rather than persisting garbage.
+        """
+        if not isinstance(raw, str):
+            return None
+        # Drop control chars, then the serialization artifacts (quotes, commas,
+        # stray backslashes) and surrounding whitespace.
+        cleaned = ''.join(ch for ch in raw if ch.isprintable())
+        cleaned = cleaned.strip().strip('",\'\\ \t').strip()
+        cleaned = cleaned.replace('"', '').replace("'", '').replace(',', '')
+        if not cleaned or len(cleaned) > 512:
+            return None
+        if cleaned.startswith('http://') or cleaned.startswith('https://'):
+            parsed = urllib.parse.urlparse(cleaned)
+            if not parsed.netloc or '.' not in parsed.netloc:
+                return None
+            return cleaned
+        # Bare host: must look like a hostname (label.label, no spaces/slashes).
+        if re.fullmatch(r'[A-Za-z0-9._\-]+\.[A-Za-z]{2,}', cleaned):
+            return cleaned
+        return None
+
+    @staticmethod
+    def _infostealer_recency_band(last_compromised: Optional[str], kind: str) -> str:
+        """Mention-row display band for a Cavalier posture record (#1604).
+
+        NOTE — the backend `classifyInfostealerPosture`
+        (backend/src/modules/brand-monitors/alerts/credential-leak-severity.ts)
+        is the SSOT for the ALERT severity an analyst acts on; this only bands
+        the DarkWebMention row so the mention list is not misleading. Same
+        doctrine: recency × side, and raw machine counts NEVER drive the band
+        (a big customer-side number is fraud-exposure volume, not a breach of
+        the brand's perimeter).
+        """
+        age_days: Optional[float] = None
+        if last_compromised:
+            try:
+                ts = str(last_compromised).replace('Z', '+00:00')
+                parsed = datetime.fromisoformat(ts)
+                now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+                age_days = max(0.0, (now - parsed).total_seconds() / 86400.0)
+            except Exception:
+                age_days = None
+        if kind == 'employee':
+            if age_days is not None and age_days <= 90:
+                return 'HIGH'
+            if age_days is not None and age_days <= 365:
+                return 'MEDIUM'
+            return 'LOW'
+        return 'MEDIUM' if (age_days is not None and age_days <= 90) else 'LOW'
+
+    async def _query_cavalier_sequenced(
+        self, session: aiohttp.ClientSession, domain: str, agent=None
+    ) -> List[Dict]:
+        """Run the two Cavalier legs IN ORDER: posture (#1604) then urls (#1612).
+
+        #1619 — both legs make their own upstream call and therefore each take
+        their own CAVALIER lease: a scan costs 2 units, not 1. (The #1612
+        comment claiming the lease was "reused" was never true — there are two
+        `checkout_provider('CAVALIER')` calls.) Two calls costing two units is
+        honest accounting and is left as-is.
+
+        What is NOT acceptable is issuing both checkouts CONCURRENTLY from the
+        same `asyncio.gather`: on a tenant with one unit left the winner was
+        nondeterministic, so the higher-value posture leg — the actual
+        infostealer-compromise surface — could lose the race to the urls leg
+        and go `unswept_quota` for that cycle. Sequencing makes posture
+        deterministically first in line for a scarce unit; the urls leg
+        degrades to `unswept_quota` instead, which is the correct precedence.
+
+        Each leg is isolated: a failure in one must not suppress the other
+        (they were independent gather entries before, and stay independent in
+        effect).
+        """
+        combined: List[Dict] = []
+        try:
+            combined.extend(await self._query_cavalier(session, domain, agent))
+        except Exception as e:  # noqa: BLE001 — never let one leg kill the other
+            logger.error(f"Cavalier posture leg failed: {e}")
+        try:
+            combined.extend(await self._query_cavalier_urls(session, domain, agent))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Cavalier urls leg failed: {e}")
+        return combined
+
+    async def _query_cavalier(
+        self, session: aiohttp.ClientSession, domain: str, agent=None
+    ) -> List[Dict]:
+        """Hudson Rock Cavalier — infostealer-infection POSTURE per domain (#1604).
+
+        FREE, KEYLESS OSINT source: `GET /api/json/v2/osint-tools/
+        search-by-domain?domain=<domain>` needs no auth, no API key and no
+        account (vendor-confirmed permanently free, with a stated GLOBAL limit
+        of 50 requests / 10 seconds shared across all free-tier consumers).
+
+        THE SEMANTIC INVARIANT — the response splits two populations that mean
+        completely different things, and conflating them would make the product
+        lie to an analyst:
+          * `employees` — infections on the brand's OWN STAFF machines that
+            captured corporate logins → potential INITIAL ACCESS into the
+            customer. The sharp end.
+          * `users` (clients) — infections on the brand's CUSTOMERS' own
+            machines that captured their logins TO the brand → account-takeover
+            / fraud exposure, NOT a breach of the customer's perimeter.
+        They are therefore emitted as SEPARATE records (one per side, only when
+        that side's count > 0), each carrying a `metadata.infostealer` envelope
+        the backend classifier keys on. A combined "N compromised" number is
+        never produced anywhere in this leg.
+
+        Quota: the Integration row is REQUIRED even though no key exists — it
+        is the per-tenant enable/disable switch and the cap surface (the five
+        agent containers do not coordinate in-process). No integration ⇒
+        `unswept_not_configured`; capped ⇒ `unswept_quota`. Never a silent
+        empty (FEED-2/HONESTY-1).
+
+        Vendor data quality: hostnames/URLs in the payload have been observed
+        carrying serialization artifacts (embedded quote + comma), so every
+        host/URL is passed through `_sanitize_vendor_host` before it is
+        persisted — never trusted verbatim.
+
+        No PII is available or persisted: the free tier returns NO email
+        addresses and NO raw passwords (the password blocks are strength
+        AGGREGATES only), so no LeakedCredential row is possible from here and
+        none is fabricated.
+        """
+        results: List[Dict] = []
+
+        # Lease CAVALIER quota up front — exactly one upstream call per scan.
+        lease_token: Optional[str] = None
+        try:
+            lease = await checkout_provider('CAVALIER', requested_units=1)
+            lease_token = lease.get('leaseToken')
+        except QuotaExceededError as e:
+            self._mark_source_status('cavalier', 'unswept_quota')
+            if agent:
+                agent.report_progress(
+                    f"Cavalier quota exceeded: retry in {e.retry_after}s"
+                )
+            return results
+        except IntegrationCredentialsError:
+            # No CAVALIER integration configured (opt-in per tenant) or the
+            # credential service is unavailable — report honestly, never a
+            # false clean. The endpoint is keyless but the integration row is
+            # the enable switch + cap surface.
+            self._mark_source_status('cavalier', 'unswept_not_configured')
+            if agent:
+                agent.report_progress(
+                    "Cavalier skipped: no CAVALIER integration configured for this tenant"
+                )
+            return results
+
+        target = (domain or '').strip().lower()
+        if target.startswith('www.'):
+            target = target[4:]
+
+        units = 0
+        success = True
+        error_code: Optional[str] = None
+        try:
+            if agent:
+                agent.report_progress(f"Querying Hudson Rock Cavalier for {target}")
+            units = 1
+            async with session.get(
+                'https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-domain',
+                params={'domain': target},
+                timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=20),
+            ) as resp:
+                if resp.status == 429:
+                    self._mark_source_status('cavalier', 'unswept_ratelimited')
+                    success = False
+                    error_code = 'http_429'
+                    return results
+                if resp.status != 200:
+                    self._mark_source_status('cavalier', f'error_http_{resp.status}')
+                    success = False
+                    error_code = f'http_{resp.status}'
+                    return results
+                payload = await resp.json(content_type=None)
+
+            if not isinstance(payload, dict):
+                self._mark_source_status('cavalier', 'degraded')
+                success = False
+                error_code = 'non_object_body'
+                return results
+
+            self._mark_source_status('cavalier', 'swept')
+
+            def _int(value: Any) -> int:
+                try:
+                    n = int(value)
+                except (TypeError, ValueError):
+                    return 0
+                return n if n > 0 else 0
+
+            def _iso(value: Any) -> Optional[str]:
+                return value.strip() if isinstance(value, str) and value.strip() else None
+
+            # Stealer-family counts (family → count). `total` is a rollup key,
+            # not a family; drop it and keep the top few for analyst context.
+            families_raw = payload.get('stealerFamilies')
+            families: Dict[str, int] = {}
+            if isinstance(families_raw, dict):
+                pairs = [
+                    (str(k), _int(v))
+                    for k, v in families_raw.items()
+                    if str(k).lower() != 'total' and _int(v) > 0
+                ]
+                pairs.sort(key=lambda p: p[1], reverse=True)
+                families = dict(pairs[:5])
+
+            def _password_stats(block: Any) -> Optional[Dict[str, Any]]:
+                """Password STRENGTH aggregates only — no raw passwords exist here."""
+                if not isinstance(block, dict):
+                    return None
+                out: Dict[str, Any] = {}
+                total = _int(block.get('totalPass'))
+                if total:
+                    out['totalPasswords'] = total
+                for band in ('too_weak', 'weak', 'medium', 'strong'):
+                    entry = block.get(band)
+                    if isinstance(entry, dict) and _int(entry.get('qty')):
+                        out[band] = _int(entry.get('qty'))
+                return out or None
+
+            def _captured_urls(key: str) -> List[Dict[str, Any]]:
+                """Top captured login URLs for one side, sanitized (vendor artifacts)."""
+                block = payload.get('data')
+                raw = block.get(key) if isinstance(block, dict) else None
+                out: List[Dict[str, Any]] = []
+                if not isinstance(raw, list):
+                    return out
+                for entry in raw[:5]:
+                    if not isinstance(entry, dict):
+                        continue
+                    url = self._sanitize_vendor_host(entry.get('url'))
+                    if not url:
+                        continue
+                    out.append({'url': url, 'occurrence': _int(entry.get('occurrence'))})
+                return out
+
+            sides = [
+                {
+                    'kind': 'employee',
+                    'count': _int(payload.get('employees')),
+                    'last': _iso(payload.get('last_employee_compromised')),
+                    'passwords': _password_stats(payload.get('employeePasswords')),
+                    'urls': _captured_urls('employees_urls'),
+                    'fragment': 'employees',
+                    'title': (
+                        'Infostealer infections on employee machines '
+                        f'({_int(payload.get("employees"))}) for {target}'
+                    ),
+                    'snippet': (
+                        f'{_int(payload.get("employees"))} machine(s) belonging to {target} staff '
+                        'were infected by infostealer malware that captured corporate logins '
+                        '(potential initial access). Employee-side only — customer-side '
+                        'infections are reported separately.'
+                    ),
+                },
+                {
+                    'kind': 'client',
+                    'count': _int(payload.get('users')),
+                    'last': _iso(payload.get('last_user_compromised')),
+                    'passwords': _password_stats(payload.get('userPasswords')),
+                    'urls': _captured_urls('clients_urls'),
+                    'fragment': 'clients',
+                    'title': (
+                        'Infostealer infections on customer devices '
+                        f'({_int(payload.get("users"))}) for {target}'
+                    ),
+                    'snippet': (
+                        f'{_int(payload.get("users"))} customer device(s) were infected by '
+                        f'infostealer malware that captured their logins to {target} — '
+                        'account-takeover / fraud exposure for those customers, NOT a breach '
+                        'of the brand perimeter. Reported separately from employee-side '
+                        'infections.'
+                    ),
+                },
+            ]
+
+            for side in sides:
+                if side['count'] <= 0:
+                    continue
+                severity = self._infostealer_recency_band(side['last'], side['kind'])
+                metadata: Dict[str, Any] = {
+                    'vendor': 'HudsonRock:Cavalier',
+                    'domain': target,
+                    # The envelope the backend classifier keys on. `kind` is the
+                    # employee/client discriminator — the whole point.
+                    'infostealer': {
+                        'kind': side['kind'],
+                        'machineCount': side['count'],
+                        'lastCompromised': side['last'],
+                    },
+                    'breachSource': 'Hudson Rock Cavalier',
+                }
+                if families:
+                    metadata['stealerFamilies'] = families
+                if side['passwords']:
+                    metadata['passwordStrength'] = side['passwords']
+                if side['urls']:
+                    metadata['capturedLoginUrls'] = side['urls']
+                results.append({
+                    'source': 'CREDENTIAL_DUMP',
+                    'sourceName': 'Hudson Rock Cavalier',
+                    # Distinct per-side anchor so the two records dedup
+                    # independently across re-scans (the fragment is the
+                    # discriminator; the path+query keeps it off the
+                    # bare-root dedup path).
+                    'sourceUrl': (
+                        'https://cavalier.hudsonrock.com/api/json/v2/osint-tools/'
+                        f'search-by-domain?domain={urllib.parse.quote(target)}#{side["fragment"]}'
+                    ),
+                    'sourceId': f'cavalier-{target}-{side["fragment"]}',
+                    'title': side['title'],
+                    'contentSnippet': side['snippet'],
+                    'matchType': 'CREDENTIAL_LEAK',
+                    'matchedKeywords': [target],
+                    'severity': severity,
+                    'relevanceScore': 80,
+                    'riskScore': 70 if side['kind'] == 'employee' else 45,
+                    'discoveredAt': side['last'],
+                    'metadata': metadata,
+                })
+        except Exception as e:
+            success = False
+            error_code = type(e).__name__
+            self._mark_source_status('cavalier', 'error')
+            if agent:
+                agent.report_progress(f"Cavalier lookup failed: {str(e)}")
+        finally:
+            if lease_token:
+                await reconcile_call(
+                    'CAVALIER',
+                    lease_token,
+                    units=units,
+                    success=success,
+                    error_code=error_code,
+                )
+        return results
+
+    async def _query_cavalier_urls(
+        self, session: aiohttp.ClientSession, domain: str, agent=None
+    ) -> List[Dict]:
+        """Hudson Rock Cavalier `urls-by-domain` — initial-access ROUTE intel (#1612).
+
+        A sibling to `_query_cavalier` (search-by-domain, #1604) that adds the
+        PATH-level surface the domain-level posture leg does not: the specific
+        login URLs infostealer logs captured for the domain, split into two
+        semantically different populations —
+          * `employees_urls` — corporate login PORTALS (VPN / webmail / admin)
+            staff machines authenticated against → potential INITIAL-ACCESS
+            ROUTES into the brand. The higher-signal side.
+          * `clients_urls`   — the brand's OWN public login pages that customers'
+            infected devices hit → account-takeover / fraud-exposure VOLUME, NOT
+            a breach of the brand's perimeter.
+        Each side (only when it has URLs) is emitted as a SEPARATE CREDENTIAL_LEAK
+        mention carrying a `metadata.infostealer` envelope with the captured
+        `initialAccessUrls`. The URL PATH is the value — the host/occurrence
+        COUNT never drives severity. The backend keys on the envelope:
+        `classifyInitialAccessUrls` bands by SIDE (employee=MEDIUM, client=LOW)
+        because `urls-by-domain` carries NO per-URL timestamp (the recency-based
+        `classifyInfostealerPosture` path does not apply here).
+
+        Reuses the CAVALIER quota lease exactly like `_query_cavalier` (the
+        Integration row is the per-tenant enable/disable + cap surface even
+        though the endpoint is keyless). `_mark_source_status('cavalier_urls',
+        ...)` on every exit path so a non-200 / malformed body reads as a real
+        status, never a silent clean.
+        """
+        results: List[Dict] = []
+
+        lease_token: Optional[str] = None
+        try:
+            lease = await checkout_provider('CAVALIER', requested_units=1)
+            lease_token = lease.get('leaseToken')
+        except QuotaExceededError as e:
+            self._mark_source_status('cavalier_urls', 'unswept_quota')
+            if agent:
+                agent.report_progress(
+                    f"Cavalier urls quota exceeded: retry in {e.retry_after}s"
+                )
+            return results
+        except IntegrationCredentialsError:
+            self._mark_source_status('cavalier_urls', 'unswept_not_configured')
+            if agent:
+                agent.report_progress(
+                    "Cavalier urls skipped: no CAVALIER integration configured for this tenant"
+                )
+            return results
+
+        target = (domain or '').strip().lower()
+        if target.startswith('www.'):
+            target = target[4:]
+
+        units = 0
+        success = True
+        error_code: Optional[str] = None
+        try:
+            if agent:
+                agent.report_progress(
+                    f"Querying Hudson Rock Cavalier initial-access URLs for {target}"
+                )
+            units = 1
+            async with session.get(
+                'https://cavalier.hudsonrock.com/api/json/v2/osint-tools/urls-by-domain',
+                params={'domain': target},
+                timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=20),
+            ) as resp:
+                if resp.status == 429:
+                    self._mark_source_status('cavalier_urls', 'unswept_ratelimited')
+                    success = False
+                    error_code = 'http_429'
+                    return results
+                if resp.status != 200:
+                    self._mark_source_status('cavalier_urls', f'error_http_{resp.status}')
+                    success = False
+                    error_code = f'http_{resp.status}'
+                    return results
+                payload = await resp.json(content_type=None)
+
+            if not isinstance(payload, dict):
+                self._mark_source_status('cavalier_urls', 'degraded')
+                success = False
+                error_code = 'non_object_body'
+                return results
+
+            data = payload.get('data')
+            # A 200 with no `data` object is a clean sweep (no captured URLs),
+            # not an error — mark swept and return empty.
+            self._mark_source_status('cavalier_urls', 'swept')
+            if not isinstance(data, dict):
+                return results
+
+            def _collect(key: str) -> List[Dict[str, Any]]:
+                raw = data.get(key)
+                out: List[Dict[str, Any]] = []
+                if not isinstance(raw, list):
+                    return out
+                for entry in raw[:5]:
+                    if not isinstance(entry, dict):
+                        continue
+                    url = self._sanitize_vendor_host(entry.get('url'))
+                    if not url:
+                        continue
+                    occ = entry.get('occurrence')
+                    out.append(
+                        {
+                            'url': url,
+                            'occurrence': int(occ) if isinstance(occ, (int, float)) else 0,
+                        }
+                    )
+                return out
+
+            sides = [
+                {
+                    'kind': 'employee',
+                    'urls': _collect('employees_urls'),
+                    'fragment': 'employees',
+                    'riskScore': 65,
+                    # Fallback only; the backend classifyInitialAccessUrls sets
+                    # the ALERT severity (employee=MEDIUM). Never drives it.
+                    'severity': 'MEDIUM',
+                },
+                {
+                    'kind': 'client',
+                    'urls': _collect('clients_urls'),
+                    'fragment': 'clients',
+                    'riskScore': 40,
+                    'severity': 'LOW',
+                },
+            ]
+
+            for side in sides:
+                urls = side['urls']
+                if not urls:
+                    continue
+                if side['kind'] == 'employee':
+                    title = (
+                        f"Infostealer-captured employee login routes ({len(urls)}) for {target}"
+                    )
+                    snippet = (
+                        f"Infostealer logs captured {len(urls)} corporate login portal(s) "
+                        f"(VPN / webmail / admin) for {target} — potential initial-access "
+                        f"routes. Employee-side only; customer-side captures are reported "
+                        f"separately."
+                    )
+                else:
+                    title = (
+                        f"Infostealer-captured customer login routes ({len(urls)}) for {target}"
+                    )
+                    snippet = (
+                        f"Infostealer logs captured {len(urls)} of {target}'s own login page(s) "
+                        f"hit by customers' infected devices — account-takeover / fraud exposure "
+                        f"for those customers, NOT a breach of the brand perimeter."
+                    )
+                results.append(
+                    {
+                        'source': 'CREDENTIAL_DUMP',
+                        'sourceName': 'Hudson Rock Cavalier',
+                        'sourceUrl': (
+                            'https://cavalier.hudsonrock.com/api/json/v2/osint-tools/'
+                            f'urls-by-domain?domain={urllib.parse.quote(target)}#{side["fragment"]}'
+                        ),
+                        'sourceId': f'cavalier-urls-{target}-{side["fragment"]}',
+                        'title': title,
+                        'contentSnippet': snippet,
+                        'matchType': 'CREDENTIAL_LEAK',
+                        'matchedKeywords': [target],
+                        'severity': side['severity'],
+                        'relevanceScore': 75,
+                        'riskScore': side['riskScore'],
+                        'discoveredAt': None,  # urls-by-domain carries no timestamp
+                        'metadata': {
+                            'vendor': 'HudsonRock:Cavalier',
+                            'domain': target,
+                            'breachSource': 'Hudson Rock Cavalier',
+                            # The envelope the backend classifier keys on.
+                            'infostealer': {
+                                'kind': side['kind'],
+                                'initialAccessUrls': urls,
+                                'lastCompromised': None,
+                            },
+                            'capturedLoginUrls': urls,
+                        },
+                    }
+                )
+        except Exception as e:
+            success = False
+            error_code = type(e).__name__
+            self._mark_source_status('cavalier_urls', 'error')
+            if agent:
+                agent.report_progress(f"Cavalier urls lookup failed: {str(e)}")
+        finally:
+            if lease_token:
+                await reconcile_call(
+                    'CAVALIER',
+                    lease_token,
+                    units=units,
+                    success=success,
+                    error_code=error_code,
+                )
+        return results
 
     async def _query_leakcheck(
         self,
@@ -2684,6 +4100,211 @@ class DarkWebMonitorTool(ToolPlugin):
             self._mark_source_status('ransomware_leaksites', 'error')
             if agent:
                 agent.report_progress(f"RansomLook query failed: {str(e)}")
+        return results
+
+    async def _fetch_phishing_domains(
+        self, session: aiohttp.ClientSession, agent=None
+    ) -> Optional[set]:
+        """Fetch + cache the Phishing.Database ACTIVE-domains feed (#1611).
+
+        Returns the set of active phishing domains (lowercased), or None on a
+        hard fetch failure (the caller marks the source ERROR — never a silent
+        clean). Process-wide TTL cache + conditional GET (If-None-Match) so a
+        304 refreshes the TTL without re-downloading ~11 MB. Guarded by a lock
+        so concurrent scans in one process do not stampede the CDN.
+        """
+        now = time.time()
+        cache = _phishing_db_cache
+        # Fast path: fresh cache, no lock/HTTP needed.
+        if (
+            cache["domains"] is not None
+            and (now - cache["fetched_at"]) < _PHISHING_DB_TTL_SECONDS
+        ):
+            return cache["domains"]
+
+        async with _get_phishing_db_lock():
+            # Re-check under the lock — another coroutine may have refreshed it.
+            now = time.time()
+            if (
+                cache["domains"] is not None
+                and (now - cache["fetched_at"]) < _PHISHING_DB_TTL_SECONDS
+            ):
+                return cache["domains"]
+
+            headers = {"User-Agent": "ASM-Platform-DarkWebMonitor"}
+            if cache["etag"]:
+                headers["If-None-Match"] = cache["etag"]
+            async with session.get(
+                _PHISHING_DB_URL,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=45),
+            ) as resp:
+                if resp.status == 304 and cache["domains"] is not None:
+                    # Not modified — keep the cached set, refresh the TTL.
+                    cache["fetched_at"] = now
+                    return cache["domains"]
+                if resp.status != 200:
+                    # Hard failure with no usable cache → signal error to caller.
+                    if cache["domains"] is not None:
+                        return cache["domains"]  # serve stale rather than false-clean
+                    return None
+                text = await resp.text()
+                etag = resp.headers.get("ETag")
+
+            domains: set = set()
+            for line in text.splitlines():
+                d = line.strip().lower()
+                # Skip blanks / comments; keep only hostname-shaped lines.
+                if not d or d.startswith("#"):
+                    continue
+                if re.fullmatch(r"[a-z0-9._\-]+\.[a-z]{2,}", d):
+                    domains.add(d)
+            cache["domains"] = domains
+            cache["etag"] = etag
+            cache["fetched_at"] = now
+            return domains
+
+    async def _query_phishing_database(
+        self,
+        session: aiohttp.ClientSession,
+        domain: str,
+        keywords: List[str],
+        agent=None,
+    ) -> List[Dict]:
+        """Match the brand against the Phishing.Database ACTIVE feed (#1611).
+
+        The FIRST live producer of `DarkWebSourceType.PHISHING_DATABASE` — our
+        only phishing-URL threat surface (URLhaus is malware-distribution, a
+        different threat model). A community-verified ACTIVE phishing domain
+        that embeds the brand's registrable label is a confirmed brand-
+        impersonation phishing vector.
+
+        FP GATE — boundary-anchored, NEVER a bare substring. Each phishing
+        domain is split into its `[.-]`-delimited segments (labels + hyphen
+        parts); a brand term matches ONLY when it EQUALS a whole segment (the
+        brand appears as a standalone label / hyphen-part), so a glued infix
+        (the brand token concatenated inside a longer segment) does NOT fire.
+        Measured on the real feed: raw substring `trade` = 316 hits,
+        boundary-gated = 6. An un-gated match is a defect (the DRP HIGH queue
+        was once ~94% false-positive from exactly this substring noise).
+
+        Brand terms are the owned-domain registrable core + the brand keywords,
+        length-gated (>= 4 chars) — a <4-char label match against a 391k-domain
+        global feed is too collision-prone to be worth the FP cost (short-named
+        brands are covered by the typosquat/lookalike surfaces instead). The
+        emitted severity is a MEDIUM fallback only; the backend routes
+        `source=PHISHING_DATABASE` to the 'impersonator' bucket (impersonation
+        watch — surfaced, not auto-HIGH, so a phishing domain that shares a
+        common brand token but targets a different brand does not flood HIGH).
+
+        FREE, KEYLESS, MIT-licensed global feed → no ProviderQuotaService lease
+        (RansomLook precedent). `_mark_source_status('phishing_database', ...)`
+        on every exit path so a fetch failure reads ERROR, never a silent clean.
+        """
+        results: List[Dict] = []
+        # #1617 — brand terms are the monitor's OWN registrable label ONLY.
+        # `monitor.keywords` is free-text operator input (dark-web.service.ts)
+        # and was the flood vector: a generic keyword matched thousands of
+        # unrelated rows in a 391,616-domain global feed. Measured on the live
+        # feed, matching keywords as domain segments yielded `link` 6,667 /
+        # `mail` 5,483 / `site` 4,928 / `login` 3,423 / `shop` 3,313 hits —
+        # none brand-related. Keyword-driven discovery belongs to the
+        # typosquat/lookalike surfaces, which score for it; this leg answers
+        # only "is MY registrable label embedded in an active phishing domain".
+        brand_terms: List[str] = []
+        seen_terms = set()
+        domain_l = (domain or "").strip().lower()
+        core = domain_l.split(".")[0] if domain_l else ""
+        for candidate in [core]:
+            c = (candidate or "").strip().lower()
+            if len(c) >= 4 and c not in seen_terms:
+                seen_terms.add(c)
+                brand_terms.append(c)
+
+        if not brand_terms:
+            # No usable brand term (e.g. only a <4-char label) — nothing to
+            # match, and the feed was never contacted. Leave UNMARKED so
+            # scan-health does not misreport an un-run leg as clean.
+            return results
+
+        try:
+            if agent:
+                agent.report_progress(
+                    f"Querying Phishing.Database ACTIVE feed for {domain}"
+                )
+            phishing_domains = await self._fetch_phishing_domains(session, agent)
+            if phishing_domains is None:
+                self._mark_source_status("phishing_database", "error")
+                if agent:
+                    agent.report_progress("Phishing.Database feed fetch failed")
+                return results
+
+            self._mark_source_status("phishing_database", "swept")
+
+            term_set = set(brand_terms)
+            matched_pairs = _match_phishing_domains(phishing_domains, term_set)
+            matched_total = len(matched_pairs)
+            matched_pairs = matched_pairs[:PHISHING_DB_MAX_EMISSIONS]
+            truncated = matched_total > len(matched_pairs)
+            if truncated:
+                # #1617 — a silent cap reads downstream as "these are all the
+                # matches". Say so on the record instead: the operator needs to
+                # know the alphabetical tail was dropped.
+                self._mark_source_status("phishing_database", "swept_truncated")
+                if agent:
+                    agent.report_progress(
+                        f"Phishing.Database: {matched_total} matches capped to "
+                        f"{PHISHING_DB_MAX_EMISSIONS} (alphabetical); "
+                        f"{matched_total - len(matched_pairs)} not emitted"
+                    )
+
+            for pd, matched_term in matched_pairs:
+                results.append(
+                    {
+                        "source": "PHISHING_DATABASE",
+                        "sourceName": "Phishing.Database",
+                        "sourceUrl": f"https://{pd}",
+                        "sourceId": f"phishdb-{pd}",
+                        "title": (
+                            f"Active phishing domain impersonating {matched_term}: {pd}"
+                        ),
+                        "contentSnippet": (
+                            f"The domain {pd} appears on the Phishing.Database ACTIVE "
+                            f'feed (community-verified active phishing) and embeds the '
+                            f'brand label "{matched_term}" as a domain segment. Likely '
+                            f"brand-impersonation phishing — verify the domain targets "
+                            f"this brand."
+                        ),
+                        "matchType": "BRAND_MENTION",
+                        "matchedKeywords": [matched_term],
+                        # Fallback only; the backend scorer bands this via the
+                        # 'impersonator' bucket (MEDIUM). Never drives the alert.
+                        "severity": "MEDIUM",
+                        "relevanceScore": 70,
+                        "riskScore": 60,
+                        "discoveredAt": None,  # the feed carries no per-domain timestamp
+                        "metadata": {
+                            "vendor": "Phishing.Database",
+                            "license": "MIT",
+                            "feed": "phishing-domains-ACTIVE",
+                            "phishingDomain": pd,
+                            "matchedLabel": matched_term,
+                            # #1617 — carry the cap on the record so a
+                            # truncated sweep is never mistaken downstream for
+                            # a complete one.
+                            "matchedTotal": matched_total,
+                            "truncated": truncated,
+                        },
+                    }
+                )
+            if agent and results:
+                agent.report_progress(
+                    f"Phishing.Database matched {len(results)} active phishing domain(s)"
+                )
+        except Exception as e:
+            self._mark_source_status("phishing_database", "error")
+            if agent:
+                agent.report_progress(f"Phishing.Database query failed: {str(e)}")
         return results
 
     async def _query_hibp_breaches(

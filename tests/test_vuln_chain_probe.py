@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import unittest
 
 from tools.agentic_vuln_chain_probe import VulnChainProbeTool
@@ -265,6 +266,28 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://vulnbank.test/api/v1/merchants/register", urls)
         self.assertIn("https://vulnbank.test/api/v1/merchants/login", urls)
 
+    def test_openapi_login_without_body_schema_gets_minimal_observed_carrier(self):
+        tool = VulnChainProbeTool()
+
+        candidates = tool._business_action_candidates(
+            [],
+            "https://vulnbank.test/",
+            {
+                "apiEndpoints": [
+                    {
+                        "method": "POST",
+                        "path": "/login",
+                        "source": "openapi",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["url"], "https://vulnbank.test/login")
+        self.assertEqual(candidates[0]["method"], "POST")
+        self.assertEqual(candidates[0]["fieldNames"], ["username", "password"])
+
     def test_business_payload_variants_cover_amount_and_mass_assignment(self):
         tool = VulnChainProbeTool()
 
@@ -412,7 +435,11 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             forms,
             "https://vulnbank.test/",
             16,
-            {"allowUnsafeMethods": True, "riskTolerance": "aggressive"},
+            {
+                "allowUnsafeMethods": True,
+                "allowPersistentStateChanges": True,
+                "riskTolerance": "aggressive",
+            },
         )
 
         variants = [probe.get("variant") for probe in created["probes"] if probe.get("type") == "business_logic"]
@@ -421,9 +448,52 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("graphql_introspection_probe", variants)
         self.assertIn("ai_prompt_injection_probe", variants)
         self.assertIn("card_limit_mass_assignment", variants)
+        self.assertNotIn("default_login_probe", variants)
         self.assertIn("xasm-graphql-introspection-enabled", template_ids)
         self.assertIn("xasm-ai-prompt-sensitive-context-exposure", template_ids)
         self.assertIn("xasm-card-limit-mass-assignment", template_ids)
+
+    def test_default_credentials_require_explicit_opt_in_and_obey_global_cap(self):
+        tool = VulnChainProbeTool()
+        candidates = [
+            {
+                "method": "POST",
+                "url": f"https://vulnbank.test/api/login{i}",
+                "fieldNames": ["username", "password"],
+            }
+            for i in range(4)
+        ]
+
+        disabled = tool._business_priority_probe_plan(candidates, {})
+        enabled = tool._business_priority_probe_plan(
+            candidates,
+            {"enableDefaultCredentialProbe": True, "maxCredAttempts": 3},
+        )
+
+        self.assertNotIn("default_login_probe", {variant["kind"] for _, variant in disabled})
+        self.assertEqual(
+            3,
+            sum(1 for _, variant in enabled if variant["kind"] == "default_login_probe"),
+        )
+
+    def test_generated_spa_seeding_is_explicit_only(self):
+        tool = VulnChainProbeTool()
+
+        self.assertFalse(tool._generated_candidate_seeding_enabled({}))
+        self.assertFalse(
+            tool._generated_candidate_seeding_enabled(
+                {
+                    "allowGeneratedCandidates": False,
+                    "allowGeneratedPostFormCandidates": False,
+                    "allowGeneratedExploitCandidates": False,
+                }
+            )
+        )
+        self.assertTrue(
+            tool._generated_candidate_seeding_enabled(
+                {"allowGeneratedPostFormCandidates": True}
+            )
+        )
 
     def test_business_candidates_prioritize_recovery_and_url_fetch_before_generic_business(self):
         tool = VulnChainProbeTool()
@@ -577,6 +647,8 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_login_sqli_bypass_finding_and_combined_auth_contexts_are_reusable(self):
         tool = VulnChainProbeTool()
+        token = "eyJhbGciOiJIUzI1NiJ9.eyJtZXJjaGFudF9pZCI6MX0.signaturevalue"
+        api_key = "vk_secret_merchant_api_key"
         candidate = {"method": "POST", "url": "https://vulnbank.test/api/login", "fieldNames": ["username", "password"]}
         variant = {
             "kind": "login_sqli_bypass_probe",
@@ -586,20 +658,26 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         result = {
             "status": 200,
             "headers": {"Content-Type": "application/json"},
-            "text": '{"token":"jwt.secret","api_key":"merchant_secret","user":{"role":"admin"}}',
+            "text": json.dumps({"token": token, "api_key": api_key, "user": {"role": "admin"}}),
             "request": "POST /api/login HTTP/1.1",
-            "response": "HTTP/1.1 200\n\n{\"token\":\"jwt.secret\",\"api_key\":\"merchant_secret\"}",
+            "response": f'HTTP/1.1 200\n\n{{"token":"{token}","api_key":"{api_key}"}}',
         }
 
         contexts = tool._business_auth_headers_from_response(result)
         findings = tool._business_findings_for_variant(candidate, variant, result, {}, "secret_exposure")
 
-        self.assertIn({"Authorization": "Bearer jwt.secret", "X-Merchant-Api-Key": "merchant_secret"}, contexts)
-        self.assertIn({"Authorization": "Bearer jwt.secret"}, contexts)
-        self.assertIn({"X-Merchant-Api-Key": "merchant_secret"}, contexts)
+        self.assertIn({"Authorization": f"Bearer {token}", "X-Merchant-Api-Key": api_key}, contexts)
+        self.assertIn({"Authorization": f"Bearer {token}"}, contexts)
+        self.assertIn({"X-Merchant-Api-Key": api_key}, contexts)
         self.assertEqual(findings[0]["template-id"], "xasm-login-sqli-authentication-bypass")
         self.assertIn("POST /api/login", findings[0]["request"])
         self.assertIn("HTTP/1.1 200", findings[0]["response"])
+        persisted = json.dumps(findings[0])
+        self.assertNotIn(token, persisted)
+        self.assertNotIn(api_key, persisted)
+        self.assertIn("[REDACTED]", findings[0]["response"])
+        self.assertIn("[REDACTED]", findings[0]["matchedContent"])
+        self.assertNotIn("[REDACTED]]", persisted)
 
     def test_graphql_ai_xss_and_card_findings_include_http_evidence(self):
         tool = VulnChainProbeTool()
@@ -720,7 +798,11 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             ],
             "https://vulnbank.test/",
             5,
-            {"riskTolerance": "aggressive", "allowUnsafeMethods": True},
+            {
+                "riskTolerance": "aggressive",
+                "allowUnsafeMethods": True,
+                "allowPersistentStateChanges": True,
+            },
         )
 
         self.assertGreaterEqual(used, 1)
@@ -729,6 +811,63 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("POST /api/v1/payments/charge HTTP/1.1", first["request"])
         self.assertIn("HTTP/1.1 200", first["response"])
         self.assertIn("variant=", first["matchedContent"])
+
+    async def test_bounded_active_skips_persistent_routes_without_explicit_opt_in(self):
+        tool = FakeBusinessVulnChainProbeTool()
+
+        result, used = await tool._probe_business_logic(
+            None,
+            {},
+            [
+                {
+                    "action": "https://vulnbank.test/api/v1/merchants/register",
+                    "method": "POST",
+                    "fields": [{"name": "email"}, {"name": "password"}],
+                },
+                {
+                    "action": "https://vulnbank.test/api/v3/forgot-password",
+                    "method": "POST",
+                    "fields": [{"name": "username"}],
+                },
+                {
+                    "action": "https://vulnbank.test/api/v1/payments/charge",
+                    "method": "POST",
+                    "fields": [{"name": "amount"}],
+                },
+                {
+                    "action": "https://vulnbank.test/graphql",
+                    "method": "POST",
+                    "fields": [{"name": "query"}],
+                },
+            ],
+            "https://vulnbank.test/",
+            12,
+            {"riskTolerance": "aggressive", "allowUnsafeMethods": True},
+        )
+
+        skipped_urls = {
+            probe["url"]
+            for probe in result["probes"]
+            if probe.get("skipped") and probe.get("url")
+        }
+        executed_requests = "\n".join(
+            str(probe.get("request") or "")
+            for probe in result["probes"]
+            if not probe.get("skipped")
+        )
+        self.assertEqual(
+            skipped_urls,
+            {
+                "https://vulnbank.test/api/v1/merchants/register",
+                "https://vulnbank.test/api/v3/forgot-password",
+                "https://vulnbank.test/api/v1/payments/charge",
+            },
+        )
+        self.assertGreater(used, 0)
+        self.assertIn("POST /graphql HTTP/1.1", executed_requests)
+        self.assertNotIn("/merchants/register", executed_requests)
+        self.assertNotIn("/forgot-password", executed_requests)
+        self.assertNotIn("/payments/charge", executed_requests)
 
     async def test_business_probe_reuses_auth_artifact_for_followup_side_effect(self):
         tool = FakeChainedBusinessVulnChainProbeTool()
@@ -750,7 +889,11 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             ],
             "https://vulnbank.test/",
             8,
-            {"riskTolerance": "aggressive", "allowUnsafeMethods": True},
+            {
+                "riskTolerance": "aggressive",
+                "allowUnsafeMethods": True,
+                "allowPersistentStateChanges": True,
+            },
         )
 
         template_ids = {finding["template-id"] for finding in result["findings"]}
@@ -779,7 +922,11 @@ class VulnChainProbeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             ],
             "https://vulnbank.test/",
             40,
-            {"riskTolerance": "aggressive", "allowUnsafeMethods": True},
+            {
+                "riskTolerance": "aggressive",
+                "allowUnsafeMethods": True,
+                "allowPersistentStateChanges": True,
+            },
         )
 
         template_ids = {finding["template-id"] for finding in result["findings"]}

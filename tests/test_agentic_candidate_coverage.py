@@ -2,9 +2,15 @@ import unittest
 import asyncio
 
 from tools.agentic_param_exploit_probe import ParamExploitProbeTool
+from tools.agentic_param_discover import ParamDiscoverTool
 from tools.agentic_api_access_control_probe import ApiAccessControlProbeTool, COMMON_READONLY_API_PATHS
 from tools.agentic_decision_plan_next import DecisionPlanNextTool
 from tools.agentic_exploitation_queue import ExploitationQueueTool
+from tools._agentic_exploration_common import (
+    NATIVE_PROBE_PATH_CANDIDATES_KEY,
+    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
+    extract_html_map,
+)
 from tools.agentic_exploit_chain import _build_login_candidates, _build_no_auth_candidates, _normalize_form
 from tools.retirejs_scan import _build_aggregate_finding
 from tools.web_security_controls_probe import WebSecurityControlsProbeTool
@@ -18,6 +24,258 @@ from tools.nuclei_full_scan import (
 
 
 class AgenticCandidateCoverageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_url_only_cart_setup_routes_to_native_race_probe_without_private_values(self):
+        mapped = extract_html_map(
+            """
+            <html><body>
+              <form action="/cart" method="POST" enctype="application/x-www-form-urlencoded">
+                <input type="hidden" name="productId" value="1">
+                <input type="hidden" name="redir" value="PRODUCT">
+                <input type="number" name="quantity" value="1">
+              </form>
+            </body></html>
+            """,
+            "https://shop.example.test/product?productId=1",
+        )
+        tool = ExploitationQueueTool()
+
+        result = await tool.execute(
+            {
+                "target": "https://shop.example.test/",
+                "forms": mapped["forms"],
+                "riskTolerance": "high",
+                "engagement": "lab",
+                "allowUnsafeMethods": True,
+            }
+        )
+
+        action = next(
+            item
+            for item in result["nextActions"]
+            if item["tool"] == "web:race_condition_probe"
+        )
+        self.assertEqual(action["nativeProbe"]["status"], "READY")
+        self.assertEqual(action["nativeProbe"]["adapterId"], "web:race_condition_probe")
+        self.assertEqual(action["candidateTypes"], ["race_cart_setup_form"])
+        self.assertEqual(
+            action["candidateIds"],
+            [mapped["forms"][0]["nativeProbeCandidateId"]],
+        )
+        self.assertNotIn("productId=1", str(action))
+
+    async def test_non_portswigger_url_only_discovery_routes_absolute_url_form_to_ssrf(self):
+        mapped = extract_html_map(
+            """
+            <html><body>
+              <form action="/fetch/preview" method="POST" enctype="application/x-www-form-urlencoded">
+                <input type="hidden" name="documentId" value="42">
+                <input type="text" name="resource" value="https://cdn.fixture.invalid/document/42">
+              </form>
+            </body></html>
+            """,
+            "https://fixture.example/",
+        )
+        tool = ExploitationQueueTool()
+
+        result = await tool.execute(
+            {
+                "target": "https://fixture.example/",
+                "forms": mapped["forms"],
+            }
+        )
+
+        action = next(
+            item for item in result["nextActions"] if item["tool"] == "web:ssrf_probe"
+        )
+        self.assertEqual(action["nativeProbe"]["status"], "READY")
+        self.assertEqual(action["candidateTypes"], ["absolute_url_form_field"])
+        self.assertEqual(
+            action["candidateIds"],
+            [mapped["forms"][0]["nativeProbeCandidateId"]],
+        )
+        public_output = str(
+            {
+                key: value
+                for key, value in mapped.items()
+                if key != NATIVE_PROBE_PRIVATE_CANDIDATES_KEY
+            }
+        )
+        self.assertNotIn("cdn.fixture.invalid", public_output)
+        self.assertNotIn("cdn.fixture.invalid", str(action))
+
+    async def test_observed_query_artifacts_route_bounded_dalfox_and_sqlmap(self):
+        discovered = await ParamDiscoverTool().execute(
+            {
+                "target": "https://fixture.example/",
+                "urls": [
+                    "https://fixture.example/search?q=private-marker",
+                    "https://fixture.example/products?category=Gifts",
+                ],
+                "discoverFromTarget": False,
+            }
+        )
+        public_discovery = {
+            key: value
+            for key, value in discovered.items()
+            if key != NATIVE_PROBE_PRIVATE_CANDIDATES_KEY
+        }
+        self.assertNotIn("private-marker", str(public_discovery))
+        self.assertNotIn("Gifts", str(public_discovery))
+
+        queued = await ExploitationQueueTool().execute(
+            {
+                "target": "https://fixture.example/",
+                "parameterizedUrls": discovered["urlsWithParams"],
+                "interestingParameters": discovered["interestingParameters"],
+                "queryCandidates": discovered["queryCandidates"],
+                "riskTolerance": "high",
+                "engagement": "aggressive",
+            }
+        )
+        dalfox = next(
+            action
+            for action in queued["nextActions"]
+            if action["tool"] == "dalfox:xss_scan"
+        )
+        browser_dom = next(
+            action
+            for action in queued["nextActions"]
+            if action["tool"] == "browser:dom_probe"
+        )
+        sqlmap = next(
+            action
+            for action in queued["nextActions"]
+            if action["tool"] == "sqlmap:detection_scan"
+        )
+        self.assertEqual(dalfox["nativeProbe"]["status"], "READY")
+        self.assertEqual(dalfox["candidateTypes"], ["reflection_candidate"])
+        self.assertEqual(browser_dom["nativeProbe"]["status"], "READY")
+        self.assertEqual(browser_dom["candidateTypes"], ["dom_xss_candidate"])
+        self.assertEqual(len(browser_dom["candidateIds"]), 1)
+        self.assertEqual(sqlmap["nativeProbe"]["status"], "READY")
+        self.assertEqual(sqlmap["candidateTypes"], ["sql_injection_candidate"])
+        self.assertNotIn("private-marker", str(queued))
+        self.assertNotIn("Gifts", str(queued))
+
+    async def test_sqlmap_query_route_requires_aggressive_posture(self):
+        discovered = await ParamDiscoverTool().execute(
+            {
+                "target": "https://fixture.example/",
+                "urls": ["https://fixture.example/products?id=1"],
+                "discoverFromTarget": False,
+            }
+        )
+        queued = await ExploitationQueueTool().execute(
+            {
+                "target": "https://fixture.example/",
+                "parameterizedUrls": discovered["urlsWithParams"],
+                "queryCandidates": discovered["queryCandidates"],
+                "riskTolerance": "low",
+            }
+        )
+        self.assertFalse(
+            any(
+                action["tool"] == "sqlmap:detection_scan"
+                for action in queued["nextActions"]
+            )
+        )
+
+    async def test_documented_path_artifacts_are_prioritized_for_native_sqlmap(self):
+        path_candidates = [
+            {
+                "url": "https://fixture.example/transactions/{account_number}",
+                "method": "GET",
+                "contentType": "application/x-www-form-urlencoded",
+                "fields": [
+                    {
+                        "name": "account_number",
+                        "type": "path",
+                        "valueSource": "documented-path",
+                    }
+                ],
+                "parameterNames": ["account_number"],
+                "nativeProbeCandidateId": "cand-1111111111111111",
+            },
+            {
+                "url": "https://fixture.example/check_balance/{account_number}",
+                "method": "GET",
+                "contentType": "application/x-www-form-urlencoded",
+                "fields": [
+                    {
+                        "name": "account_number",
+                        "type": "path",
+                        "valueSource": "documented-path",
+                    }
+                ],
+                "parameterNames": ["account_number"],
+                "nativeProbeCandidateId": "cand-2222222222222222",
+            },
+        ]
+
+        queued = await ExploitationQueueTool().execute(
+            {
+                "target": "https://fixture.example/",
+                NATIVE_PROBE_PATH_CANDIDATES_KEY: path_candidates,
+                "riskTolerance": "high",
+                "engagement": "aggressive",
+            }
+        )
+
+        sqlmap = next(
+            action
+            for action in queued["nextActions"]
+            if action["tool"] == "sqlmap:detection_scan"
+        )
+        self.assertEqual(sqlmap["nativeProbe"]["status"], "READY")
+        self.assertEqual(
+            sqlmap["candidateIds"],
+            ["cand-1111111111111111", "cand-2222222222222222"],
+        )
+        self.assertEqual(sqlmap["parameters"], {"target": "https://fixture.example/"})
+        self.assertNotIn("/transactions/1", str(queued))
+
+    def test_html_map_splits_public_metadata_from_private_form_baselines(self):
+        mapped = extract_html_map(
+            """
+            <form action="/product/stock" method="POST">
+              <input type="hidden" name="productId" value="1">
+              <input type="hidden" name="csrfToken" value="framework-secret-123">
+              <input type="email" name="email" value="person@example.test">
+              <select name="storeId"><option value="2" selected>Paris</option></select>
+            </form>
+            """,
+            "https://shop.example.test/",
+        )
+
+        form = mapped["forms"][0]
+        candidate_id = form["nativeProbeCandidateId"]
+        self.assertRegex(candidate_id, r"^cand-[a-f0-9]{16}$")
+        self.assertNotIn("framework-secret-123", str(form))
+        self.assertNotIn("person@example.test", str(form))
+        private = mapped[NATIVE_PROBE_PRIVATE_CANDIDATES_KEY][0]
+        self.assertEqual(private["candidateId"], candidate_id)
+        self.assertEqual(private["fields"]["csrfToken"], "framework-secret-123")
+        self.assertEqual(private["fields"]["email"], "person@example.test")
+        self.assertEqual(private["fields"]["storeId"], "2")
+
+    def test_html_map_extracts_inline_url_search_parameters(self):
+        mapped = extract_html_map(
+            """
+            <a href="/blog">Blog</a>
+            <script>
+              const current = new URL(window.location.href);
+              current.searchParams.set('q', 'browser-only-value');
+              const params = new URLSearchParams(window.location.search);
+              const page = params.get('page');
+            </script>
+            """,
+            "https://example.test/blog",
+        )
+
+        self.assertEqual(mapped["inlineQueryParameters"], ["q", "page"])
+        self.assertEqual(mapped["parameterizedUrls"], ["https://example.test/blog?q=&page="])
+        self.assertNotIn("browser-only-value", str(mapped))
+
     def test_generated_merchant_login_precedes_observed_forms(self):
         candidates = _build_login_candidates(
             "https://vulnbank.org/",
@@ -157,6 +415,126 @@ class AgenticCandidateCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("HTTP/1.1 200 OK", finding["response"])
         self.assertNotIn("Cookie:", finding["request"])
         self.assertIn("anonymous_status=200", finding["matchedContent"])
+
+    def test_api_probe_promotes_anonymous_sensitive_json_baseline(self):
+        tool = ApiAccessControlProbeTool()
+        endpoint = {
+            "method": "GET",
+            "url": "https://example.test/api/system-info",
+            "source": "openapi",
+        }
+        body = '{"system_info":{"system_prompt":"internal instruction","database_access":true},"status":"ok"}'
+        response = {
+            "url": endpoint["url"],
+            "status": 200,
+            "headers": {"Content-Type": "application/json", "Set-Cookie": "sid=server-secret"},
+            "body": body,
+            "elapsedMs": 10,
+            "jsonKeys": tool._json_keys(body),
+            "bodyLength": len(body),
+            "sensitiveBodyMarkers": tool._sensitive_body_markers(body),
+        }
+
+        finding = tool._anonymous_sensitive_baseline_finding(
+            endpoint,
+            response,
+            {"Accept": "application/json"},
+        )
+
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["template-id"], "xasm-api-anonymous-sensitive-data-exposure")
+        self.assertEqual(finding["info"]["classification"]["cwe-id"], ["CWE-200", "CWE-862"])
+        self.assertIn("GET /api/system-info HTTP/1.1", finding["request"])
+        self.assertIn("HTTP/1.1 200 OK", finding["response"])
+        self.assertIn('\"system_prompt\":[REDACTED]', finding["response"])
+        self.assertNotIn("internal instruction", finding["response"])
+        self.assertNotIn("server-secret", finding["response"])
+        self.assertIn("database_access", finding["matchedContent"])
+
+    def test_api_probe_does_not_promote_public_metadata_baseline(self):
+        tool = ApiAccessControlProbeTool()
+        endpoint = {
+            "method": "GET",
+            "url": "https://example.test/api/status",
+            "source": "openapi",
+        }
+        body = '{"status":"ok","version":"1.2.3","documentation":"/api/docs"}'
+        response = {
+            "url": endpoint["url"],
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": body,
+            "elapsedMs": 5,
+            "jsonKeys": tool._json_keys(body),
+            "bodyLength": len(body),
+            "sensitiveBodyMarkers": tool._sensitive_body_markers(body),
+        }
+
+        finding = tool._anonymous_sensitive_baseline_finding(endpoint, response, {})
+
+        self.assertIsNone(finding)
+
+    def test_api_probe_promotes_and_redacts_truncated_sensitive_json(self):
+        tool = ApiAccessControlProbeTool()
+        endpoint = {
+            "method": "GET",
+            "url": "https://example.test/debug/users",
+            "source": "dirsearch:quick",
+        }
+        body = (
+            '{"users":[{"id":1,"email":"alice@example.test",'
+            '"password_hash":"$2b$12$raw-sensitive-hash","role":"admin"},'
+        )
+        response = {
+            "url": endpoint["url"],
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": body,
+            "elapsedMs": 10,
+            "jsonKeys": tool._json_keys(body),
+            "bodyLength": 250_000,
+            "sensitiveBodyMarkers": tool._sensitive_body_markers(body),
+        }
+
+        self.assertIn("password_hash", response["jsonKeys"])
+        finding = tool._anonymous_sensitive_baseline_finding(endpoint, response, {})
+
+        self.assertIsNotNone(finding)
+        self.assertIn("GET /debug/users HTTP/1.1", finding["request"])
+        self.assertIn('"password_hash":[REDACTED]', finding["response"])
+        self.assertNotIn("raw-sensitive-hash", finding["response"])
+        self.assertNotIn("alice@example.test", finding["response"])
+
+    def test_api_probe_redacts_identity_and_financial_baseline_values(self):
+        tool = ApiAccessControlProbeTool()
+        endpoint = {
+            "method": "GET",
+            "url": "https://example.test/debug/users",
+            "source": "openapi",
+        }
+        body = (
+            '{"users":[{"username":"alice","account_number":"502001",'
+            '"balance":1250,"role":"admin"}]}'
+        )
+        response = {
+            "url": endpoint["url"],
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": body,
+            "elapsedMs": 10,
+            "jsonKeys": tool._json_keys(body),
+            "bodyLength": len(body),
+            "sensitiveBodyMarkers": tool._sensitive_body_markers(body),
+        }
+
+        finding = tool._anonymous_sensitive_baseline_finding(endpoint, response, {})
+
+        self.assertIsNotNone(finding)
+        self.assertIn('"account_number":"[REDACTED]"', finding["response"])
+        self.assertNotIn("502001", finding["response"])
+        self.assertNotIn("alice", finding["response"])
+        self.assertNotIn("1250", finding["response"])
+        self.assertNotIn('"role":"admin"', finding["response"])
 
     def test_web_security_controls_promotes_sanitized_http_evidence(self):
         tool = WebSecurityControlsProbeTool()
@@ -331,6 +709,179 @@ class AgenticCandidateCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cve:runtime_probe", tools)
         self.assertIn("dalfox:xss_scan", tools)
         self.assertTrue(result["attackChainCandidates"])
+
+        action_by_tool = {action["tool"]: action for action in result["nextActions"]}
+        dalfox_decision = action_by_tool["dalfox:xss_scan"]["nativeProbe"]
+        self.assertEqual(dalfox_decision["version"], 1)
+        self.assertEqual(dalfox_decision["status"], "BLOCKED")
+        self.assertEqual(
+            dalfox_decision["reasonCode"],
+            "ADAPTER_NOT_IMPLEMENTED",
+        )
+        self.assertTrue(dalfox_decision["candidateIds"])
+        self.assertNotIn("parameters", dalfox_decision)
+        self.assertFalse(action_by_tool["dalfox:xss_scan"]["autonomousReady"])
+
+    async def test_exploitation_queue_preserves_sanitized_form_default_signals(self):
+        tool = ExploitationQueueTool()
+
+        result = await tool.execute(
+            {
+                "target": "https://shop.example.test/",
+                "forms": [
+                    {
+                        "action": "/product/stock",
+                        "method": "POST",
+                        "contentType": "application/x-www-form-urlencoded",
+                        "fields": [
+                            {
+                                "name": "stockApi",
+                                "type": "text",
+                                "hasDefault": True,
+                                "valueLength": 42,
+                                "valueKind": "absolute-http-url",
+                                "valueSource": "html-default",
+                                "value": "https://must-not-survive.example/internal",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        candidate = next(
+            item
+            for item in result["candidates"]
+            if item["type"] == "state_changing_form"
+        )
+        self.assertEqual(candidate["contentType"], "application/x-www-form-urlencoded")
+        self.assertEqual(
+            candidate["fields"],
+            [
+                {
+                    "name": "stockApi",
+                    "type": "text",
+                    "hasDefault": True,
+                    "valueLength": 42,
+                    "valueKind": "absolute-http-url",
+                    "valueSource": "html-default",
+                }
+            ],
+        )
+        self.assertNotIn("must-not-survive.example", str(result))
+
+        ssrf_candidate = next(
+            item
+            for item in result["candidates"]
+            if item["type"] == "absolute_url_form_field"
+        )
+        self.assertEqual(ssrf_candidate["recommendedTools"], ["web:ssrf_probe"])
+        ssrf_action = next(
+            action
+            for action in result["nextActions"]
+            if action["tool"] == "web:ssrf_probe"
+        )
+        self.assertEqual(ssrf_action["nativeProbe"]["status"], "BLOCKED")
+        self.assertEqual(
+            ssrf_action["nativeProbe"]["reasonCode"],
+            "ADAPTER_NOT_IMPLEMENTED",
+        )
+
+    async def test_exploitation_queue_preserves_opaque_artifact_candidate_id(self):
+        tool = ExploitationQueueTool()
+        artifact_candidate_id = "cand-0123456789abcdef"
+
+        result = await tool.execute(
+            {
+                "target": "https://shop.example.test/",
+                "forms": [
+                    {
+                        "action": "/product/stock",
+                        "method": "POST",
+                        "contentType": "application/x-www-form-urlencoded",
+                        "nativeProbeCandidateId": artifact_candidate_id,
+                        "fields": [
+                            {
+                                "name": "stockApi",
+                                "type": "text",
+                                "hasDefault": True,
+                                "valueLength": 42,
+                                "valueKind": "absolute-http-url",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        native_action = next(
+            action
+            for action in result["nextActions"]
+            if action["tool"] == "web:security_controls_probe"
+        )
+        self.assertIn(artifact_candidate_id, native_action["candidateIds"])
+        self.assertNotIn("value", str(native_action["nativeProbe"]))
+
+        ssrf_action = next(
+            action
+            for action in result["nextActions"]
+            if action["tool"] == "web:ssrf_probe"
+        )
+        self.assertTrue(ssrf_action["autonomousReady"])
+        self.assertEqual(
+            ssrf_action["nativeProbe"],
+            {
+                "version": 1,
+                "status": "READY",
+                "adapterId": "web:ssrf_probe",
+                "resolverVersion": 1,
+                "candidateIds": [artifact_candidate_id],
+                "candidateKinds": ["absolute_url_form_field"],
+                "confidence": 0.96,
+                "source": "exploitation-queue",
+            },
+        )
+        self.assertNotIn("value", str(ssrf_action["nativeProbe"]))
+
+    async def test_absolute_url_metadata_takes_ssrf_precedence_without_a_urlish_field_name(self):
+        tool = ExploitationQueueTool()
+        artifact_candidate_id = "cand-fedcba9876543210"
+
+        result = await tool.execute(
+            {
+                "target": "https://fixture.example/",
+                "forms": [
+                    {
+                        "action": "/lookup",
+                        "method": "POST",
+                        "contentType": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "nativeProbeCandidateId": artifact_candidate_id,
+                        "fields": [
+                            {
+                                "name": "resource",
+                                "type": "text",
+                                "hasDefault": True,
+                                "valueKind": "absolute-http-url",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        ssrf_candidate = next(
+            candidate
+            for candidate in result["candidates"]
+            if candidate["type"] == "absolute_url_form_field"
+        )
+        self.assertEqual(ssrf_candidate["confidence"], 0.92)
+        ssrf_action = next(
+            action for action in result["nextActions"] if action["tool"] == "web:ssrf_probe"
+        )
+        self.assertEqual(ssrf_action["nativeProbe"]["status"], "READY")
+        self.assertNotIn("web:xxe_probe", [
+            action["tool"] for action in result["nextActions"]
+        ])
 
     async def test_exploitation_queue_flags_business_logic_surface(self):
         tool = ExploitationQueueTool()

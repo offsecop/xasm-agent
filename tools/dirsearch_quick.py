@@ -27,6 +27,18 @@ from tools._dirsearch_base import (
 
 # Quick scan extensions - common web files only
 QUICK_EXTENSIONS = "php,html,js"
+DEFAULT_QUICK_TIMEOUT_SECONDS = 300
+MIN_QUICK_TIMEOUT_SECONDS = 1
+MAX_QUICK_TIMEOUT_SECONDS = 300
+
+
+def coerce_quick_timeout_seconds(value: Any) -> int:
+    """Return a caller-controlled, bounded wall-clock deadline."""
+    try:
+        timeout_seconds = int(value)
+    except (TypeError, ValueError):
+        timeout_seconds = DEFAULT_QUICK_TIMEOUT_SECONDS
+    return max(MIN_QUICK_TIMEOUT_SECONDS, min(timeout_seconds, MAX_QUICK_TIMEOUT_SECONDS))
 
 
 class DirsearchQuickTool(ToolPlugin):
@@ -74,6 +86,13 @@ class DirsearchQuickTool(ToolPlugin):
                     "type": "integer",
                     "description": "Maximum number of targets to scan from array (default: 10)",
                     "default": 10
+                },
+                "timeoutSeconds": {
+                    "type": "integer",
+                    "description": "Whole-tool wall-clock deadline in seconds (default: 300)",
+                    "default": DEFAULT_QUICK_TIMEOUT_SECONDS,
+                    "minimum": MIN_QUICK_TIMEOUT_SECONDS,
+                    "maximum": MAX_QUICK_TIMEOUT_SECONDS
                 },
                 "headers_file": {
                     "type": "string",
@@ -147,6 +166,7 @@ class DirsearchQuickTool(ToolPlugin):
         headers_file = extract_auth_headers_file(parameters)
         cookie = extract_auth_cookie(parameters)
         agent = parameters.get('_agent')
+        timeout_seconds = coerce_quick_timeout_seconds(parameters.get('timeoutSeconds'))
 
         # Apply exclusion filtering to targets
         from tools._scope_utils import extract_exclusion_patterns, extract_rate_limit, filter_excluded_urls
@@ -157,10 +177,17 @@ class DirsearchQuickTool(ToolPlugin):
 
         try:
             execution_start = time.time()
+            execution_monotonic_start = time.monotonic()
+            deadline = execution_monotonic_start + timeout_seconds
             execution_metrics = {
                 'start_time': execution_start,
                 'process_pid': None,
                 'execution_duration': 0,
+                'elapsedMs': 0,
+                'timeoutSeconds': timeout_seconds,
+                'deadlineExceeded': False,
+                'completedTargets': 0,
+                'candidateCount': 0,
                 'memory_before': psutil.Process().memory_info().rss / 1024 / 1024 if PSUTIL_AVAILABLE else None,
             }
 
@@ -170,7 +197,7 @@ class DirsearchQuickTool(ToolPlugin):
                     operation_desc += " [authenticated]"
                 agent.report_progress(
                     current_operation=operation_desc,
-                    current_target=targets_list[0] if targets_list else "unknown",
+                    current_target="target-batch",
                     items_processed=0,
                     total_items=len(targets_list)
                 )
@@ -190,12 +217,20 @@ class DirsearchQuickTool(ToolPlugin):
             all_endpoints = []
             all_urls = []
             errors = []
+            timed_out = False
+            completed_targets = 0
+            successful_targets = 0
 
             for idx, target in enumerate(targets_list):
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    timed_out = True
+                    errors.append("configured wall-clock deadline exceeded before next target")
+                    break
                 if agent:
                     agent.report_progress(
                         current_operation=f"Quick scan target {idx + 1}/{len(targets_list)}",
-                        current_target=target,
+                        current_target=f"target-{idx + 1}",
                         items_processed=idx,
                         total_items=len(targets_list)
                     )
@@ -208,16 +243,27 @@ class DirsearchQuickTool(ToolPlugin):
                     wordlist=wordlist_to_use,
                     agent=agent,
                     execution_metrics=execution_metrics,
-                    rate_limit_config=rate_limit_config
+                    rate_limit_config=rate_limit_config,
+                    timeout_seconds=remaining_seconds,
                 )
 
                 if result.get('error'):
-                    errors.append(f"{target}: {result['error']}")
+                    errors.append(f"target {idx + 1}: {result['error']}")
+                else:
+                    successful_targets += 1
                 
                 all_endpoints.extend(result.get('endpoints', []))
                 all_urls.extend(result.get('urls', []))
+                completed_targets += 1
+                if result.get('timedOut'):
+                    timed_out = True
+                    break
 
             execution_metrics['execution_duration'] = time.time() - execution_start
+            execution_metrics['elapsedMs'] = int((time.monotonic() - execution_monotonic_start) * 1000)
+            execution_metrics['deadlineExceeded'] = timed_out
+            execution_metrics['completedTargets'] = completed_targets
+            execution_metrics['candidateCount'] = len(all_endpoints)
 
             if PSUTIL_AVAILABLE:
                 try:
@@ -229,6 +275,17 @@ class DirsearchQuickTool(ToolPlugin):
                 agent.append_output(f"✓ Total: {len(all_endpoints)} endpoints from {len(targets_list)} targets")
 
             return {
+                # Reaching the configured quick-scan deadline is a bounded,
+                # inspectable completion rather than an execution failure. The
+                # partial/coverageComplete fields preserve the distinction for
+                # callers without discarding endpoints already collected or
+                # causing the required RECON_BRUTE phase to be skipped.
+                'success': successful_targets > 0,
+                'status': 'PARTIAL_TIMEOUT' if timed_out else ('COMPLETED' if successful_targets > 0 else 'FAILED'),
+                'timedOut': timed_out,
+                'partial': timed_out,
+                'coverageComplete': not timed_out,
+                'timeoutSeconds': timeout_seconds,
                 'targets': targets_list,
                 'target': targets_list[0] if targets_list else None,
                 'endpoints': all_endpoints,
@@ -271,7 +328,8 @@ class DirsearchQuickTool(ToolPlugin):
         wordlist: str,
         agent,
         execution_metrics: dict,
-        rate_limit_config: dict = None
+        rate_limit_config: dict = None,
+        timeout_seconds: float = DEFAULT_QUICK_TIMEOUT_SECONDS,
     ) -> dict:
         """Scan a single target with dirsearch quick mode"""
         try:
@@ -290,9 +348,9 @@ class DirsearchQuickTool(ToolPlugin):
                 '--exclude-sizes=0B',
                 '--random-agent',
                 '-e', extensions,
-                '--format=json',
+                '-O', 'json',
                 '-o', output_file,
-                '--quiet'
+                '-q'
             ]
 
             if wordlist and os.path.exists(wordlist):
@@ -300,7 +358,7 @@ class DirsearchQuickTool(ToolPlugin):
 
             # Add authentication
             if headers_file and os.path.exists(headers_file):
-                cmd.extend(['--header-list', headers_file])
+                cmd.extend(['--headers-file', headers_file])
             elif cookie:
                 cmd.extend(['--cookie', cookie])
 
@@ -313,17 +371,21 @@ class DirsearchQuickTool(ToolPlugin):
             if execution_metrics.get('process_pid') is None:
                 execution_metrics['process_pid'] = process.pid
 
+            timed_out = False
+            stdout = b''
+            stderr = b''
+            scan_start = time.monotonic()
             try:
-                # 5 minute timeout for quick scan
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=300
+                    timeout=max(0.001, float(timeout_seconds)),
                 )
             except asyncio.TimeoutError:
+                timed_out = True
                 process.kill()
                 await process.wait()
                 if agent:
-                    agent.append_output(f"⚠️ Quick scan timeout: {target}")
+                    agent.append_output("[Dirsearch Quick] configured deadline reached; preserving partial output")
 
             endpoints = []
             urls = []
@@ -338,7 +400,7 @@ class DirsearchQuickTool(ToolPlugin):
                     for item in results:
                         url = item.get('url')
                         status = item.get('status')
-                        length = item.get('content-length', item.get('length'))
+                        length = item.get('contentLength', item.get('content-length', item.get('length')))
 
                         if url:
                             endpoint = {
@@ -357,27 +419,37 @@ class DirsearchQuickTool(ToolPlugin):
                     if agent:
                         if filter_stats['filtered_count'] > 0:
                             agent.append_output(
-                                f"  ✓ {target}: {len(endpoints)} endpoints "
+                                f"  ✓ {len(endpoints)} endpoints "
                                 f"({filter_stats['filtered_count']} false positives filtered: "
                                 f"{filter_stats['filter_reasons']})"
                             )
                         else:
-                            agent.append_output(f"  ✓ {target}: {len(endpoints)} endpoints")
+                            agent.append_output(f"  ✓ {len(endpoints)} endpoints")
 
             except json.JSONDecodeError:
                 if agent:
-                    agent.append_output(f"  ⚠️ {target}: Failed to parse output")
+                    agent.append_output("  ⚠️ Partial dirsearch output was not valid JSON")
             finally:
                 try:
                     os.unlink(output_file)
                 except Exception:
                     pass
 
+            return_code = getattr(process, 'returncode', 0)
+            process_error = None
+            if not timed_out and return_code not in (0, None):
+                detail = (stderr or stdout or b'dirsearch exited non-zero').decode('utf-8', errors='replace')
+                process_error = f"dirsearch exited {return_code}: {detail[:300]}"
+
             return {
                 'target': target,
                 'endpoints': endpoints,
                 'urls': urls,
-                'totalEndpoints': len(endpoints)
+                'totalEndpoints': len(endpoints),
+                'timedOut': timed_out,
+                'partial': timed_out,
+                'elapsedMs': int((time.monotonic() - scan_start) * 1000),
+                'error': process_error,
             }
 
         except Exception as e:

@@ -63,12 +63,11 @@ def _build_post(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a Threads post. Mirrors SMM `threads_post()`."""
     if not isinstance(raw, dict):
         return {}
-    caption = raw.get('caption') if isinstance(raw.get('caption'), dict) else {}
-    user = raw.get('user') if isinstance(raw.get('user'), dict) else {}
-    text = (
-        caption.get('text') if isinstance(caption, dict) and caption.get('text')
-        else _first(raw, 'text', 'body')
-    )
+    raw_caption = raw.get('caption')
+    caption: Dict[str, Any] = raw_caption if isinstance(raw_caption, dict) else {}
+    raw_user = raw.get('user')
+    user: Dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+    text = caption.get('text') or _first(raw, 'text', 'body')
     return {
         'post_id': str(_first(raw, 'pk', 'id', 'post_id') or '') or None,
         'code': _first(raw, 'code', 'short_code'),
@@ -90,7 +89,8 @@ def _build_user(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a Threads user record. Mirrors SMM `threads_account()`."""
     if not isinstance(raw, dict):
         return {}
-    user = raw.get('user') if isinstance(raw.get('user'), dict) else raw
+    raw_user = raw.get('user')
+    user: Dict[str, Any] = raw_user if isinstance(raw_user, dict) else raw
     handle = _first(user, 'username', 'handle')
     return {
         'handle': handle,
@@ -173,6 +173,14 @@ class ScrapeCreatorsThreadsSearchTool(ToolPlugin):
                     'type': 'integer',
                     'description': 'Recency window in days — mapped to the vendor start_date/end_date range.',
                 },
+                'end_days_ago': {
+                    'type': 'integer',
+                    'description': (
+                        'Optional end anchor: the window ENDS this many days in '
+                        'the past (0/omitted = now). Lets a historical backfill '
+                        'target a bounded past slice.'
+                    ),
+                },
                 'brand_monitor_id': {'type': 'string'},
                 'tenantId': {'type': 'string'},
             },
@@ -238,7 +246,14 @@ class ScrapeCreatorsThreadsSearchTool(ToolPlugin):
             base_params: Dict[str, Any] = {'query': query}
             # The ONLY time-ranged SC keyword endpoint: absolute YYYY-MM-DD
             # dates computed agent-side (step templates can't carry them).
-            start_date, end_date = threads_date_range(knobs['window_days'])
+            # `end_days_ago` slides the whole window into the past for a
+            # historical backfill. Provider cap: the endpoint returns at most
+            # ~10 un-paginated results per call regardless of range width —
+            # this bounds recency, it does NOT raise volume.
+            start_date, end_date = threads_date_range(
+                knobs['window_days'],
+                end_days_ago=knobs['end_days_ago'],
+            )
             if start_date and end_date:
                 base_params['start_date'] = start_date
                 base_params['end_date'] = end_date
