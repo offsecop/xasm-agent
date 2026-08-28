@@ -24,10 +24,12 @@ RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap 
 # Install nuclei via binary (faster and more reliable) - v3.3.6 (supports -dast flag)
 # v3.3.6 is the latest stable v3.3.x - avoids v3.4.x which produces 0 findings (BROKEN)
 # Upgraded from v3.1.5 to enable DAST mode (headless browser scanning)
-RUN wget https://github.com/projectdiscovery/nuclei/releases/download/v3.3.6/nuclei_3.3.6_linux_amd64.zip \
-    && unzip nuclei_3.3.6_linux_amd64.zip \
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then NUCLEI_ARCH="arm64"; else NUCLEI_ARCH="amd64"; fi && \
+    wget https://github.com/projectdiscovery/nuclei/releases/download/v3.3.6/nuclei_3.3.6_linux_${NUCLEI_ARCH}.zip \
+    && unzip nuclei_3.3.6_linux_${NUCLEI_ARCH}.zip \
     && mv nuclei /usr/local/bin/ \
-    && rm nuclei_3.3.6_linux_amd64.zip README.md LICENSE.md \
+    && rm nuclei_3.3.6_linux_${NUCLEI_ARCH}.zip README.md LICENSE.md \
     && nuclei -version \
     && nuclei -update-templates || echo "Template update skipped"
 
