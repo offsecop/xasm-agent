@@ -8,8 +8,13 @@ venv/
 env/
 ENV/
 
-# Configuration
-config.yaml
+# Configuration and local credentials
+config*.yaml
+!config.yaml.example
+!config.docker.yaml.example
+.env
+.env.*
+!.env.agent.example
 
 # Logs
 *.log
@@ -19,4 +24,3 @@ config.yaml
 .idea/
 *.swp
 .DS_Store
-
