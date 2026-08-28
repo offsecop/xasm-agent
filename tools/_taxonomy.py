@@ -344,7 +344,7 @@ def validate(name: str, meta: Dict[str, Any]) -> List[str]:
 # ToolRegistryEntry dispatch fields, using ONLY the existing persona-filter
 # category vocabulary so adding a tool never introduces a new dispatch key.
 # --------------------------------------------------------------------------- #
-# The 22 categories the personas' allowedToolFilters already reference. New
+# The categories the personas' allowedToolFilters already reference. New
 # registry rows MUST use one of these (asserted by the generator + the jest lock).
 REGISTRY_CATEGORIES = frozenset(
     {
@@ -361,6 +361,7 @@ REGISTRY_CATEGORIES = frozenset(
         "code.taint",
         "code.xref",
         "dast",
+        "dast-api",
         "dast-web",
         "exploit-test",
         "http.sequence",
@@ -377,6 +378,7 @@ REGISTRY_CATEGORIES = frozenset(
 # refined by domain below.
 PLUGIN_TO_REGISTRY_CATEGORY: Dict[str, str] = {
     "vuln-scan": "dast",
+    "dast-api": "dast-api",
     "browser-dast": "dast",
     "exploit-test": "exploit-test",
     "exploit": "exploit-test",
@@ -396,6 +398,7 @@ PLUGIN_TO_REGISTRY_CATEGORY: Dict[str, str] = {
 REGISTRY_RISK_BY_CATEGORY: Dict[str, str] = {
     "exploit-test": "MEDIUM",
     "dast": "MEDIUM",
+    "dast-api": "MEDIUM",
     "dast-web": "MEDIUM",
     "agentic-recon": "MEDIUM",
     "recon": "LOW",

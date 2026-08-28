@@ -6,6 +6,7 @@ alternate-protocol retry. A reachable port still proceeds to gowitness, now with
 the tightened --timeout/--delay flags.
 """
 import asyncio
+import json
 
 import pytest
 
@@ -273,11 +274,58 @@ def test_cloaking_suppressed_on_parking_host_final_url():
     assert out['parked'] is True
 
 
-def test_extract_final_url_prefers_explicit_then_last():
-    tool = BrandMonitorScreenshotTool()
-    assert tool._extract_final_url('status=200 final_url=https://forsale.godaddy.com/x more') \
-        == 'https://forsale.godaddy.com/x'
-    # no explicit field → last URL wins (gowitness logs the resolved URL).
-    assert tool._extract_final_url('GET https://a.test then https://sedoparking.com/b') \
-        == 'https://sedoparking.com/b'
-    assert tool._extract_final_url('no urls here') is None
+# #1554 — probe metadata now comes from the structured gowitness --write-jsonl
+# record, never from log scraping (gowitness v3 logs to stderr and persists no
+# metadata without a writer, so the old extractors always parsed '' → None).
+def test_parse_gowitness_jsonl_real_record(tmp_path):
+    # Field subset of a REAL gowitness v3 --write-jsonl record (captured
+    # in-container against a live 200 page), not an invented shape.
+    record = {
+        'id': 0,
+        'url': 'https://lure-lumenfield.test',
+        'final_url': 'https://sedoparking.com/lure-lumenfield.test',
+        'response_code': 200,
+        'protocol': 'h2',
+        'title': 'lure-lumenfield.test is for sale',
+        'failed': False,
+        'failed_reason': '',
+    }
+    p = tmp_path / 'gw.jsonl'
+    p.write_text(json.dumps(record) + '\n')
+    probe = BrandMonitorScreenshotTool._parse_gowitness_jsonl(str(p))
+    assert probe == {
+        'page_title': 'lure-lumenfield.test is for sale',
+        'http_status': 200,
+        'final_url': 'https://sedoparking.com/lure-lumenfield.test',
+        'failed': False,
+        'failed_reason': None,
+    }
+
+
+def test_parse_gowitness_jsonl_failed_probe(tmp_path):
+    p = tmp_path / 'gw.jsonl'
+    p.write_text(json.dumps({
+        'url': 'https://dead.test',
+        'final_url': '',
+        'response_code': 0,
+        'title': '',
+        'failed': True,
+        'failed_reason': 'net::ERR_CONNECTION_REFUSED',
+    }) + '\n')
+    probe = BrandMonitorScreenshotTool._parse_gowitness_jsonl(str(p))
+    assert probe['page_title'] is None
+    assert probe['http_status'] is None  # 0 is not a real HTTP status
+    assert probe['final_url'] is None
+    assert probe['failed'] is True
+    assert probe['failed_reason'] == 'net::ERR_CONNECTION_REFUSED'
+
+
+def test_parse_gowitness_jsonl_missing_empty_or_garbage(tmp_path):
+    assert BrandMonitorScreenshotTool._parse_gowitness_jsonl(
+        str(tmp_path / 'absent.jsonl')) is None
+    empty = tmp_path / 'empty.jsonl'
+    empty.write_text('')
+    assert BrandMonitorScreenshotTool._parse_gowitness_jsonl(str(empty)) is None
+    garbage = tmp_path / 'garbage.jsonl'
+    garbage.write_text('not json at all\n')
+    assert BrandMonitorScreenshotTool._parse_gowitness_jsonl(str(garbage)) is None

@@ -28,8 +28,19 @@ class ParseSearchKnobsTests(unittest.TestCase):
         knobs = parse_search_knobs({})
         self.assertEqual(knobs['limit'], 50)
         self.assertIsNone(knobs['window_days'])
+        self.assertIsNone(knobs['end_days_ago'])
         self.assertEqual(knobs['max_pages'], 1)
         self.assertIsNone(knobs['sort'])
+
+    def test_end_days_ago_parses_and_degrades(self):
+        self.assertEqual(parse_search_knobs({'end_days_ago': 90})['end_days_ago'], 90)
+        self.assertEqual(parse_search_knobs({'end_days_ago': '45'})['end_days_ago'], 45)
+        # 0 == "end at now" == absent; garbage/negative degrade the same way.
+        self.assertIsNone(parse_search_knobs({'end_days_ago': 0})['end_days_ago'])
+        self.assertIsNone(parse_search_knobs({'end_days_ago': -3})['end_days_ago'])
+        self.assertIsNone(
+            parse_search_knobs({'end_days_ago': '{{ json searchEndDaysAgo }}'})['end_days_ago'],
+        )
 
     def test_accepts_ints_and_numeric_strings(self):
         knobs = parse_search_knobs(
@@ -75,6 +86,11 @@ class VendorBucketTests(unittest.TestCase):
         self.assertEqual(reddit_timeframe(30), 'month')
         self.assertEqual(reddit_timeframe(90), 'year')
         self.assertEqual(reddit_timeframe(365), 'year')
+        # #1510 boundary lock — ≤ 366 stays 'year' (default behavior
+        # byte-identical); the first day past it reaches the vendor's
+        # all-time bucket (recall widener, NOT a date slice).
+        self.assertEqual(reddit_timeframe(366), 'year')
+        self.assertEqual(reddit_timeframe(367), 'all')
         self.assertEqual(reddit_timeframe(1000), 'all')
 
     def test_reddit_sort_passthrough_only_for_supported(self):
@@ -111,6 +127,24 @@ class VendorBucketTests(unittest.TestCase):
         self.assertEqual(start, '2026-06-09')
         self.assertEqual(end, '2026-07-09')
         self.assertEqual(threads_date_range(None), (None, None))
+
+    def test_threads_date_range_end_anchor_slides_window_into_the_past(self):
+        ref = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        # 30-day window ending 60 days ago: [ref-90d, ref-60d].
+        start, end = threads_date_range(30, end_days_ago=60, now=ref)
+        self.assertEqual(start, '2026-04-10')
+        self.assertEqual(end, '2026-05-10')
+        # None/0 end anchor == the pre-existing "end at now" behavior.
+        self.assertEqual(
+            threads_date_range(30, end_days_ago=None, now=ref),
+            threads_date_range(30, now=ref),
+        )
+        self.assertEqual(
+            threads_date_range(30, end_days_ago=0, now=ref),
+            threads_date_range(30, now=ref),
+        )
+        # No window ⇒ no range, anchor or not.
+        self.assertEqual(threads_date_range(None, end_days_ago=60), (None, None))
 
 
 if __name__ == '__main__':

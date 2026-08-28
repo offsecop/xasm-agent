@@ -7,27 +7,37 @@ synthetic-data principle (no real client strings in business-logic tests).
 import asyncio
 import os
 import sys
+from typing import cast
 
+import aiohttp
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+# The dispatch tests monkeypatch checkout/reconcile/upstream_request on the
+# lib module, so no real ClientSession is ever used — a typed null stand-in
+# keeps the call sites honest under pyright without opening a socket.
+_NULL_SESSION = cast('aiohttp.ClientSession', None)
+
 import tools.brand_monitor_vip_exposure as vip
+import lib.serper_search as serper_lib
 from tools.brand_monitor_vip_exposure import (
     _exec_dork_templates,
     _pivot_dork_templates,
-    _execute_exec_dorks,
-    _dispatch_serper,
     _classify_serp_host,
     _classify_exposure,
     _build_serp_dork_cohorts,
     _serp_hit_to_finding,
-    _registrable_domain,
-    _SerpNotConfigured,
-    _SerpSweepFailed,
+    MAX_SERP_PAGES_PER_VIP,
+)
+from lib.serper_search import (
+    dispatch_serper as _dispatch_serper,
+    execute_serp_queries as _execute_exec_dorks,
+    registrable_domain as _registrable_domain,
+    SerpNotConfigured as _SerpNotConfigured,
+    SerpSweepFailed as _SerpSweepFailed,
     DISCOVERY_MAX_PAGES,
     PINPOINT_MAX_PAGES,
-    MAX_SERP_PAGES_PER_VIP,
     SERPER_RESULTS_PER_PAGE,
 )
 from lib.integration_credentials import (
@@ -200,11 +210,12 @@ class TestSerperDispatch:
         async def _upstream(session, method, url, **kw):
             assert url == 'https://google.serper.dev/search'  # host PINNED (SSRF)
             assert kw['headers'].get('X-API-KEY') == 'sk-live-serper'
+            assert upstream is not None
             return await upstream(session, method, url, **kw)
 
-        monkeypatch.setattr(vip, 'checkout_provider', _checkout)
-        monkeypatch.setattr(vip, 'reconcile_call', _reconcile)
-        monkeypatch.setattr(vip, 'upstream_request', _upstream)
+        monkeypatch.setattr(serper_lib, 'checkout_provider', _checkout)
+        monkeypatch.setattr(serper_lib, 'reconcile_call', _reconcile)
+        monkeypatch.setattr(serper_lib, 'upstream_request', _upstream)
         return reconciles
 
     def test_parses_organic_and_reconciles_success(self, monkeypatch):
@@ -217,7 +228,7 @@ class TestSerperDispatch:
             return _FakeResp(200, payload), {}
 
         reconciles = self._patch(monkeypatch, upstream=upstream)
-        out = asyncio.run(_dispatch_serper('q', 1, session=None))
+        out = asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
         assert [h['url'] for h in out['hits']] == ['https://a.test', 'https://b.test']
         assert out['unswept'] is False
         assert len(reconciles) == 1  # exactly one metered reconcile per page
@@ -230,7 +241,7 @@ class TestSerperDispatch:
             return _FakeResp(400), {}
 
         reconciles = self._patch(monkeypatch, upstream=upstream)
-        out = asyncio.run(_dispatch_serper('filetype:env q', 1, session=None))
+        out = asyncio.run(_dispatch_serper('filetype:env q', 1, session=_NULL_SESSION))
         assert out['unswept'] is True
         assert out['hits'] == []
         assert reconciles[0]['success'] is False
@@ -242,7 +253,7 @@ class TestSerperDispatch:
 
         reconciles = self._patch(monkeypatch, upstream=upstream)
         with pytest.raises(_SerpSweepFailed):
-            asyncio.run(_dispatch_serper('q', 1, session=None))
+            asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
         assert reconciles[0]['success'] is False  # metered even on the failure path
 
     def test_checkout_401_is_sweep_failed(self, monkeypatch):
@@ -251,7 +262,7 @@ class TestSerperDispatch:
 
         self._patch(monkeypatch, checkout=checkout, upstream=None)
         with pytest.raises(_SerpSweepFailed):
-            asyncio.run(_dispatch_serper('q', 1, session=None))
+            asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
 
     def test_checkout_quota_is_sweep_failed(self, monkeypatch):
         async def checkout(provider_key, requested_units, session):
@@ -259,7 +270,7 @@ class TestSerperDispatch:
 
         self._patch(monkeypatch, checkout=checkout, upstream=None)
         with pytest.raises(_SerpSweepFailed):
-            asyncio.run(_dispatch_serper('q', 1, session=None))
+            asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
 
     def test_checkout_404_is_not_configured(self, monkeypatch):
         async def checkout(provider_key, requested_units, session):
@@ -267,7 +278,7 @@ class TestSerperDispatch:
 
         self._patch(monkeypatch, checkout=checkout, upstream=None)
         with pytest.raises(_SerpNotConfigured):
-            asyncio.run(_dispatch_serper('q', 1, session=None))
+            asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
 
     def test_5xx_is_unswept_not_clean(self, monkeypatch):
         # A persistent 5xx (after upstream_request's own retries) must NOT look
@@ -276,7 +287,7 @@ class TestSerperDispatch:
             return _FakeResp(503), {}
 
         reconciles = self._patch(monkeypatch, upstream=upstream)
-        out = asyncio.run(_dispatch_serper('q', 1, session=None))
+        out = asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
         assert out['unswept'] is True
         assert out['hits'] == []
         assert reconciles[0]['success'] is False
@@ -287,7 +298,7 @@ class TestSerperDispatch:
 
         reconciles = self._patch(monkeypatch, upstream=upstream)
         with pytest.raises(_SerpSweepFailed):
-            asyncio.run(_dispatch_serper('q', 1, session=None))
+            asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
         assert reconciles[0]['success'] is False
 
     def test_transport_error_is_unswept_not_clean(self, monkeypatch):
@@ -295,7 +306,7 @@ class TestSerperDispatch:
             raise RuntimeError('connection reset')
 
         reconciles = self._patch(monkeypatch, upstream=upstream)
-        out = asyncio.run(_dispatch_serper('q', 1, session=None))
+        out = asyncio.run(_dispatch_serper('q', 1, session=_NULL_SESSION))
         assert out['unswept'] is True
         assert reconciles[0]['success'] is False
         assert reconciles[0]['error_code'] == 'serp_dispatch_error'
@@ -344,6 +355,7 @@ class TestHostClassifier:
 
     def test_combosquat_on_etld1_fires_high(self):
         c = _classify_serp_host('https://lumenfield-login.test/signin', [], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'flag'
         assert c['category'] == 'COMBOSQUAT'
         assert c['severity'] == 'HIGH'
@@ -357,42 +369,50 @@ class TestHostClassifier:
     def test_known_platform_subdomain_not_squat(self):
         # The real 2026-07-03 FP shape: brand.<third-party-platform>.
         c = _classify_serp_host('https://lumenfield.pissedconsumer.com/reviews', [], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'suppress'
         assert c['reason'] == 'known_directory'
 
     def test_brand_on_softwaredir_not_squat(self):
         c = _classify_serp_host('https://lumenfield-global.soft112.com/app', [], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'suppress'
 
     def test_owned_domain_suppressed(self):
         c = _classify_serp_host('https://www.lumenfield.test/about', ['lumenfield.test'], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'suppress'
         assert c['reason'] == 'owned'
 
     def test_tracked_typosquat_suppressed(self):
         c = _classify_serp_host('https://lumenfeild.test/', [], ['lumenfeild.test'], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'suppress'
         assert c['reason'] == 'known_typosquat'
 
     def test_data_broker_is_medium_pii(self):
         c = _classify_serp_host('https://rocketreach.co/jane-synth', [], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'flag'
         assert c['severity'] == 'MEDIUM'
         assert c['exposureType'] == 'CONTACT_EXPOSURE'  # mirrors to triage at MEDIUM
 
     def test_bucket_brand_in_name_fires(self):
         c = _classify_serp_host('https://lumenfield-backups.s3.amazonaws.com/db.sql', [], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'flag'
         assert c['category'] == 'OBJECT_STORE_BUCKET'
 
     def test_bucket_brand_only_in_content_suppressed(self):
         # Virtual-host bucket name has no brand token; brand is only in the KEY.
         c = _classify_serp_host('https://randombucket.s3.amazonaws.com/lumenfield.pdf', [], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'suppress'
         assert c['reason'] == 'bucket_brand_in_content'
 
     def test_bucket_pathstyle_brand_in_name_fires(self):
         c = _classify_serp_host('https://s3.amazonaws.com/lumenfield-data/x', [], [], self.TOKENS)
+        assert c is not None
         assert c['action'] == 'flag'
 
 
@@ -450,6 +470,7 @@ class TestHitToFinding:
                '_cohort': 'combosquat', '_query': 'q', '_page': 1}
         f = _serp_hit_to_finding('vip-1', hit, 'Jane Synth', 'Lumenfield', 'lumenfield.test',
                                  [], [], ['lumenfield'])
+        assert f is not None
         assert f['severity'] == 'HIGH'
         assert f['exposureType'] == 'IMPERSONATION'
         assert f['sourceName'] == 'Serper SERP'
@@ -483,6 +504,7 @@ class TestHitToFinding:
                'snippet': 'address', '_cohort': 'residence'}
         f = _serp_hit_to_finding('vip-1', hit, 'Jane Synth', 'Lumenfield', 'lumenfield.test',
                                  [], [], ['lumenfield'])
+        assert f is not None
         assert f['severity'] == 'MEDIUM'
         assert f['metadata']['hostClass'] == 'DATA_BROKER_PII'
 
@@ -605,12 +627,14 @@ class TestDataBrokerWrongPerson:
         # Synth → suppress (wrong-person attribution).
         c = _classify_serp_host('https://www.zoominfo.com/p/John-Doe/123',
                                 [], [], self.TOKENS, 'Jane Synth')
+        assert c is not None
         assert c['action'] == 'suppress'
         assert c['reason'] == 'data_broker_wrong_person'
 
     def test_matching_person_slug_kept(self):
         c = _classify_serp_host('https://www.zoominfo.com/p/Jane-Synth/999',
                                 [], [], self.TOKENS, 'Jane Synth')
+        assert c is not None
         assert c['action'] == 'flag'
         assert c['category'] == 'DATA_BROKER_PII'
 
@@ -619,6 +643,7 @@ class TestDataBrokerWrongPerson:
         # 'Michael Synth'.
         c = _classify_serp_host('https://rocketreach.co/mike-synth-email',
                                 [], [], self.TOKENS, 'Michael Synth')
+        assert c is not None
         assert c['action'] == 'flag'
         assert c['category'] == 'DATA_BROKER_PII'
 
@@ -627,6 +652,7 @@ class TestDataBrokerWrongPerson:
         # even though the slug is not a VIP name.
         c = _classify_serp_host('https://www.zoominfo.com/c/lumenfield-inc/456',
                                 [], [], self.TOKENS, 'Jane Synth')
+        assert c is not None
         assert c['action'] == 'flag'
         assert c['category'] == 'DATA_BROKER_PII'
 
@@ -635,6 +661,7 @@ class TestDataBrokerWrongPerson:
         # (no basis to disprove).
         c = _classify_serp_host('https://rocketreach.co/someone-else',
                                 [], [], self.TOKENS, '')
+        assert c is not None
         assert c['action'] == 'flag'
 
     def test_wrong_person_hit_dropped_end_to_end(self):
@@ -660,8 +687,10 @@ class TestDeterministicCohort:
                       'snippet': 'x', '_cohort': 'data_broker'}
         f1 = _serp_hit_to_finding('vip-1', via_exec, 'Jane Synth', 'Lumenfield',
                                   'lumenfield.test', [], [], self.TOKENS)
+        assert f1 is not None
         f2 = _serp_hit_to_finding('vip-1', via_broker, 'Jane Synth', 'Lumenfield',
                                   'lumenfield.test', [], [], self.TOKENS)
+        assert f2 is not None
         assert f1['metadata']['cohort'] == 'data_broker'
         assert f2['metadata']['cohort'] == 'data_broker'
         # The surfacing dork is still recorded separately for provenance.
@@ -673,6 +702,7 @@ class TestDeterministicCohort:
                'snippet': 'x', '_cohort': 'exec'}
         f = _serp_hit_to_finding('vip-1', hit, 'Jane Synth', 'Lumenfield',
                                  'lumenfield.test', [], [], self.TOKENS)
+        assert f is not None
         assert f['metadata']['cohort'] == 'combosquat'
         assert f['severity'] == 'HIGH'  # combosquat HIGH not regressed
 

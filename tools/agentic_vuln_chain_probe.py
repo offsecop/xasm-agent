@@ -333,8 +333,20 @@ REDACTION_PATTERNS = [
     (r"(?i)(Cookie:\s*)[^\r\n]+", r"\1[REDACTED]"),
     (r"(?i)(Set-Cookie:\s*)[^\r\n]+", r"\1[REDACTED]"),
     (r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "[JWT_REDACTED]"),
+    # Response excerpts are intentionally truncated before they are attached to
+    # a finding. Match a JWT header/payload prefix as well as a complete token so
+    # truncation cannot leave reusable authentication material in matchedContent.
+    (r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]*)?", "[JWT_REDACTED]"),
+    (
+        r"(?i)([\"']?(?:password|passwd|token|access_token|refresh_token|api_key|merchant_api_key|secret|credential|session)[\"']?\s*:\s*[\"']?)(?!\[(?:JWT_)?REDACTED\])([^\"'\s,}\]]+)",
+        r"\1[REDACTED]",
+    ),
     (r"(?i)((?:password|passwd|token|access_token|refresh_token|api_key|secret)=)([^&\s]+)", r"\1[REDACTED]"),
 ]
+
+SENSITIVE_EVIDENCE_KEY_RE = re.compile(
+    r"(?i)(?:password|passwd|token|access_token|refresh_token|api_key|merchant_api_key|secret|credential|session|authorization|cookie)"
+)
 
 
 class VulnChainProbeTool(ToolPlugin):
@@ -372,9 +384,18 @@ class VulnChainProbeTool(ToolPlugin):
                 "includeBusinessLogicChecks": {"type": "boolean", "default": False},
                 "allowUnsafeMethods": {"type": "boolean", "default": False},
                 "allowStateChanging": {"type": "boolean", "default": False},
+                "allowPersistentStateChanges": {"type": "boolean", "default": False},
+                "allowAccountCreation": {"type": "boolean", "default": False},
+                "allowRecoverySideEffects": {"type": "boolean", "default": False},
                 "aggressive": {"type": "boolean", "default": False},
                 "riskTolerance": {"type": "string", "default": "low"},
                 "maxBusinessRequests": {"type": "integer", "default": 80},
+                "enableDefaultCredentialProbe": {"type": "boolean", "default": False},
+                "allowDefaultCredentialProbe": {"type": "boolean", "default": False},
+                "maxCredAttempts": {"type": "integer", "default": 0},
+                "allowGeneratedCandidates": {"type": "boolean", "default": False},
+                "allowGeneratedPostFormCandidates": {"type": "boolean", "default": False},
+                "allowGeneratedExploitCandidates": {"type": "boolean", "default": False},
                 "cookie": {"type": "string"},
                 "authCookies": {"type": "string"},
                 "headers": {"type": "object"},
@@ -992,6 +1013,11 @@ class VulnChainProbeTool(ToolPlugin):
         except Exception as _api_err:
             print(f"[vuln:chain_probe] API discovery augmentation failed: {_api_err}")
 
+        # Generated write endpoints are a separate, explicit opt-in. Observed
+        # HTML, browser-traffic, JS and OpenAPI actions above remain eligible.
+        if not self._generated_candidate_seeding_enabled(parameters):
+            return {"urls": dedupe_keep_order(urls, max_pages * 30), "forms": forms[:300]}
+
         # Pre-seed common SPA endpoints (Juice Shop, Express, Flask, banking-style labs).
         try:
             from urllib.parse import urlparse as _urlparse, urljoin as _urljoin
@@ -1383,6 +1409,20 @@ class VulnChainProbeTool(ToolPlugin):
         used = 0
         allow_unsafe = self._allow_business_state_changes(parameters)
         candidates = self._business_action_candidates(forms, base, parameters)
+        eligible_candidates: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            persistent_reason = self._persistent_business_candidate_reason(candidate, parameters)
+            if persistent_reason:
+                probes.append({
+                    "type": "business_logic",
+                    "url": candidate["url"],
+                    "method": candidate["method"],
+                    "skipped": True,
+                    "reason": persistent_reason,
+                })
+                continue
+            eligible_candidates.append(candidate)
+        candidates = eligible_candidates
         header_contexts: List[Dict[str, str]] = [headers or {}]
         seen_header_fingerprints = {self._header_fingerprint(headers or {})}
         has_initial_auth_context = self._has_auth_context(headers or {})
@@ -1397,7 +1437,7 @@ class VulnChainProbeTool(ToolPlugin):
         candidate_budget = max(1, budget - chain_reserve)
         executed_probe_keys = set()
 
-        for candidate, variant in self._business_priority_probe_plan(candidates):
+        for candidate, variant in self._business_priority_probe_plan(candidates, parameters):
             if used >= candidate_budget:
                 break
             if not allow_unsafe:
@@ -1449,6 +1489,10 @@ class VulnChainProbeTool(ToolPlugin):
                 for variant in variants:
                     if used >= candidate_budget:
                         break
+                    # The priority pass owns credential probes so the explicit
+                    # global attempt cap cannot be bypassed by this second pass.
+                    if variant.get("kind") == "default_login_probe":
+                        continue
                     probe_key = self._business_variant_probe_key(candidate, variant, current_headers)
                     if probe_key in executed_probe_keys:
                         continue
@@ -1643,6 +1687,7 @@ class VulnChainProbeTool(ToolPlugin):
     def _business_priority_probe_plan(
         self,
         candidates: Iterable[Dict[str, Any]],
+        parameters: Dict[str, Any],
     ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
         priority = {
             "default_login_probe": 0,
@@ -1659,7 +1704,7 @@ class VulnChainProbeTool(ToolPlugin):
             "amount_boundary": 11,
         }
         caps = {
-            "default_login_probe": 9,
+            "default_login_probe": self._default_credential_probe_limit(parameters),
             "login_sqli_bypass_probe": 6,
             "auth_recovery_probe": 6,
             "graphql_introspection_probe": 3,
@@ -1687,6 +1732,29 @@ class VulnChainProbeTool(ToolPlugin):
                 counts[kind] = occurrence + 1
                 planned.append((occurrence, priority[kind], path_rank, path, candidate, variant))
         return [(candidate, variant) for _, _, _, _, candidate, variant in sorted(planned, key=lambda item: item[:4])]
+
+    def _default_credential_probe_limit(self, parameters: Dict[str, Any]) -> int:
+        enabled = bool(
+            parameters.get("enableDefaultCredentialProbe")
+            or parameters.get("allowDefaultCredentialProbe")
+        )
+        if not enabled:
+            return 0
+        try:
+            configured = int(parameters.get("maxCredAttempts") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(configured, 20))
+
+    def _generated_candidate_seeding_enabled(self, parameters: Dict[str, Any]) -> bool:
+        return any(
+            bool(parameters.get(key))
+            for key in (
+                "allowGeneratedCandidates",
+                "allowGeneratedPostFormCandidates",
+                "allowGeneratedExploitCandidates",
+            )
+        )
 
     def _high_value_business_path_rank(self, path: str) -> int:
         if re.search(r"(?:login|signin|sign-in)", path):
@@ -2606,6 +2674,50 @@ class VulnChainProbeTool(ToolPlugin):
             or risk in {"aggressive", "high", "lab", "ctf"}
         )
 
+    def _persistent_business_candidate_reason(
+        self,
+        candidate: Dict[str, Any],
+        parameters: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return a fail-closed reason for write candidates with durable side effects.
+
+        ``allowUnsafeMethods`` authorizes bounded active HTTP methods; it does
+        not authorize creating accounts, sending recovery factors, uploading
+        files, or changing financial/application state. Those actions require
+        a separate, explicit workflow opt-in.
+        """
+        method = str(candidate.get("method") or "GET").upper()
+        if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            return None
+        path = urlparse(str(candidate.get("url") or "")).path.lower()
+        allow_persistent = bool(parameters.get("allowPersistentStateChanges"))
+
+        if re.search(r"(?:^|/)(?:register|signup|sign-up)(?:/|$)", path):
+            if allow_persistent or bool(parameters.get("allowAccountCreation")):
+                return None
+            return "account creation requires allowAccountCreation=true or allowPersistentStateChanges=true"
+
+        if re.search(
+            r"(?:^|/)(?:forgot(?:[_-]password)?|reset(?:[_-]password)?|password-reset|recover)(?:/|$)",
+            path,
+        ):
+            if allow_persistent or bool(parameters.get("allowRecoverySideEffects")):
+                return None
+            return "password recovery side effects require allowRecoverySideEffects=true or allowPersistentStateChanges=true"
+
+        persistent_path = bool(
+            re.search(
+                r"(?:^|/)(?:upload|transfer|payments?|pay|charge|loans?|cards?|virtual-cards?|bills?|create|update|delete|profile|bio|comments?|feedback)(?:[/?_-]|$)",
+                path,
+            )
+            or re.search(r"(?:^|/)(?:accounts?|users?|merchants?|transactions?)/?$", path)
+        )
+        if method in {"PUT", "PATCH", "DELETE"} or persistent_path:
+            if allow_persistent:
+                return None
+            return "persistent state change requires allowPersistentStateChanges=true"
+        return None
+
     def _business_action_candidates(
         self,
         forms: Iterable[Dict[str, Any]],
@@ -3025,6 +3137,12 @@ class VulnChainProbeTool(ToolPlugin):
     def _infer_fields_from_action(self, action: str) -> List[str]:
         path = urlparse(action).path.lower()
         inferred: List[str] = []
+        if re.search(r"(?:login|signin|sign-in)", path):
+            # OpenAPI summaries frequently expose only method + path. Preserve
+            # the observed endpoint and infer the minimal conventional login
+            # carrier so a root URL-only run can validate it instead of dropping
+            # the candidate for having no requestBodyKeys metadata.
+            inferred.extend(["username", "password"])
         if "transfer" in path:
             inferred.extend(["to_account", "amount", "description"])
         if "payment" in path or "charge" in path:
@@ -3961,21 +4079,27 @@ class VulnChainProbeTool(ToolPlugin):
         evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         evidence = self._clean_evidence(evidence or {})
+        sanitized_extracted = [
+            self._redact_evidence(item)
+            for item in (extracted or [])
+            if str(item).strip()
+        ]
         matched_content = evidence.get("matchedContent")
         if not matched_content:
             matched_content = "\n".join(
-                str(item) for item in (extracted or []) if str(item).strip()
+                str(item) for item in sanitized_extracted if str(item).strip()
             )
             if matched_content:
                 evidence["matchedContent"] = self._redact_evidence(matched_content)
+        sanitized_matched_at = self._redact_evidence(matched_at)
         return {
             "template-id": template_id,
             "templateID": template_id,
-            "matched-at": matched_at,
-            "matched": matched_at,
-            "host": matched_at,
+            "matched-at": sanitized_matched_at,
+            "matched": sanitized_matched_at,
+            "host": sanitized_matched_at,
             "matcher-name": matcher_name,
-            "extracted-results": extracted,
+            "extracted-results": sanitized_extracted,
             "matchedContent": evidence.get("matchedContent"),
             "request": evidence.get("request"),
             "response": evidence.get("response"),
@@ -4123,8 +4247,23 @@ class VulnChainProbeTool(ToolPlugin):
         return any(str(key).lower() in auth_header_names and bool(value) for key, value in (headers or {}).items())
 
     def _clean_evidence(self, evidence: Dict[str, Any]) -> Dict[str, Any]:
+        def clean(value: Any, key: str = "") -> Any:
+            if SENSITIVE_EVIDENCE_KEY_RE.search(key):
+                return "[REDACTED]"
+            if isinstance(value, dict):
+                return {
+                    child_key: clean(child_value, str(child_key))
+                    for child_key, child_value in value.items()
+                    if child_value is not None and child_value != "" and child_value != []
+                }
+            if isinstance(value, list):
+                return [clean(item) for item in value if item is not None and item != ""]
+            if isinstance(value, str):
+                return self._redact_evidence(value)
+            return value
+
         return {
-            key: value
+            key: clean(value, str(key))
             for key, value in evidence.items()
             if value is not None and value != "" and value != []
         }

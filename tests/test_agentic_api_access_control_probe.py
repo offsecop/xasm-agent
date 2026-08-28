@@ -94,6 +94,70 @@ class FakeStoreTool(ApiAccessControlProbeTool):
         return self._json_response(url, uid, method)
 
 
+class ObservedIdentifierReplayTool(ApiAccessControlProbeTool):
+    """Offline API whose anonymous index exposes an identifier used by a read route."""
+
+    observed_account = "502001"
+
+    def __init__(self, control_same_shape=False):
+        super().__init__()
+        self.fetch_calls = []
+        self.control_same_shape = control_same_shape
+
+    async def _discover_readonly_endpoints(self, target, parameters, max_endpoints):
+        return [
+            {
+                "method": "GET",
+                "url": "https://bank.test/check_balance/1",
+                "path": "/check_balance/1",
+                "source": "openapi",
+                "originalPath": "/check_balance/{account_number}",
+            },
+            {
+                "method": "GET",
+                "url": "https://bank.test/debug/users",
+                "path": "/debug/users",
+                "source": "openapi",
+                "originalPath": "/debug/users",
+            },
+        ]
+
+    def _response(self, url, status, document):
+        body = json.dumps(document)
+        return {
+            "url": url,
+            "status": status,
+            "headers": {"Content-Type": "application/json"},
+            "body": body,
+            "elapsedMs": 1,
+            "jsonKeys": self._json_keys(body),
+            "bodyLength": len(body),
+            "sensitiveBodyMarkers": self._sensitive_body_markers(body),
+        }
+
+    async def _fetch(self, session, method, url, headers):
+        self.fetch_calls.append({"method": method, "url": url, "headers": dict(headers)})
+        if url == "https://bank.test/debug/users":
+            return self._response(
+                url,
+                200,
+                {"users": [{"username": "alice", "account_number": self.observed_account}]},
+            )
+        if url == f"https://bank.test/check_balance/{self.observed_account}":
+            return self._response(
+                url,
+                200,
+                {"username": "alice", "account_number": self.observed_account, "balance": 1250},
+            )
+        if self.control_same_shape and url == "https://bank.test/check_balance/xasm-invalid-id":
+            return self._response(
+                url,
+                200,
+                {"username": "fallback", "account_number": "fallback", "balance": 0},
+            )
+        return self._response(url, 404, {"error": "not found"})
+
+
 def _params(**extra):
     base = {"target": "http://lab.test/", "urls": ["http://lab.test/api/users/2"],
             "includeAnonymousComparison": False, "includeIdMutation": False}
@@ -202,6 +266,99 @@ class MutationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[REDACTED]", blob)
 
 
+class ObservedIdentifierReplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_replays_anonymous_identifier_into_matching_readonly_template(self):
+        tool = ObservedIdentifierReplayTool()
+        result = await tool.execute(
+            {
+                "target": "https://bank.test/",
+                "includeIdMutation": False,
+                "maxRequests": 8,
+            }
+        )
+
+        findings = [
+            finding
+            for finding in result["findings"]
+            if finding.get("template-id") == "xasm-api-anonymous-observed-object-read"
+        ]
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(
+            any(call["url"].endswith(f"/check_balance/{tool.observed_account}") for call in tool.fetch_calls),
+            "the private identifier must be used by the actual same-origin request",
+        )
+        finding = findings[0]
+        self.assertIn("GET /check_balance/redacted-account_number HTTP/1.1", finding["request"])
+        self.assertIn("HTTP/1.1 200 OK", finding["response"])
+        self.assertIn('"account_number": "[REDACTED_ID]"', finding["response"])
+        self.assertIn("GET /check_balance/xasm-invalid-id HTTP/1.1", finding["evidence"]["controlRequest"])
+        self.assertEqual(finding["evidence"]["controlStatus"], 404)
+        self.assertEqual(finding["evidence"]["sourcePaths"], ["/debug/users"])
+        self.assertEqual(result["summary"]["observedIdentifierFields"], ["account_number"])
+        self.assertEqual(result["summary"]["observedIdentifierRequests"], 2)
+        self.assertNotIn(tool.observed_account, json.dumps(result), "raw identifiers must not enter public output")
+
+    async def test_successful_same_shape_control_kills_false_positive(self):
+        tool = ObservedIdentifierReplayTool(control_same_shape=True)
+        result = await tool.execute(
+            {
+                "target": "https://bank.test/",
+                "includeIdMutation": False,
+                "maxRequests": 8,
+            }
+        )
+
+        findings = [
+            finding
+            for finding in result["findings"]
+            if finding.get("template-id") == "xasm-api-anonymous-observed-object-read"
+        ]
+        self.assertEqual(findings, [])
+
+    async def test_total_request_budget_includes_replay_and_control(self):
+        tool = ObservedIdentifierReplayTool()
+        result = await tool.execute(
+            {
+                "target": "https://bank.test/",
+                "includeIdMutation": False,
+                "maxRequests": 4,
+            }
+        )
+
+        self.assertEqual(result["requestsRun"], 4)
+        self.assertEqual(len(tool.fetch_calls), 4)
+        self.assertLessEqual(result["requestsRun"], 4)
+
+    async def test_cross_origin_template_is_never_requested(self):
+        tool = ObservedIdentifierReplayTool()
+
+        async def cross_origin_discovery(target, parameters, max_endpoints):
+            endpoints = await ObservedIdentifierReplayTool._discover_readonly_endpoints(
+                tool, target, parameters, max_endpoints
+            )
+            endpoints.append(
+                {
+                    "method": "GET",
+                    "url": "https://other.test/accounts/1",
+                    "path": "/accounts/1",
+                    "source": "openapi",
+                    "originalPath": "/accounts/{account_number}",
+                }
+            )
+            return endpoints
+
+        tool._discover_readonly_endpoints = cross_origin_discovery
+        await tool.execute(
+            {
+                "target": "https://bank.test/",
+                "includeIdMutation": False,
+                "maxRequests": 10,
+            }
+        )
+
+        self.assertFalse(any(call["url"].startswith("https://other.test/") for call in tool.fetch_calls))
+
+
 class HelperTests(unittest.TestCase):
     def setUp(self):
         self.tool = ApiAccessControlProbeTool()
@@ -236,6 +393,65 @@ class HelperTests(unittest.TestCase):
         resp = {"body": json.dumps({"data": {"user": {"role": "admin"}}})}
         self.assertEqual(self.tool._extract_field_value(resp, "role"), "admin")
         self.assertIsNone(self.tool._extract_field_value({"body": "<html>not json</html>"}, "role"))
+
+    def test_endpoint_dedupe_prefers_openapi_template_metadata(self):
+        endpoints = self.tool._dedupe_endpoints(
+            [
+                {"method": "GET", "url": "https://bank.test/accounts/1", "path": "/accounts/1"},
+                {
+                    "method": "GET",
+                    "url": "https://bank.test/accounts/1",
+                    "path": "/accounts/1",
+                    "source": "openapi",
+                    "originalPath": "/accounts/{account_id}",
+                },
+            ]
+        )
+        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(endpoints[0]["originalPath"], "/accounts/{account_id}")
+
+    def test_identifier_extraction_rejects_credentials_and_unsafe_path_values(self):
+        observed = {}
+        body = json.dumps(
+            {
+                "accountNumber": "ACC-1024",
+                "password": "never-replay-this",
+                "user_id": "../admin",
+            }
+        )
+        self.tool._collect_observed_identifiers(
+            observed,
+            {
+                "status": 200,
+                "body": body,
+            },
+            {"url": "https://bank.test/public-index"},
+        )
+        self.assertEqual(observed, {"account_number": [{"value": "ACC-1024", "sourcePath": "/public-index"}]})
+
+    def test_materialized_template_response_does_not_poison_observed_values(self):
+        observed = {}
+        self.tool._collect_observed_identifiers(
+            observed,
+            {"status": 200, "body": json.dumps({"account_number": "1"})},
+            {
+                "url": "https://bank.test/check_balance/1",
+                "originalPath": "/check_balance/{account_number}",
+            },
+        )
+        self.assertEqual(observed, {})
+
+    def test_truncated_json_prefix_still_yields_complete_identifier_scalars(self):
+        observed = {}
+        self.tool._collect_observed_identifiers(
+            observed,
+            {
+                "status": 200,
+                "body": '{"users":[{"account_number":"ACC-9001","password":"secret"},{"account_number":"cut',
+            },
+            {"url": "https://bank.test/public-index"},
+        )
+        self.assertEqual(observed, {"account_number": [{"value": "ACC-9001", "sourcePath": "/public-index"}]})
 
 
 if __name__ == "__main__":

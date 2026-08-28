@@ -4,12 +4,16 @@ Passive parameter discovery and classification for agentic exploration.
 
 import os
 import tempfile
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
 from plugin_interface import ToolPlugin
 from tools._agentic_exploration_common import (
+    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
+    NATIVE_PROBE_QUERY_CANDIDATES_KEY,
+    build_native_probe_query_contract,
     classify_parameters,
     dedupe_keep_order,
     extract_html_map,
@@ -17,11 +21,14 @@ from tools._agentic_exploration_common import (
     normalize_url,
     parse_headers,
     run_process,
+    sanitize_native_probe_public_url,
     same_origin,
 )
 
 
 class ParamDiscoverTool(ToolPlugin):
+    _TRANSIENT_PAGE_STATUSES = {408, 425, 429, *range(500, 600)}
+
     @property
     def name(self) -> str:
         return "param:discover"
@@ -74,18 +81,39 @@ class ParamDiscoverTool(ToolPlugin):
             return {"success": False, "error": "target/url or urls is required"}
 
         forms = parameters.get("forms") if isinstance(parameters.get("forms"), list) else []
+        private_probe_candidates: List[Dict[str, Any]] = []
+        page_fetches: List[Dict[str, Any]] = []
         if bool(parameters.get("discoverFromTarget", True)) and target:
             discovered = await self._discover_from_target(normalize_url(target), parameters)
             urls.extend(discovered.get("urls", []))
             forms.extend(discovered.get("forms", []))
+            page_fetches.extend(discovered.get("pageFetches", []))
+            private_probe_candidates.extend(
+                discovered.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+            )
 
         max_targets = max(1, min(int(parameters.get("maxTargets") or 50), 200))
         urls = dedupe_keep_order(urls, max_targets)
-        passive = classify_parameters(urls, forms)
+        query_origin = normalize_url(target or urls[0])
+        same_origin_query_urls = [
+            url for url in urls if same_origin(query_origin, url)
+        ]
+        query_contract = build_native_probe_query_contract(
+            same_origin_query_urls,
+            source="param:discover",
+        )
+        private_probe_candidates.extend(
+            query_contract.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+        )
+        public_urls = [
+            sanitize_native_probe_public_url(url) if "?" in url else url
+            for url in urls
+        ]
+        passive = classify_parameters(public_urls, forms)
 
         arjun_results = []
         if bool(parameters.get("activeArjun", False)):
-            for url in urls[:max_targets]:
+            for url in public_urls[:max_targets]:
                 headers_file = None
                 cmd = ["arjun", "-u", url, "-m", "GET", "--stable", "-oJ", "-"]
                 cookie = parameters.get("cookie") or parameters.get("authCookies")
@@ -118,7 +146,13 @@ class ParamDiscoverTool(ToolPlugin):
 
         return {
             "success": True,
-            "targets": urls,
+            "targets": public_urls,
+            "forms": forms[:200],
+            "pageFetches": page_fetches[:200],
+            NATIVE_PROBE_QUERY_CANDIDATES_KEY: query_contract.get(
+                NATIVE_PROBE_QUERY_CANDIDATES_KEY, []
+            ),
+            NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_probe_candidates[:250],
             **passive,
             "activeArjun": arjun_results,
             "recommendations": recommendations[:100],
@@ -129,38 +163,237 @@ class ParamDiscoverTool(ToolPlugin):
                 "interesting": len(passive.get("interestingParameters", [])),
                 "formFields": len(passive.get("formFields", [])),
                 "recommendations": len(recommendations),
+                "nativeQueryCandidates": len(
+                    query_contract.get(NATIVE_PROBE_QUERY_CANDIDATES_KEY, [])
+                ),
+                "pagesFetched": sum(
+                    1 for item in page_fetches if item.get("outcome") == "mapped"
+                ),
+                "pagesFailed": sum(
+                    1 for item in page_fetches if item.get("outcome") != "mapped"
+                ),
+                "pageFetchAttempts": sum(
+                    int(item.get("attempts") or 0) for item in page_fetches
+                ),
             },
+        }
+
+    def _public_page_url(self, value: str) -> str:
+        try:
+            parsed = urlparse(str(value or ""))
+            host = parsed.hostname or ""
+            if not host:
+                return ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            return urlunparse((parsed.scheme, host, parsed.path or "/", "", "", ""))
+        except (TypeError, ValueError):
+            return ""
+
+    def _fetch_error_class(self, error: Exception) -> str:
+        if isinstance(error, aiohttp.ClientConnectionError):
+            return "connection_error"
+        if isinstance(error, aiohttp.ClientError):
+            return "client_error"
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        if isinstance(error, OSError):
+            return "network_error"
+        return "fetch_error"
+
+    def _page_fetch_urls(
+        self,
+        urls: List[str],
+        target: str,
+        max_pages: int,
+    ) -> List[str]:
+        output: List[str] = []
+        seen = set()
+        for value in urls:
+            try:
+                parsed = urlparse(str(value or ""))
+                fetch_url = urlunparse(parsed._replace(fragment=""))
+            except (TypeError, ValueError):
+                continue
+            if not fetch_url or not same_origin(target, fetch_url) or fetch_url in seen:
+                continue
+            seen.add(fetch_url)
+            output.append(fetch_url)
+            if len(output) >= max_pages:
+                break
+        return output
+
+    async def _fetch_page_map(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        headers: Dict[str, str],
+        max_bytes: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        public_url = self._public_page_url(url)
+        attempts = 0
+        for attempt in range(1, 3):
+            attempts = attempt
+            try:
+                fetched = await fetch_text(
+                    session,
+                    url,
+                    headers=headers,
+                    max_bytes=max_bytes,
+                )
+            except (aiohttp.ClientError, TimeoutError, OSError) as error:
+                if attempt == 1:
+                    continue
+                return None, {
+                    "url": public_url,
+                    "status": 0,
+                    "attempts": attempts,
+                    "outcome": "fetch_error",
+                    "errorClass": self._fetch_error_class(error),
+                    "mappedLinks": 0,
+                    "mappedForms": 0,
+                    "mappedQueryUrls": 0,
+                }
+            except Exception as error:
+                return None, {
+                    "url": public_url,
+                    "status": 0,
+                    "attempts": attempts,
+                    "outcome": "fetch_error",
+                    "errorClass": self._fetch_error_class(error),
+                    "mappedLinks": 0,
+                    "mappedForms": 0,
+                    "mappedQueryUrls": 0,
+                }
+
+            status = int(fetched.get("status") or 0)
+            if status in self._TRANSIENT_PAGE_STATUSES and attempt == 1:
+                continue
+            if not 200 <= status < 400:
+                return None, {
+                    "url": public_url,
+                    "status": status,
+                    "attempts": attempts,
+                    "outcome": (
+                        "transient_http"
+                        if status in self._TRANSIENT_PAGE_STATUSES
+                        else "terminal_http"
+                    ),
+                    "errorClass": None,
+                    "mappedLinks": 0,
+                    "mappedForms": 0,
+                    "mappedQueryUrls": 0,
+                }
+            if not same_origin(url, str(fetched.get("url") or url)):
+                return None, {
+                    "url": public_url,
+                    "status": status,
+                    "attempts": attempts,
+                    "outcome": "cross_origin_redirect",
+                    "errorClass": None,
+                    "mappedLinks": 0,
+                    "mappedForms": 0,
+                    "mappedQueryUrls": 0,
+                }
+
+            try:
+                mapped = extract_html_map(
+                    fetched.get("text", ""),
+                    fetched.get("url") or url,
+                )
+            except Exception:
+                return None, {
+                    "url": public_url,
+                    "status": status,
+                    "attempts": attempts,
+                    "outcome": "parse_error",
+                    "errorClass": "parse_error",
+                    "mappedLinks": 0,
+                    "mappedForms": 0,
+                    "mappedQueryUrls": 0,
+                }
+            return mapped, {
+                "url": public_url,
+                "status": status,
+                "attempts": attempts,
+                "outcome": "mapped",
+                "errorClass": None,
+                "mappedLinks": len(mapped.get("links", [])),
+                "mappedForms": len(mapped.get("forms", [])),
+                "mappedQueryUrls": len(mapped.get("parameterizedUrls", [])),
+            }
+
+        return None, {
+            "url": public_url,
+            "status": 0,
+            "attempts": attempts,
+            "outcome": "fetch_error",
+            "errorClass": "fetch_error",
+            "mappedLinks": 0,
+            "mappedForms": 0,
+            "mappedQueryUrls": 0,
         }
 
     async def _discover_from_target(self, target: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         max_pages = max(1, min(int(parameters.get("maxPages") or 20), 50))
         urls: List[str] = [target]
         forms: List[Dict[str, Any]] = []
+        page_fetches: List[Dict[str, Any]] = []
+        private_probe_candidates: List[Dict[str, Any]] = []
+        headers = parse_headers(parameters)
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as session:
-            try:
-                fetched = await fetch_text(session, target, headers=parse_headers(parameters), max_bytes=1_000_000)
-                mapped = extract_html_map(fetched.get("text", ""), fetched.get("url") or target)
+            mapped, coverage = await self._fetch_page_map(
+                session,
+                target,
+                headers,
+                1_000_000,
+            )
+            page_fetches.append(coverage)
+            if mapped:
                 urls.extend([u for u in mapped.get("links", []) if same_origin(target, u)])
+                urls.extend([u for u in mapped.get("parameterizedUrls", []) if same_origin(target, u)])
                 forms.extend(mapped.get("forms", []))
-            except Exception:
-                return {"urls": urls, "forms": forms}
+                private_probe_candidates.extend(
+                    mapped.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+                )
+            else:
+                return {
+                    "urls": urls,
+                    "forms": forms,
+                    "pageFetches": page_fetches,
+                    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_probe_candidates,
+                }
 
-            for url in list(dedupe_keep_order(urls, max_pages)):
+            for url in self._page_fetch_urls(urls, target, max_pages):
                 if url == target or not same_origin(target, url):
                     continue
-                try:
-                    fetched = await fetch_text(session, url, headers=parse_headers(parameters), max_bytes=800_000)
-                    mapped = extract_html_map(fetched.get("text", ""), fetched.get("url") or url)
+                mapped, coverage = await self._fetch_page_map(
+                    session,
+                    url,
+                    headers,
+                    800_000,
+                )
+                page_fetches.append(coverage)
+                if mapped:
                     urls.extend([u for u in mapped.get("links", []) if same_origin(target, u)])
+                    urls.extend([u for u in mapped.get("parameterizedUrls", []) if same_origin(target, u)])
                     forms.extend(mapped.get("forms", []))
-                except Exception:
-                    continue
+                    private_probe_candidates.extend(
+                        mapped.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+                    )
 
-        return {"urls": dedupe_keep_order(urls, max_pages * 20), "forms": forms[:200]}
+        return {
+            "urls": dedupe_keep_order(urls, max_pages * 20),
+            "forms": forms[:200],
+            "pageFetches": page_fetches[:max_pages],
+            NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_probe_candidates[:250],
+        }
 
 
 def get_tool():

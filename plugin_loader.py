@@ -96,7 +96,7 @@ class PluginLoader:
         # Normalize target/url parameters for backward compatibility
         # FIX: BUG-033 - Parameter Naming Inconsistency
         # Tools use either 'target' or 'url' - normalize so both work
-        parameters = self._normalize_parameters(parameters)
+        parameters = self._normalize_parameters(parameters, plugin.schema)
 
         # Coerce parameter types to match schema before validation
         # FIX: BUG-493 - String "2" rejected where integer 2 expected
@@ -167,7 +167,11 @@ class PluginLoader:
 
         return coerced
 
-    def _normalize_parameters(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_parameters(
+        self,
+        parameters: Dict[str, Any],
+        schema: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         """
         Normalize target/url/domain/host/ip/query parameters for backward compatibility.
 
@@ -198,6 +202,27 @@ class PluginLoader:
         )
 
         if canonical:
+            properties = (schema or {}).get("properties", {})
+            is_closed_schema = (schema or {}).get("additionalProperties") is False
+
+            # Closed schemas intentionally define their complete input
+            # contract. When the caller already supplied a target-like field
+            # declared by that contract, do not append the legacy
+            # target/url/domain/host aliases: they would become unsupported
+            # parameters before the plugin executes. If the caller supplied a
+            # legacy alias instead, populate only target-like fields the closed
+            # schema actually declares.
+            if is_closed_schema:
+                declared_target_keys = {
+                    key for key in ("target", "url", "domain", "host", "ip")
+                    if key in properties
+                }
+                if declared_target_keys.intersection(normalized):
+                    return normalized
+                for key in declared_target_keys:
+                    normalized.setdefault(key, canonical)
+                return normalized
+
             # Populate missing target-like keys
             for key in ('target', 'url', 'domain', 'host'):
                 if key not in normalized:

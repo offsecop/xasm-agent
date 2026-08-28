@@ -1,0 +1,46 @@
+# xASM bounded compound-route discovery list.
+#
+# Common wordlists cover individual names but miss non-listable compound routes
+# when the parent returns 404. These entries combine broadly used diagnostic,
+# internal, administrative, and API prefixes with high-signal read-only
+# resources. Keep this list small: it is merged into every dirsearch scan.
+debug/users
+debug/config
+debug/status
+debug/info
+debug/routes
+debug/settings
+debug/health
+internal/users
+internal/config
+internal/status
+internal/info
+internal/routes
+internal/settings
+internal/health
+diagnostics/users
+diagnostics/config
+diagnostics/status
+diagnostics/info
+diagnostics/routes
+diagnostics/settings
+diagnostics/health
+admin/users
+admin/config
+admin/status
+admin/info
+admin/routes
+admin/settings
+admin/health
+api/debug/users
+api/debug/config
+api/debug/status
+api/debug/info
+api/internal/users
+api/internal/config
+api/internal/status
+api/internal/info
+api/diagnostics/users
+api/diagnostics/config
+api/diagnostics/status
+api/diagnostics/info

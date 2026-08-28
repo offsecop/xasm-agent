@@ -16,7 +16,17 @@ import aiohttp
 import yaml
 
 from plugin_interface import ToolPlugin
-from tools._agentic_exploration_common import fetch_text, normalize_url, parse_headers, same_origin
+from tools._agentic_exploration_common import (
+    NATIVE_PROBE_PATH_CANDIDATES_KEY,
+    NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
+    NATIVE_PROBE_QUERY_CANDIDATES_KEY,
+    build_native_probe_path_contract,
+    build_native_probe_query_contract,
+    fetch_text,
+    normalize_url,
+    parse_headers,
+    same_origin,
+)
 
 
 COMMON_API_PATHS = [
@@ -356,6 +366,7 @@ def parse_openapi_endpoints(
             security = raw_operation.get("security", document.get("security"))
             requires_auth = bool(security) if security != [] else False
             for base in bases:
+                path_template_url = base.rstrip("/") + "/" + str(raw_path).lstrip("/")
                 full_url = base.rstrip("/") + "/" + concrete_path.lstrip("/")
                 full_url = normalize_url(_with_query_params(full_url, params, method_upper))
                 if target_origin and not include_cross_origin_servers and not same_origin(target, full_url):
@@ -366,6 +377,7 @@ def parse_openapi_endpoints(
                         "url": full_url,
                         "path": urlparse(full_url).path or "/",
                         "originalPath": str(raw_path),
+                        "pathTemplateUrl": path_template_url,
                         "operationId": _safe_name(raw_operation.get("operationId")),
                         "summary": _safe_name(raw_operation.get("summary") or raw_operation.get("description"))[:180],
                         "tags": raw_operation.get("tags") if isinstance(raw_operation.get("tags"), list) else [],
@@ -399,6 +411,154 @@ def _dedupe_endpoints(endpoints: Iterable[Dict[str, Any]], limit: int = 300) -> 
         if len(output) >= limit:
             break
     return output
+
+
+def _documented_query_contract(
+    target: str,
+    endpoints: Iterable[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build private native-probe candidates only from documented GET queries."""
+    public_candidates: List[Dict[str, Any]] = []
+    private_candidates: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+
+    for endpoint in list(endpoints or [])[:300]:
+        if not isinstance(endpoint, dict):
+            continue
+        if str(endpoint.get("method") or "GET").upper() != "GET":
+            continue
+        url = str(endpoint.get("url") or "").strip()
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            continue
+        if parsed.fragment or not parsed.query or not same_origin(target, url):
+            continue
+
+        endpoint_source = str(endpoint.get("source") or "documented")[:80]
+        contract = build_native_probe_query_contract(
+            [url],
+            source=f"api:discover:{endpoint_source}",
+        )
+        public_rows = contract.get(NATIVE_PROBE_QUERY_CANDIDATES_KEY, [])
+        private_rows = contract.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+        if len(public_rows) != 1 or len(private_rows) != 1:
+            continue
+        public_row = public_rows[0]
+        private_row = private_rows[0]
+        candidate_id = str(public_row.get("nativeProbeCandidateId") or "")
+        if not candidate_id or candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+
+        public_fields = []
+        for field in public_row.get("fields", []):
+            if not isinstance(field, dict):
+                continue
+            public_fields.append({**field, "valueSource": "documented-query"})
+        public_candidates.append(
+            {
+                **public_row,
+                "fields": public_fields,
+                "source": endpoint_source,
+                **(
+                    {"originalPath": str(endpoint.get("originalPath"))[:500]}
+                    if endpoint.get("originalPath")
+                    else {}
+                ),
+            }
+        )
+        private_candidates.append(private_row)
+
+    return {
+        NATIVE_PROBE_QUERY_CANDIDATES_KEY: public_candidates,
+        NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_candidates,
+    }
+
+
+def _documented_path_contract(
+    target: str,
+    endpoints: Iterable[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build private candidates only from public documented GET path parameters."""
+    public_candidates: List[Dict[str, Any]] = []
+    private_candidates: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+
+    for endpoint in list(endpoints or [])[:300]:
+        if not isinstance(endpoint, dict):
+            continue
+        if (
+            str(endpoint.get("method") or "GET").upper() != "GET"
+            or endpoint.get("requiresAuth") is not False
+            or endpoint.get("queryParameters")
+        ):
+            continue
+        url = str(endpoint.get("url") or "").strip()
+        public_url = str(endpoint.get("pathTemplateUrl") or "").strip()
+        names = [
+            str(value).strip()
+            for value in list(endpoint.get("pathParameters") or [])[:80]
+        ]
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            continue
+        if (
+            parsed.fragment
+            or parsed.query
+            or not public_url
+            or not names
+            or not same_origin(target, url)
+            or not same_origin(target, public_url)
+        ):
+            continue
+
+        endpoint_source = str(endpoint.get("source") or "documented")[:80]
+        contract = build_native_probe_path_contract(
+            [
+                {
+                    "url": url,
+                    "publicUrl": public_url,
+                    "parameterNames": names,
+                }
+            ],
+            source=f"api:discover:{endpoint_source}",
+        )
+        public_rows = contract.get(NATIVE_PROBE_PATH_CANDIDATES_KEY, [])
+        private_rows = contract.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+        if len(public_rows) != 1 or len(private_rows) != 1:
+            continue
+        public_row = public_rows[0]
+        private_row = private_rows[0]
+        candidate_id = str(public_row.get("nativeProbeCandidateId") or "")
+        if not candidate_id or candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+
+        public_fields = []
+        for field in public_row.get("fields", []):
+            if not isinstance(field, dict):
+                continue
+            public_fields.append({**field, "valueSource": "documented-path"})
+        public_candidates.append(
+            {
+                **public_row,
+                "fields": public_fields,
+                "source": endpoint_source,
+                **(
+                    {"originalPath": str(endpoint.get("originalPath"))[:500]}
+                    if endpoint.get("originalPath")
+                    else {}
+                ),
+            }
+        )
+        private_candidates.append(private_row)
+
+    return {
+        NATIVE_PROBE_PATH_CANDIDATES_KEY: public_candidates,
+        NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_candidates,
+    }
 
 
 def _extract_spec_refs_from_html(html: str, page_url: str) -> List[str]:
@@ -454,7 +614,7 @@ class ApiDiscoverTool(ToolPlugin):
             "phase": 2,
             "domain": ["web", "api"],
             "input_type": ["url", "api_paths"],
-            "output_type": ["api_endpoints", "openapi", "graphql"],
+            "output_type": ["api_endpoints", "openapi", "graphql", "query_candidates"],
             "chainable_after": ["js:", "browser:", "katana:"],
             "chainable_before": ["curl:", "api:", "param:", "nuclei:"],
         }
@@ -543,10 +703,16 @@ class ApiDiscoverTool(ToolPlugin):
                     continue
 
         api_endpoints = _dedupe_endpoints(api_endpoints, max_endpoints)
+        query_contract = _documented_query_contract(target, api_endpoints)
+        path_contract = _documented_path_contract(target, api_endpoints)
+        public_query_candidates = query_contract.get(NATIVE_PROBE_QUERY_CANDIDATES_KEY, [])
+        private_query_candidates = query_contract.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+        public_path_candidates = path_contract.get(NATIVE_PROBE_PATH_CANDIDATES_KEY, [])
+        private_path_candidates = path_contract.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
         parameterized_urls = [
-            endpoint["url"]
-            for endpoint in api_endpoints
-            if endpoint.get("method") in READONLY_METHODS and urlparse(str(endpoint.get("url"))).query
+            str(candidate.get("url"))
+            for candidate in public_query_candidates
+            if candidate.get("url")
         ]
         method_counts = self._method_counts(api_endpoints)
         result = {
@@ -555,6 +721,12 @@ class ApiDiscoverTool(ToolPlugin):
             "apiSurfaces": findings,
             "apiEndpoints": api_endpoints,
             "parameterizedUrls": _dedupe_keep_order(parameterized_urls, 300),
+            NATIVE_PROBE_QUERY_CANDIDATES_KEY: public_query_candidates,
+            NATIVE_PROBE_PATH_CANDIDATES_KEY: public_path_candidates,
+            NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: [
+                *private_path_candidates,
+                *private_query_candidates,
+            ],
             "openapi": [f for f in findings if f["type"] == "openapi"],
             "openapiSpecs": spec_documents,
             "graphql": [f for f in findings if f["type"] == "graphql"],
@@ -570,6 +742,8 @@ class ApiDiscoverTool(ToolPlugin):
                 "writeEndpoints": sum(1 for e in api_endpoints if e.get("method") not in READONLY_METHODS),
                 "templatedEndpoints": sum(1 for e in api_endpoints if e.get("pathParameters")),
                 "parameterizedUrls": len(parameterized_urls),
+                "nativeQueryCandidates": len(public_query_candidates),
+                "nativePathCandidates": len(public_path_candidates),
                 "methods": method_counts,
             },
             "recommendations": self._recommendations(api_endpoints, findings),

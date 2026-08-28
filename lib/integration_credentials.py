@@ -5,7 +5,8 @@ Fetches API keys from backend integrations with agent access enabled.
 DRP→ASM migration T2.6: adds `checkout_provider()` + `reconcile_call()` for
 per-tenant quota leasing. Every non-LLM external provider that the agent
 calls (HikerAPI, ScrapeCreators, twitterapi.io, IntelX, OTX_API,
-GITHUB_SEARCH, VIRUSTOTAL, PHISHTANK, etc.) MUST go through these helpers
+GITHUB_SEARCH, GITLAB_SEARCH, CAVALIER, VIRUSTOTAL, PHISHTANK, etc.) MUST go
+through these helpers
 so the backend's ProviderQuotaService can enforce tenant-scoped caps
 across all five agent containers.
 

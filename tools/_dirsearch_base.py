@@ -20,6 +20,7 @@ COMBINED_WORDLIST_DIR = "/tmp/xasm_dirsearch_wordlists"
 # the default wordlist so .git/ and .env (and friends) are probed deterministically,
 # regardless of whether upstream dicc.txt downloaded or contains them.
 SENSITIVE_PATHS_WORDLIST = os.path.join(os.path.dirname(__file__), "wordlists", "sensitive-paths.txt")
+SENSITIVE_ROUTES_WORDLIST = os.path.join(os.path.dirname(__file__), "wordlists", "sensitive-routes.txt")
 
 # The agent is mounted at /app in Docker, so /app/wordlists/fuzz.txt is the
 # durable runtime location for customer-provided additions.
@@ -127,6 +128,13 @@ def discover_extra_wordlists(parameters=None):
     # dirsearch:* scan covers VCS metadata + app-secret files by default.
     if _is_enabled(parameters.get("includeSensitivePaths"), default=True):
         auto_paths.append(SENSITIVE_PATHS_WORDLIST)
+    # A flat common wordlist can discover `/debug` and `/users` independently,
+    # but it cannot reach a non-listable compound route such as `/debug/users`
+    # when the prefix itself returns 404. Keep a deliberately small, generic
+    # matrix of high-signal diagnostic and administrative routes in every deep
+    # discovery pass. This adds bounded coverage without target-specific hints.
+    if _is_enabled(parameters.get("includeSensitiveRoutes"), default=True):
+        auto_paths.append(SENSITIVE_ROUTES_WORDLIST)
 
     return _existing_wordlists(explicit_paths + env_paths + auto_paths)
 
@@ -196,7 +204,12 @@ def resolve_dirsearch_wordlist(
     base_wordlist = default_wordlist if default_wordlist and os.path.exists(default_wordlist) else None
 
     if prefer_common_wordlist and extra_wordlists and not base_wordlist:
-        base_wordlist = _first_common_wordlist()
+        # Container layouts differ across pip, distro, and source installs.
+        # Falling back to only the small xASM sensitive-path additions turns a
+        # "quick" scan into a few dozen requests and silently drops the common
+        # route corpus. Resolve the official dirsearch list when no packaged
+        # copy is available, then merge the bounded additions into it.
+        base_wordlist = _first_common_wordlist() or ensure_dicc_wordlist(tool_label)
 
     if base_wordlist:
         base_abs = os.path.abspath(base_wordlist)

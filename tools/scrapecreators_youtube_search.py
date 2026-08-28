@@ -185,7 +185,7 @@ class ScrapeCreatorsYoutubeSearchTool(ToolPlugin):
             'Keyword-driven YouTube discovery via ScrapeCreators. Modes: '
             '`keyword` searches videos+channels+lives by query; `hashtag` '
             'searches by hashtag (no `#` prefix); `channel` performs an '
-            'anchor lookup on a single channel handle (e.g. `@lumenfield`).'
+            'anchor lookup on a single channel handle (e.g. `@channelhandle`).'
         )
 
     @property

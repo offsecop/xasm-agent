@@ -293,9 +293,9 @@ class DirsearchComprehensiveTool(ToolPlugin):
                 '--exclude-sizes=0B',
                 '--random-agent',
                 '-e', extensions,
-                '--format=json',
+                '-O', 'json',
                 '-o', output_file,
-                '--quiet'
+                '-q'
             ]
 
             # Add wordlist if available
@@ -304,7 +304,7 @@ class DirsearchComprehensiveTool(ToolPlugin):
 
             # Add authentication
             if headers_file and os.path.exists(headers_file):
-                cmd.extend(['--header-list', headers_file])
+                cmd.extend(['--headers-file', headers_file])
             elif cookie:
                 cmd.extend(['--cookie', cookie])
 
@@ -342,7 +342,7 @@ class DirsearchComprehensiveTool(ToolPlugin):
                     for item in results:
                         url = item.get('url')
                         status = item.get('status')
-                        length = item.get('content-length', item.get('length'))
+                        length = item.get('contentLength', item.get('content-length', item.get('length')))
 
                         if url:
                             endpoint = {

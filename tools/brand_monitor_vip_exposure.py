@@ -28,13 +28,17 @@ _AGENT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _AGENT_ROOT not in sys.path:
     sys.path.append(_AGENT_ROOT)
 
-from lib.integration_credentials import (  # noqa: E402
-    checkout_provider,
-    reconcile_call,
-    upstream_request,
-    IntegrationAuthError,
-    IntegrationServerError,
-    QuotaExceededError,
+from lib.search_recency import serper_tbs  # noqa: E402
+from lib.serper_search import (  # noqa: E402
+    SerpNotConfigured,
+    SerpSweepFailed,
+    dispatch_serper,
+    execute_serp_queries,
+    new_empty_retry_budget,
+    registrable_domain,
+    SERPER_RESULTS_PER_PAGE,
+    PINPOINT_MAX_PAGES,
+    DISCOVERY_MAX_PAGES,
 )
 from lib.token_rarity import is_common_token, RISK_ANCHOR_TOKENS  # noqa: E402
 
@@ -78,7 +82,8 @@ EXPOSURE_KEYWORDS = {
         'pastebin',
     ],
     # Bare contact nouns: only count as CONTACT_EXPOSURE (and only MEDIUM) when
-    # they co-occur with a leak word above.
+    # they are ATTRIBUTED to the VIP (see _contact_noun_attributed). Matched with
+    # word boundaries via _CONTACT_NOUN_RE below — never as raw substrings.
     'CONTACT_NOUN': [
         'email', 'phone', 'address', 'contact', 'mobile',
     ],
@@ -87,6 +92,16 @@ EXPOSURE_KEYWORDS = {
         'extort', 'blackmail', 'swat',
     ],
 }
+
+# Contact nouns matched with WORD BOUNDARIES (optional plural). The former raw
+# substring scan fired 'address' on "addressing" and 'contact' on "contacted",
+# turning contact-free press-release prose into CONTACT_EXPOSURE/MEDIUM (the
+# 2026-07 live-tenant FP class: ~12/17 contact_exposure rows carried no contact
+# data for the exec, or a third party's).
+_CONTACT_NOUN_RE = re.compile(
+    r'\b(?:e-?mails?|phones?|address(?:es)?|contacts?|mobiles?)\b',
+    re.IGNORECASE,
+)
 
 
 def _normalize_spaces(value: str) -> str:
@@ -107,7 +122,7 @@ def _exec_dork_templates(
     This is a PURE TEMPLATE BUILDER — it performs no I/O. Its output is consumed
     by `_build_serp_dork_cohorts` (the exec-pinpoint cohort) and executed live
     through the sanctioned SERP_SEARCH provider (#981, Serper.dev) via
-    `_dispatch_serper` / `_execute_exec_dorks`. Brave / SerpAPI / Tavily remain
+    `dispatch_serper` / `execute_serp_queries` (lib/serper_search). Brave / SerpAPI / Tavily remain
     DEFERRED (2026-05-15 scope decision); Serper is the first admitted SERP
     vendor. Keeping the operator grammar here (not inline at the call site) keeps
     the dork vocabulary reviewable + locked independently of provider wiring.
@@ -204,27 +219,10 @@ def _pivot_dork_templates(identifier: str) -> List[str]:
     return out
 
 
-# #981 — sanctioned SERP provider key (the enum value the ProviderQuotaService
-# checks; concrete vendor = Serper.dev, discriminated by settings.provider).
-_SERP_PROVIDER_KEY = 'SERP_SEARCH'
-
-# SSRF: the Serper endpoint is PINNED here — the tool NEVER uses the
-# checkout-returned baseUrl (the catalog omits `baseUrl` from optionalFields),
-# so an operator cannot repoint SERP_SEARCH at an internal host to exfiltrate
-# the key or drive blind server-side POSTs.
-SERPER_ENDPOINT = 'https://google.serper.dev/search'
-# Depth lever: `num>10` does NOT deepen (Serper caps a page at 10 results); the
-# `page` parameter is the only way to reach results 11+, and EACH page is a
-# separate metered call. So we page, we do not inflate `num`.
-SERPER_RESULTS_PER_PAGE = 10
-# Per-cohort depth policy (#981 §5): pinpoint dorks (LinkedIn/paste/data-broker)
-# have a worthless tail → 1 page; discovery dorks (combosquat/brand-abuse/…)
-# paginate loop-until-dry, bounded.
-PINPOINT_MAX_PAGES = 1
-DISCOVERY_MAX_PAGES = 3
 # FinOps HARD cap: worst-case metered pages per VIP scan. At $0.001/page this
 # bounds a single VIP sweep to ~$0.03 no matter how many cohorts run. Enforced
-# as a hard stop in `_execute_exec_dorks`; asserted by the agent test.
+# as a hard stop in `execute_serp_queries` (lib/serper_search) via the
+# max_pages argument; asserted by the agent test.
 MAX_SERP_PAGES_PER_VIP = 30
 
 # Known third-party directory / platform hosts: a brand/exec appearing on ONE
@@ -283,9 +281,14 @@ _MUNICIPAL_RECORDS_HOSTS = {
     'escribemeetings.com', 'civicweb.net', 'legistar.com', 'novusagenda.com',
     'iqm2.com', 'granicus.com', 'civicplus.com',
 }
+# Residence-SPECIFIC content terms only. Generic commercial-property vocabulary
+# ('property owner', 'site plan application', 'zoning', 'land use') was cut
+# 2026-07: it matched corporate-HQ / commercial real-estate pages and elevated a
+# company's own publicly listed office address to HIGH/80. Those generic terms
+# still count implicitly via the municipal-records HOST leg
+# (_MUNICIPAL_RECORDS_HOSTS), which elevates independently of content terms.
 _RESIDENCE_TERMS = (
     'minor variance', 'committee of adjustment', 'home address', 'residence of',
-    'property owner', 'site plan application', 'zoning', 'land use',
 )
 
 # Deterministic cohort by hostClass (#3): when the HOST classifier fires, the
@@ -305,43 +308,8 @@ OBJECT_STORE_MARKERS = (
     's3.amazonaws.com', 'storage.googleapis.com', 'blob.core.windows.net',
     'r2.cloudflarestorage.com', 'digitaloceanspaces.com',
 )
-# Registrable-domain (eTLD+1) helper: the small set of multi-label public
-# suffixes we care about. A full PSL is overkill for dork triage; this covers
-# the common ccTLD second levels so `foo.co.uk` → `foo.co.uk`, not `co.uk`.
-_MULTI_LEVEL_TLDS = {
-    'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'co.jp', 'com.au', 'net.au',
-    'org.au', 'co.nz', 'com.br', 'com.mx', 'co.in', 'co.za', 'com.sg',
-    'com.hk', 'com.tr', 'com.cn', 'com.tw',
-}
-
-
-class _SerpNotConfigured(Exception):
-    """No usable SERP_SEARCH integration (404 no-integration / 403 agent-access
-    off). NOT a failure — the sweep simply isn't available, so the caller falls
-    through to the existing behaviour (never a false empty-clean)."""
-
-
-class _SerpSweepFailed(Exception):
-    """A CONFIGURED SERP provider was actively broken mid-sweep (401 revoked key,
-    429 quota, 402 cost-breaker, persistent 5xx). Scan-invalidating: the caller
-    must FAIL the job, never report a clean zero-findings result."""
-
-
-def _registrable_domain(host: str) -> str:
-    """eTLD+1 of a hostname (best-effort, PSL-lite). '' on empty input."""
-    host = (host or '').lower().strip().strip('.').split(':')[0]
-    if not host:
-        return ''
-    labels = host.split('.')
-    if len(labels) <= 2:
-        return host
-    if '.'.join(labels[-2:]) in _MULTI_LEVEL_TLDS:
-        return '.'.join(labels[-3:])
-    return '.'.join(labels[-2:])
-
-
 def _host_in_directory(host: str, hostset: set) -> bool:
-    reg = _registrable_domain(host)
+    reg = registrable_domain(host)
     return bool(host) and (
         host in hostset or reg in hostset or
         any(host == h or host.endswith('.' + h) for h in hostset)
@@ -433,9 +401,9 @@ def _classify_serp_host(
     host = (urlparse(url or '').hostname or '').lower()
     if not host:
         return None
-    reg = _registrable_domain(host)
-    owned = {_registrable_domain(d) for d in (owned_domains or []) if d}
-    known_squats = {_registrable_domain(d) for d in (typosquat_domains or []) if d}
+    reg = registrable_domain(host)
+    owned = {registrable_domain(d) for d in (owned_domains or []) if d}
+    known_squats = {registrable_domain(d) for d in (typosquat_domains or []) if d}
     tokens = [t.lower() for t in (brand_tokens or []) if t and len(t) >= 3]
 
     # 1) Owned property → never flag.
@@ -624,212 +592,6 @@ def _build_serp_dork_cohorts(
             add('code_search', f'{codesearch} {b}', 'discovery')
 
     return specs
-
-
-async def _dispatch_serper(
-    query: str,
-    page: int,
-    session: aiohttp.ClientSession,
-    timeout_seconds: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Live Serper.dev dispatch for ONE metered page (#981 §3). Per the issue's
-    per-page-metering contract: checkout a lease → POST → reconcile, one bracket
-    per page, so a `ProviderCallLog` row exists per page and the DAILY cap can
-    halt a runaway sweep at a page boundary.
-
-    Returns `{'hits': [...], 'unswept': bool}`. Error handling (fail-closed —
-    NEVER a swept-clean empty page on failure):
-      - checkout 404/403 no-integration       → `_SerpNotConfigured` (fall-through)
-      - checkout/HTTP 401, 402, 403, 429       → `_SerpSweepFailed` (abort sweep)
-      - HTTP 400 (free-tier filetype block)    → `unswept=True` (this page only)
-      - HTTP 404/5xx/other, transport, JSON    → `unswept=True` (this page only;
-        an all-unswept sweep then fails closed in execute())
-    NEVER logs or returns the decrypted apiKey."""
-    try:
-        lease = await checkout_provider(_SERP_PROVIDER_KEY, requested_units=1, session=session)
-    except IntegrationAuthError:
-        raise _SerpSweepFailed('serp_auth_failed')       # 401 revoked/bad key
-    except QuotaExceededError:
-        raise _SerpSweepFailed('serp_quota_exceeded')    # 429 quota exhausted
-    except IntegrationServerError as exc:
-        msg = str(exc)
-        if any(m in msg for m in ('HTTP 404', 'HTTP 403', 'No active', 'not enabled', 'Unknown provider')):
-            raise _SerpNotConfigured(msg)                # not configured / agent-access off
-        raise _SerpSweepFailed('serp_server_error')      # 402 cost-breaker / 5xx / transport
-
-    api_key = lease.get('apiKey')
-    lease_token = lease.get('leaseToken')
-    if not api_key or not lease_token:
-        raise _SerpSweepFailed('serp_no_key')
-    eff_timeout = timeout_seconds or lease.get('timeoutSeconds') or 30
-
-    ok = True
-    err_code: Optional[str] = None
-    unswept = False
-    hits: List[Dict[str, str]] = []
-    resp = None
-    try:
-        # Endpoint is PINNED (SSRF) — the leased baseUrl is deliberately ignored.
-        resp, _ = await upstream_request(
-            session, 'POST', SERPER_ENDPOINT,
-            headers={'X-API-KEY': api_key, 'Content-Type': 'application/json'},
-            json_body={'q': query, 'num': SERPER_RESULTS_PER_PAGE, 'page': page},
-            provider_label='serper',
-            timeout_seconds=eff_timeout,
-        )
-        status = getattr(resp, 'status', 0)
-        if status == 400:
-            # Free-tier config-filetype block → unswept (low-confidence), the
-            # sweep of THIS query is NOT a clean zero. Never empty-clean.
-            ok = False
-            err_code = 'serp_http_400'
-            unswept = True
-        elif status == 401:
-            ok = False
-            err_code = 'serp_http_401'
-            raise _SerpSweepFailed('serp_http_401')       # key revoked mid-sweep
-        elif status in (402, 403):
-            # Cost-breaker (402) / forbidden (403) — the vendor is CUT OFF; every
-            # further call will fail the same way, so abort the whole sweep.
-            ok = False
-            err_code = f'serp_http_{status}'
-            raise _SerpSweepFailed(f'serp_http_{status}')
-        elif status == 429:
-            ok = False
-            err_code = 'serp_http_429'
-            raise _SerpSweepFailed('serp_http_429')
-        elif status >= 400:
-            # 404 / 5xx / other — upstream_request already retried 5xx; a
-            # persistent failure here is NOT a clean page. Mark this page
-            # `unswept` so the sweep can never be reported swept-clean on an
-            # upstream error (an all-unswept sweep fails closed in execute()).
-            ok = False
-            err_code = f'serp_http_{status}'
-            unswept = True
-        else:
-            data = await resp.json()
-            for item in (data.get('organic') or []):
-                link = item.get('link')
-                if not link:
-                    continue
-                hits.append({
-                    'url': link,
-                    'title': item.get('title', '') or '',
-                    'snippet': item.get('snippet', '') or '',
-                })
-    except _SerpSweepFailed:
-        raise
-    except Exception:
-        # Transport error / timeout / malformed JSON — NEVER a clean page.
-        ok = False
-        err_code = 'serp_dispatch_error'
-        unswept = True
-    finally:
-        if resp is not None:
-            try:
-                await resp.release()
-            except Exception:
-                pass
-        # ONE reconcile per page, always — with success + error_code attribution
-        # so 4xx/5xx feed the reconciled-failure throttle path.
-        try:
-            await reconcile_call(
-                _SERP_PROVIDER_KEY, lease_token,
-                units=1, success=ok, error_code=err_code, session=session,
-            )
-        except Exception:
-            pass
-    return {'hits': hits, 'unswept': unswept}
-
-
-async def _execute_exec_dorks(
-    dork_specs: List[Dict[str, Any]],
-    agent=None,
-    max_pages: int = MAX_SERP_PAGES_PER_VIP,
-    _dispatch=None,
-) -> Dict[str, Any]:
-    """Execute cohort-tagged SERP dork specs through an injectable per-page
-    dispatch `(query, page) -> {'hits': [...], 'unswept': bool}`.
-
-    Per-cohort depth: pinpoint = 1 page; discovery = loop-until-dry bounded by
-    DISCOVERY_MAX_PAGES. A GLOBAL `max_pages` hard cap bounds worst-case metered
-    spend per VIP scan. Fail-closed contract:
-      - `_dispatch is None`                       → status 'unswept_no_provider'
-      - first dispatch raises `_SerpNotConfigured`→ status 'unswept_no_provider'
-      - queries blocked/broken (400 free-tier, 404/5xx, transport) and NOTHING
-        swept clean                               → status 'unswept' (caller FAILs)
-      - `_SerpSweepFailed` (401/402/403/429)      → propagates (caller FAILs job)
-    NEVER returns `{swept:True, results:[]}` from a failed/blocked-only sweep.
-    The caller (execute()) treats BOTH a raised `_SerpSweepFailed` AND a returned
-    status 'unswept' as a job failure — only 'unswept_no_provider' falls through.
-    """
-    if _dispatch is None:
-        if agent:
-            agent.report_progress(
-                current_operation='SERP execution skipped: no SERP provider configured',
-            )
-        return {'swept': False, 'status': 'unswept_no_provider', 'results': []}
-
-    results: List[Dict[str, Any]] = []
-    pages_used = 0
-    swept_any = False
-    unswept_any = False
-    diagnostics = {'pagesUsed': 0, 'queriesRun': 0, 'unsweptQueries': 0, 'truncated': False}
-
-    try:
-        for spec in dork_specs:
-            if pages_used >= max_pages:
-                diagnostics['truncated'] = True
-                break
-            query = spec.get('query') if isinstance(spec, dict) else spec
-            kind = spec.get('kind', 'discovery') if isinstance(spec, dict) else 'discovery'
-            cohort = spec.get('cohort') if isinstance(spec, dict) else None
-            if not query:
-                continue
-            per_cohort_max = PINPOINT_MAX_PAGES if kind == 'pinpoint' else DISCOVERY_MAX_PAGES
-            diagnostics['queriesRun'] += 1
-            page = 1
-            while page <= per_cohort_max and pages_used < max_pages:
-                pages_used += 1
-                page_result = await _dispatch(query, page)
-                if (page_result or {}).get('unswept'):
-                    unswept_any = True
-                    diagnostics['unsweptQueries'] += 1
-                    break  # a blocked query — don't paginate it, never clean it
-                swept_any = True
-                hits = (page_result or {}).get('hits') or []
-                new_hits = 0
-                for hit in hits:
-                    if not (hit or {}).get('url'):
-                        continue
-                    hit['_cohort'] = cohort
-                    hit['_query'] = query
-                    hit['_page'] = page
-                    results.append(hit)
-                    new_hits += 1
-                # loop-until-dry: stop on pinpoint, or when a discovery page dries
-                # up (no new hits) or returns a short final page.
-                if kind == 'pinpoint' or new_hits == 0 or len(hits) < SERPER_RESULTS_PER_PAGE:
-                    break
-                page += 1
-    except _SerpNotConfigured:
-        if not swept_any and not results:
-            if agent:
-                agent.report_progress(
-                    current_operation='SERP provider not configured; skipping SERP sweep',
-                )
-            return {'swept': False, 'status': 'unswept_no_provider', 'results': []}
-        # Configured then vanished mid-sweep → treat as a scan-invalidating fail.
-        raise _SerpSweepFailed('serp_not_configured_midsweep')
-
-    diagnostics['pagesUsed'] = pages_used
-    # Fail-closed: a sweep whose ONLY outcome was blocked (400) queries is NOT a
-    # clean zero-findings result.
-    if not swept_any and unswept_any:
-        return {'swept': False, 'status': 'unswept', 'results': [], 'diagnostics': diagnostics}
-    if not swept_any:
-        return {'swept': False, 'status': 'unswept_no_provider', 'results': results, 'diagnostics': diagnostics}
-    return {'swept': True, 'status': 'swept', 'results': results, 'diagnostics': diagnostics}
 
 
 def _serp_hit_to_finding(
@@ -1385,6 +1147,46 @@ def _leak_word_corroborated(
     )
 
 
+def _contact_noun_attributed(
+    haystack: str,
+    full_name: str,
+    company_domain: str,
+    vip_email: str,
+) -> bool:
+    """A contact noun only earns CONTACT_EXPOSURE when the contact info is
+    plausibly THE VIP'S, not a third party's (the 2026-07 live-tenant FP class:
+    a think-tank donation mailbox, another person's phone in a regulator
+    bulletin). Attribution (any ONE):
+      - the VIP's exact email appears in the text, OR
+      - an @company-domain mailbox appears in the text (covers masked
+        data-broker forms like e******@<brand-domain> — the substring is the
+        domain side), OR
+      - a contact noun falls within a small token window of the VIP name
+        (the page ties the contact channel to the exec, not to someone else).
+    Mirrors `_leak_word_corroborated`'s corroboration shape."""
+    email = _normalize_spaces(vip_email or '').lower().lstrip('@')
+    if email and email in haystack:
+        return True
+    dom = _normalize_spaces(company_domain or '').lower().lstrip('@').split('/')[0].split(':')[0]
+    if dom and f'@{dom}' in haystack:
+        return True
+    name = _normalize_spaces(full_name or '').lower()
+    if not name:
+        return False
+    tokens = haystack.split()
+    name_first = name.split()[0]
+    WINDOW = 10
+    name_positions = [i for i, t in enumerate(tokens) if name_first in t]
+    noun_positions = [
+        i for i, t in enumerate(tokens) if _CONTACT_NOUN_RE.search(t)
+    ]
+    return any(
+        abs(ni - ci) <= WINDOW
+        for ni in name_positions
+        for ci in noun_positions
+    )
+
+
 def _classify_exposure(
     platform: str,
     title: str,
@@ -1445,8 +1247,12 @@ def _classify_exposure(
         has_leak_word = any(
             keyword in haystack for keyword in EXPOSURE_KEYWORDS['CONTACT_EXPOSURE_LEAK']
         )
-        has_contact_noun = any(
-            keyword in haystack for keyword in EXPOSURE_KEYWORDS['CONTACT_NOUN']
+        # Word-boundary contact-noun match ('addressing'/'contacted' must not
+        # fire) AND VIP attribution: contact info belonging to a third party on
+        # a page that merely mentions the exec is a PUBLIC_MENTION, never the
+        # exec's CONTACT_EXPOSURE.
+        has_contact_noun = bool(_CONTACT_NOUN_RE.search(haystack)) and _contact_noun_attributed(
+            haystack, full_name, company_domain, vip_email,
         )
         if has_leak_word:
             # #1 — a leak word only earns HIGH when it is CORROBORATED as tied to
@@ -1574,6 +1380,17 @@ class BrandMonitorVipExposureTool(ToolPlugin):
                     "description": "Maximum number of findings to return",
                     "default": 15,
                 },
+                "window_days": {
+                    "type": "integer",
+                    "description": (
+                        "OPTIONAL recency window in days for the SERP dork "
+                        "sweep (#1508) — mapped to the Google `tbs` "
+                        "restriction. Omitted/invalid = ALL TIME, the "
+                        "pre-existing default: VIP exposure is threat "
+                        "hunting, so unbounded history stays the baseline; "
+                        "this knob only lets a re-scan bound itself."
+                    ),
+                },
             },
             "required": ["brandVipId", "brandMonitorId", "fullName"],
         }
@@ -1601,6 +1418,17 @@ class BrandMonitorVipExposureTool(ToolPlugin):
         vip_email = _normalize_spaces(parameters.get('email', ''))
         profile_urls = _extract_profile_urls(parameters)
         max_results = int(parameters.get('maxResults', 15) or 15)
+
+        # #1508 — OPTIONAL SERP recency window. Absent/garbage/<1 → None →
+        # NO `tbs` → byte-identical all-time requests (today's behavior; a
+        # silent recall regression is the failure mode this guards against).
+        try:
+            window_days = int(str(parameters.get('window_days')).strip())
+        except (TypeError, ValueError):
+            window_days = None
+        if window_days is not None and window_days < 1:
+            window_days = None
+        serp_tbs = serper_tbs(window_days)
 
         # #981 — owned-domain + tracked-typosquat cohorts for the SERP host
         # classifier (combosquat cross-reference). Null-safe: absent/empty threads
@@ -1706,14 +1534,27 @@ class BrandMonitorVipExposureTool(ToolPlugin):
                 full_name, company_name, company_domain, owned_domains,
             )
             if serp_specs:
+                # #1504 — ONE shared retry-on-empty budget for the whole VIP
+                # sweep so vendor-blink retries are bounded sweep-wide
+                # (MAX_SERP_PAGES_PER_VIP=30 pages would otherwise allow 60
+                # extra metered calls at 2 retries/page).
+                retry_budget = new_empty_retry_budget()
+
                 async def _serp_dispatch(q: str, p: int) -> Dict[str, Any]:
-                    return await _dispatch_serper(q, p, session)
+                    # #1508 — tbs is None on the default all-time sweep.
+                    return await dispatch_serper(
+                        q, p, session,
+                        tbs=serp_tbs,
+                        empty_retry_budget=retry_budget,
+                    )
 
                 try:
-                    serp_out = await _execute_exec_dorks(
-                        serp_specs, agent=agent, _dispatch=_serp_dispatch,
+                    serp_out = await execute_serp_queries(
+                        serp_specs, agent=agent,
+                        max_pages=MAX_SERP_PAGES_PER_VIP,
+                        _dispatch=_serp_dispatch,
                     )
-                except _SerpSweepFailed as exc:
+                except SerpSweepFailed as exc:
                     serp_failed = True
                     serp_error = str(exc)
                     serp_out = {'swept': False, 'status': 'unswept', 'results': []}
@@ -1722,6 +1563,11 @@ class BrandMonitorVipExposureTool(ToolPlugin):
                 search_diagnostics['serp'] = {
                     'status': serp_status,
                     'failed': serp_failed,
+                    # #1508 — effective recency bound (None/None = all-time,
+                    # the default) so a scan record shows whether the sweep
+                    # was windowed.
+                    'windowDays': window_days,
+                    'tbs': serp_tbs,
                     **(serp_out.get('diagnostics') or {}),
                 }
                 if serp_out.get('swept'):
