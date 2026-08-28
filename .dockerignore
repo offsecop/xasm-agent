@@ -25,6 +25,9 @@ env/
 # Local secrets / state
 .env
 .env.*
+config*.yaml
+!config.yaml.example
+!config.docker.yaml.example
 
 # Docs / audit-only files — not needed at runtime
 README.md
