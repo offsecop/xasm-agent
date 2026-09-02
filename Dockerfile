@@ -50,8 +50,15 @@ RUN ARCH=$(dpkg --print-architecture) && \
     && chmod +x /usr/local/bin/katana \
     && katana -version
 
-# Install dirsearch web directory brute forcer
-RUN pip install dirsearch
+# Install dirsearch web directory brute forcer in an isolated environment.
+# dirsearch and browser-use pin different patch releases of requests, while the
+# agent intentionally pins cryptography for ARM compatibility. Keeping the CLI
+# isolated prevents either scanner dependency set from mutating the agent
+# runtime while preserving the `dirsearch` executable expected by the tools.
+RUN python -m venv /opt/dirsearch-venv \
+    && /opt/dirsearch-venv/bin/pip install --no-cache-dir dirsearch \
+    && ln -s /opt/dirsearch-venv/bin/dirsearch /usr/local/bin/dirsearch \
+    && dirsearch --version
 
 # Install Dalfox XSS scanner (architecture-aware)
 RUN ARCH=$(dpkg --print-architecture) && \

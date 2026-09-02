@@ -150,8 +150,15 @@ async def fetch_text(
     headers: Optional[Dict[str, str]] = None,
     data: Optional[str] = None,
     max_bytes: int = 2_000_000,
+    allow_redirects: bool = True,
 ) -> Dict[str, Any]:
-    async with session.request(method, url, headers=headers, data=data, allow_redirects=True) as response:
+    async with session.request(
+        method,
+        url,
+        headers=headers,
+        data=data,
+        allow_redirects=allow_redirects,
+    ) as response:
         body = await read_limited(response.content, max_bytes + 1)
         truncated = len(body) > max_bytes
         if truncated:

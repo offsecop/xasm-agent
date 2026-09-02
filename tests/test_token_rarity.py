@@ -54,7 +54,7 @@ class TestRareDirection:
     """Coined brandable names MUST read rare — they keep full scoring weight."""
 
     def test_coined_names_are_rare(self):
-        for w in ('lumenfield', 'finetre', 'bytesiege', 'qorvex'):
+        for w in ('lumenfield', 'finetre', 'cipherhollow', 'qorvex'):
             s = score_token_rarity(w)
             assert s['max'] < MEMBERSHIP_ZIPF, f'{w} zipf={s["max"]}'
             assert not is_common_token(w), f'{w} must read RARE'

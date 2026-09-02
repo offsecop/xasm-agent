@@ -79,6 +79,14 @@ class WebSecurityControlsProbeTool(ToolPlugin):
             return {"success": False, "error": "target/url or urls is required"}
 
         base = target or urls[0]
+        # #1951 — infrastructure handoff can legitimately provide multiple
+        # independently confirmed origins (for example HTTP/80 + HTTPS/443).
+        # Treat only those explicit origins as roots; discovered links remain
+        # constrained to one of them and cannot expand the handoff scope.
+        bases = dedupe_keep_order(
+            [normalize_url(u) for u in urls if normalize_url(u)],
+            min(len(urls), 32),
+        )
         max_pages = max(1, min(int(parameters.get("maxPages") or 25), 80))
         max_urls = max(1, min(int(parameters.get("maxUrls") or 80), 200))
         headers = parse_headers(parameters)
@@ -93,9 +101,15 @@ class WebSecurityControlsProbeTool(ToolPlugin):
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=25),
         ) as session:
-            queue = dedupe_keep_order([u for u in urls if self._allowed(base, u)], max_urls)
+            queue = dedupe_keep_order([u for u in urls if self._allowed_any(bases, u)], max_urls)
             if bool(parameters.get("discoverFromTarget", True)):
-                queue.extend([urljoin(base, "/robots.txt"), urljoin(base, "/sitemap.xml")])
+                for authorized_base in bases:
+                    queue.extend(
+                        [
+                            urljoin(authorized_base, "/robots.txt"),
+                            urljoin(authorized_base, "/sitemap.xml"),
+                        ]
+                    )
             queue = dedupe_keep_order(queue, max_urls)
 
             visited = set()
@@ -103,7 +117,7 @@ class WebSecurityControlsProbeTool(ToolPlugin):
             while cursor < len(queue) and len(visited) < max_pages:
                 url = queue[cursor]
                 cursor += 1
-                if url in visited or not self._allowed(base, url):
+                if url in visited or not self._allowed_any(bases, url):
                     continue
                 try:
                     fetched = await fetch_text(session, url, headers=headers, max_bytes=700_000)
@@ -112,7 +126,9 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                 visited.add(url)
                 fetched_url = fetched.get("url") or url
                 mapped = extract_html_map(fetched.get("text", ""), fetched_url)
-                queue.extend([u for u in mapped.get("links", []) if self._allowed(base, u)])
+                queue.extend(
+                    [u for u in mapped.get("links", []) if self._allowed_any(bases, u)]
+                )
                 for form in mapped.get("forms", []):
                     if isinstance(form, dict):
                         form["sourcePage"] = fetched_url
@@ -143,14 +159,16 @@ class WebSecurityControlsProbeTool(ToolPlugin):
                 if agent:
                     agent.report_progress("Checking web security controls", url, len(visited), max_pages)
 
-        form_findings, form_probes = self._form_findings(forms, base)
-        findings.extend(form_findings)
-        probes.extend(form_probes)
+        for authorized_base in bases:
+            form_findings, form_probes = self._form_findings(forms, authorized_base)
+            findings.extend(form_findings)
+            probes.extend(form_probes)
         findings = self._dedupe_findings(findings)
 
         return {
             "success": True,
             "target": base,
+            "targets": bases,
             "pages": pages[:200],
             "forms": self._dedupe_forms(forms)[:200],
             "probes": probes[:500],
@@ -334,6 +352,9 @@ class WebSecurityControlsProbeTool(ToolPlugin):
 
     def _allowed(self, base: str, candidate: str) -> bool:
         return same_origin(base, candidate)
+
+    def _allowed_any(self, bases: Iterable[str], candidate: str) -> bool:
+        return any(self._allowed(base, candidate) for base in bases)
 
     def _finding(
         self,
