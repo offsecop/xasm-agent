@@ -4,6 +4,7 @@ Scans top 1000 most common ports for fast results
 """
 
 import asyncio
+import ipaddress
 import subprocess
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
@@ -117,35 +118,9 @@ class NmapQuickScanTool(ToolPlugin):
 
                 # Parse XML to extract open ports with service info
                 try:
-                    root = ET.fromstring(xml_output)
-                    for host in root.findall('.//host'):
-                        for port in host.findall('.//port'):
-                            state = port.find('state')
-                            if state is not None and state.get('state') == 'open':
-                                port_id = port.get('portid')
-                                protocol = port.get('protocol')
-
-                                # Extract service information
-                                service_elem = port.find('service')
-                                port_data = {
-                                    'port': int(port_id),
-                                    'protocol': protocol,
-                                    'state': 'open',
-                                    'target': normalized_target,
-                                    'originalTarget': scan_target
-                                }
-
-                                if service_elem is not None:
-                                    service_info = {
-                                        'name': service_elem.get('name'),
-                                        'product': service_elem.get('product'),
-                                        'version': service_elem.get('version'),
-                                        'extrainfo': service_elem.get('extrainfo')
-                                    }
-                                    if service_info.get('name'):
-                                        port_data['service'] = service_info
-
-                                all_open_ports.append(port_data)
+                    all_open_ports.extend(
+                        self._parse_open_ports(xml_output, normalized_target, scan_target)
+                    )
                 except Exception as e:
                     print(f"[Nmap Quick] XML parsing error for {scan_target}: {e}")
 
@@ -175,11 +150,58 @@ class NmapQuickScanTool(ToolPlugin):
                 "error": f"Error running Nmap quick scan: {str(e)}"
             }
 
+    def _parse_open_ports(self, xml_output: str, normalized_target: str, original_target: str):
+        root = ET.fromstring(xml_output)
+        open_ports = []
+        for host in root.findall('.//host'):
+            # #1951 — a CIDR scan can return many <host> nodes. Attribute
+            # every port to Nmap's observed address, never to the CIDR string.
+            observed_address = None
+            for address_type in ('ipv4', 'ipv6'):
+                address = host.find(f"address[@addrtype='{address_type}']")
+                if address is not None and address.get('addr'):
+                    observed_address = address.get('addr')
+                    break
+            observed_target = observed_address or normalized_target
+            for port in host.findall('.//port'):
+                state = port.find('state')
+                if state is None or state.get('state') != 'open':
+                    continue
+                service_elem = port.find('service')
+                port_data = {
+                    'port': int(port.get('portid')),
+                    'protocol': port.get('protocol'),
+                    'state': 'open',
+                    'target': observed_target,
+                    'originalTarget': original_target,
+                }
+                if service_elem is not None:
+                    service_info = {
+                        'name': service_elem.get('name'),
+                        'product': service_elem.get('product'),
+                        'version': service_elem.get('version'),
+                        'extrainfo': service_elem.get('extrainfo'),
+                    }
+                    if service_info.get('name'):
+                        port_data['service'] = service_info
+                open_ports.append(port_data)
+        return open_ports
+
     def _split_host_port(self, raw_target: str):
         """Return (host, port) for URL or host:port targets."""
         target = raw_target.strip()
         if not target:
             return raw_target, None
+
+        # urlparse treats the CIDR suffix as a path. Preserve an authorized
+        # IPv4/IPv6 network verbatim so Nmap can enumerate its hosts and the
+        # XML parser can attribute each result to the observed address.
+        try:
+            if '/' in target:
+                ipaddress.ip_network(target, strict=False)
+                return target, None
+        except ValueError:
+            pass
 
         try:
             parsed = urlparse(target if "://" in target else f"//{target}", scheme="http")

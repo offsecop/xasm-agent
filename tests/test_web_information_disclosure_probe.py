@@ -346,6 +346,149 @@ class WebInformationDisclosureProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(raw_password, serialized)
         self.assertIn("GET /backup/Product.java.bak", result["findings"][0]["request"])
 
+    async def test_root_autoindex_creates_bounded_finding_without_downloading_entries(self):
+        entry_hits = {"count": 0}
+        app = web.Application()
+        app.router.add_get(
+            "/",
+            lambda _r: web.Response(
+                text=(
+                    '<html><title>Index of /</title><h1>Index of /</h1>'
+                    '<a href="../">Parent Directory</a>'
+                    '<a href="public.txt">public.txt</a>'
+                    '<a href="releases/">releases/</a>'
+                    '<a href="?C=N;O=D">Name</a></html>'
+                ),
+                content_type="text/html",
+            ),
+        )
+
+        async def entry(_request):
+            entry_hits["count"] += 1
+            return web.Response(text="entry body must not be fetched")
+
+        app.router.add_get("/public.txt", entry)
+        app.router.add_get("/releases/", entry)
+        app.router.add_route("*", "/{tail:.*}", lambda _r: web.Response(status=404, text="missing"))
+        async with _TestServer(app) as target:
+            result = await self.tool.execute({"target": target})
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["verification"]["leakKind"], "directory_listing")
+        self.assertEqual(result["summary"]["requestCount"], 2)
+        self.assertEqual(entry_hits["count"], 0)
+        finding = result["findings"][0]
+        self.assertEqual(finding["info"]["name"], "Web Directory Listing Enabled")
+        self.assertEqual(finding["evidence"]["directoryEntries"], ["/public.txt", "/releases/"])
+        self.assertIn("GET / HTTP/1.1", finding["request"])
+        self.assertIn("Index of /", finding["response"])
+
+    async def test_index_heading_without_same_origin_child_is_not_a_finding(self):
+        app = web.Application()
+        app.router.add_get(
+            "/",
+            lambda _r: web.Response(
+                text=(
+                    '<html><title>Index of /</title>'
+                    '<a href="../">Parent</a>'
+                    '<a href="https://outside.example/file">External</a></html>'
+                ),
+                content_type="text/html",
+            ),
+        )
+        app.router.add_route("*", "/{tail:.*}", lambda _r: web.Response(status=404, text="missing"))
+        async with _TestServer(app) as target:
+            result = await self.tool.execute({"target": target})
+
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["findings"], [])
+
+    async def test_index_heading_with_only_local_resources_is_not_a_finding(self):
+        app = web.Application()
+        app.router.add_get(
+            "/",
+            lambda _r: web.Response(
+                text=(
+                    '<html><title>Index of products</title><h1>Index of products</h1>'
+                    '<link rel="stylesheet" href="/app.css">'
+                    '<script src="/app.js"></script>'
+                    '<a href="/products/1">Product one</a></html>'
+                ),
+                content_type="text/html",
+            ),
+        )
+        app.router.add_route("*", "/{tail:.*}", lambda _r: web.Response(status=404, text="missing"))
+        async with _TestServer(app) as target:
+            result = await self.tool.execute({"target": target})
+
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["findings"], [])
+
+    async def test_autoindex_signed_query_is_path_only_and_redacted_from_transcript(self):
+        raw_secrets = {
+            "aws": "0123456789abcdef0123456789abcdef",
+            "gcp": "fedcba9876543210fedcba9876543210",
+            "azure": "a1b2c3d4e5f60718273645",
+            "identity": "service-account@example.test",
+        }
+        app = web.Application()
+        app.router.add_get(
+            "/",
+            lambda _r: web.Response(
+                text=(
+                    '<html><title>Index of /</title><h1>Index of /</h1>'
+                    '<a href="/download.bin?name=file'
+                    f'&amp;X-Amz-Signature={raw_secrets["aws"]}'
+                    f'&amp;X-Goog-Signature={raw_secrets["gcp"]}'
+                    f'&amp;GoogleAccessId={raw_secrets["identity"]}'
+                    f'&amp;sig={raw_secrets["azure"]}">'
+                    'download.bin</a>'
+                    '</html>'
+                ),
+                content_type="text/html",
+            ),
+        )
+        app.router.add_route("*", "/{tail:.*}", lambda _r: web.Response(status=404, text="missing"))
+        async with _TestServer(app) as target:
+            result = await self.tool.execute({"target": target})
+
+        serialized = json.dumps(result)
+        self.assertTrue(result["verified"])
+        self.assertEqual(
+            result["findings"][0]["evidence"]["directoryEntries"],
+            ["/download.bin"],
+        )
+        for raw_secret in raw_secrets.values():
+            self.assertNotIn(raw_secret, serialized)
+        self.assertIn("&amp;X-Amz-Signature=[REDACTED]", result["findings"][0]["response"])
+        self.assertIn("&amp;X-Goog-Signature=[REDACTED]", result["findings"][0]["response"])
+        self.assertIn("&amp;GoogleAccessId=[REDACTED]", result["findings"][0]["response"])
+        self.assertIn("&amp;sig=[REDACTED]", result["findings"][0]["response"])
+
+    async def test_autoindex_marker_on_redirect_error_or_empty_body_is_not_a_finding(self):
+        cases = (
+            web.Response(status=302, headers={"Location": "/elsewhere"}, text="redirect"),
+            web.Response(
+                status=500,
+                text='<html><title>Index of /</title><a href="/file">file</a></html>',
+                content_type="text/html",
+            ),
+            web.Response(status=200, body=b"", content_type="text/html"),
+        )
+        for response in cases:
+            with self.subTest(status=response.status, body_length=response.body_length):
+                app = web.Application()
+                app.router.add_get("/", lambda _r, response=response: response)
+                app.router.add_route(
+                    "*",
+                    "/{tail:.*}",
+                    lambda _r: web.Response(status=404, text="missing"),
+                )
+                async with _TestServer(app) as target:
+                    result = await self.tool.execute({"target": target})
+                self.assertFalse(result["verified"])
+                self.assertEqual(result["findings"], [])
+
     async def test_spa_catch_all_200_does_not_create_a_finding(self):
         body = '<html><title>Example SPA</title><div id="root"></div></html>'
         app = web.Application()

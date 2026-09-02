@@ -5,12 +5,21 @@ Performs service and version detection on a specific port
 
 import asyncio
 import json
+import re
 import xml.etree.ElementTree as ET
 from plugin_interface import ToolPlugin
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 
 from lib.wrapper_helpers import resolve_targets as _resolve_targets
+
+
+FTP_ANON_POSITIVE_RE = re.compile(
+    r"anonymous\s+ftp\s+login\s+allowed\s*\(ftp\s+code\s+230\)",
+    re.IGNORECASE,
+)
+FTP_LISTING_LIMIT = 20
+FTP_LISTING_LINE_LIMIT = 240
 
 
 class NmapServiceScanTool(ToolPlugin):
@@ -111,6 +120,7 @@ class NmapServiceScanTool(ToolPlugin):
 
         all_results = []
         all_raw = []
+        all_findings = []
 
         for idx, target in enumerate(targets_list):
             try:
@@ -148,6 +158,9 @@ class NmapServiceScanTool(ToolPlugin):
                     'port': port,
                     'service': service_info
                 })
+                ftp_finding = self._build_ftp_anon_finding(target, port, service_info)
+                if ftp_finding:
+                    all_findings.append(ftp_finding)
 
                 if agent:
                     agent.report_progress(
@@ -194,7 +207,8 @@ class NmapServiceScanTool(ToolPlugin):
                 'targets': targets_list,
                 'total': len(all_results),
                 'tool': 'nmap',
-                'scan_type': 'service_scan'
+                'scan_type': 'service_scan',
+                'findings': all_findings,
             },
             'raw_output': raw_output
         }
@@ -248,11 +262,124 @@ class NmapServiceScanTool(ToolPlugin):
                         for script in script_output:
                             if script.get('id') == 'banner':
                                 service_info['banner'] = script.get('output')
+                            elif script.get('id') == 'ftp-anon':
+                                ftp_anon = self._parse_ftp_anon_output(script.get('output'))
+                                if ftp_anon:
+                                    service_info['ftpAnon'] = ftp_anon
                     break
         except ET.ParseError as e:
             print(f"Error parsing Nmap XML: {e}")
 
         return service_info
+
+    def _parse_ftp_anon_output(self, raw_output: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Retain only positive, bounded ftp-anon evidence from the NSE script."""
+        output = str(raw_output or '')
+        match = FTP_ANON_POSITIVE_RE.search(output)
+        if not match:
+            return None
+
+        listing: List[str] = []
+        for raw_line in output[match.end():].splitlines():
+            line = self._sanitize_evidence_line(raw_line)
+            if not line:
+                continue
+            listing.append(line)
+            if len(listing) >= FTP_LISTING_LIMIT:
+                break
+
+        return {
+            'verified': True,
+            'replyCode': 230,
+            'proof': 'Anonymous FTP login allowed (FTP code 230)',
+            'listing': listing,
+            'listingTruncated': len(
+                [line for line in output[match.end():].splitlines() if line.strip()]
+            ) > len(listing),
+        }
+
+    def _sanitize_evidence_line(self, raw_line: str) -> str:
+        printable = ''.join(
+            character if character.isprintable() or character == '\t' else ' '
+            for character in str(raw_line or '')
+        )
+        return ' '.join(printable.split())[:FTP_LISTING_LINE_LIMIT]
+
+    def _build_ftp_anon_finding(
+        self,
+        target: str,
+        port: int,
+        service_info: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        ftp_anon = service_info.get('ftpAnon') if isinstance(service_info, dict) else None
+        if not isinstance(ftp_anon, dict) or ftp_anon.get('verified') is not True:
+            return None
+
+        endpoint = f"ftp://{target}:{port}/"
+        listing = [str(line) for line in ftp_anon.get('listing', []) if str(line).strip()]
+        request = (
+            f"FTP CONNECT {target}:{port}\n"
+            "USER anonymous\n"
+            "PASS [REDACTED]\n"
+            "LIST"
+        )
+        response_lines = [
+            str(ftp_anon.get('proof') or '230 Anonymous FTP login allowed'),
+            *listing,
+        ]
+        if ftp_anon.get('listingTruncated'):
+            response_lines.append('... [bounded listing truncated]')
+        response = '\n'.join(response_lines)
+        transcript = [{
+            'label': 'nmap-ftp-anon-read-only',
+            'request': request,
+            'response': response,
+        }]
+
+        return {
+            'template-id': 'xasm-ftp-anonymous-access',
+            'templateID': 'xasm-ftp-anonymous-access',
+            'matched-at': endpoint,
+            'matched': endpoint,
+            'host': endpoint,
+            'matcher-name': 'ftp-anon-nse-positive',
+            'extracted-results': [
+                'FTP reply code 230',
+                f"bounded listing entries: {len(listing)}",
+            ],
+            'request': request,
+            'response': response,
+            'observedTranscript': transcript,
+            'evidence': {
+                'request': request,
+                'response': response,
+                'observedTranscript': transcript,
+                'fallback': False,
+                'verified': True,
+                'proofLevel': 'runtime-read-only',
+                'protocol': 'ftp',
+                'port': port,
+                'replyCode': 230,
+                'listing': listing,
+                'listingTruncated': bool(ftp_anon.get('listingTruncated')),
+            },
+            'info': {
+                'name': 'Anonymous FTP Access Enabled',
+                'severity': 'medium',
+                'description': (
+                    'The FTP service accepts an anonymous login and exposes a directory listing '
+                    'without an authenticated account.'
+                ),
+                'remediation': (
+                    'Disable anonymous FTP access unless it is explicitly required. If public '
+                    'downloads are intended, expose only the minimum read-only content and prevent '
+                    'uploads or access to sensitive files.'
+                ),
+                'classification': {
+                    'cwe-id': ['CWE-284'],
+                },
+            },
+        }
 
 
 def get_tool():

@@ -7,6 +7,7 @@ submitting forms or pressing risky state-changing controls.
 """
 
 from typing import Any, Dict
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
@@ -21,6 +22,30 @@ from tools._agentic_exploration_common import (
     parse_headers,
     same_origin,
 )
+
+
+BROWSER_CONTEXT_SCOPE_OPTIONS = {"service_workers": "block"}
+
+
+def same_websocket_origin(base: str, candidate: str) -> bool:
+    """Match a page origin to its WebSocket transport equivalent."""
+    try:
+        page = urlparse(base)
+        websocket = urlparse(candidate)
+        expected_scheme = {"http": "ws", "https": "wss"}.get(page.scheme.lower())
+        if not expected_scheme or websocket.scheme.lower() != expected_scheme:
+            return False
+
+        def effective_port(parsed: Any, secure: bool) -> int:
+            return int(parsed.port) if parsed.port else (443 if secure else 80)
+
+        return (
+            (page.hostname or "").lower() == (websocket.hostname or "").lower()
+            and effective_port(page, page.scheme.lower() == "https")
+            == effective_port(websocket, websocket.scheme.lower() == "wss")
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 class BrowserMapAppTool(ToolPlugin):
@@ -91,11 +116,46 @@ class BrowserMapAppTool(ToolPlugin):
                 context = await browser.new_context(
                     ignore_https_errors=True,
                     extra_http_headers=parse_headers(parameters),
+                    **BROWSER_CONTEXT_SCOPE_OPTIONS,
                 )
+
+                async def keep_requests_in_scope(route):
+                    request_url = route.request.url
+                    if request_url.startswith(("about:", "blob:", "data:")) or same_origin(
+                        target, request_url
+                    ):
+                        await route.continue_()
+                    else:
+                        await route.abort("blockedbyclient")
+
+                # The fallback is selected automatically by the coordinator,
+                # so redirects and subresources must remain on the exact
+                # authorized origin rather than silently expanding scope.
+                await context.route("**/*", keep_requests_in_scope)
+
+                async def keep_websockets_in_scope(websocket):
+                    if same_websocket_origin(target, websocket.url):
+                        websocket.connect_to_server()
+                    else:
+                        await websocket.close(
+                            code=1008,
+                            reason="cross-origin websocket blocked by authorized scope",
+                        )
+
+                # HTTP routing does not cover WebSocket handshakes. Register
+                # this before creating a page so no script gets an unbounded
+                # connection window during initial navigation.
+                await context.route_web_socket("**/*", keep_websockets_in_scope)
                 page = await context.new_page()
                 page.set_default_timeout(timeout_seconds * 1000)
-                await page.goto(target, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+                navigation = await page.goto(
+                    target,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_seconds * 1000,
+                )
                 await page.wait_for_timeout(1000)
+                if not same_origin(target, page.url):
+                    raise RuntimeError(f"cross-origin navigation blocked: {page.url}")
 
                 snapshot = await page.evaluate(
                     """() => {
@@ -177,8 +237,12 @@ class BrowserMapAppTool(ToolPlugin):
                 same_origin_links = [u for u in snapshot.get("links", []) if same_origin(target, u)]
                 map_result = {
                     "success": True,
+                    "coverageStatus": "CONFIRMED",
+                    "coverageReason": "BROWSER_ROOT_DOCUMENT_LOADED",
+                    "verified": True,
                     "target": target,
                     "finalUrl": snapshot.get("url"),
+                    "status": navigation.status if navigation else None,
                     "title": snapshot.get("title"),
                     "links": same_origin_links,
                     "externalLinks": [u for u in snapshot.get("links", []) if not same_origin(target, u)][:100],
@@ -214,13 +278,70 @@ class BrowserMapAppTool(ToolPlugin):
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as session:
-            fetched = await fetch_text(session, target, headers=parse_headers(parameters))
+            current_url = target
+            redirects = []
+            fetched = None
+            for _ in range(6):
+                fetched = await fetch_text(
+                    session,
+                    current_url,
+                    headers=parse_headers(parameters),
+                    allow_redirects=False,
+                )
+                status = int(fetched.get("status") or 0)
+                response_headers = fetched.get("headers") or {}
+                location = next(
+                    (
+                        value
+                        for key, value in response_headers.items()
+                        if str(key).lower() == "location"
+                    ),
+                    None,
+                )
+                if status not in {301, 302, 303, 307, 308} or not location:
+                    break
+                next_url = urljoin(current_url, str(location))
+                if not same_origin(target, next_url):
+                    return {
+                        "success": False,
+                        "coverageStatus": "INCOMPLETE",
+                        "coverageReason": "CROSS_ORIGIN_REDIRECT_BLOCKED",
+                        "verified": False,
+                        "target": target,
+                        "finalUrl": current_url,
+                        "status": status,
+                        "redirectTarget": next_url,
+                        "redirects": redirects,
+                        "fallback": True,
+                        "fallbackReason": reason,
+                        "error": "redirect left the authorized origin",
+                    }
+                redirects.append(next_url)
+                current_url = next_url
+            else:
+                return {
+                    "success": False,
+                    "coverageStatus": "INCOMPLETE",
+                    "coverageReason": "REDIRECT_LIMIT_EXCEEDED",
+                    "verified": False,
+                    "target": target,
+                    "finalUrl": current_url,
+                    "redirects": redirects,
+                    "fallback": True,
+                    "fallbackReason": reason,
+                    "error": "same-origin redirect limit exceeded",
+                }
+        assert fetched is not None
         mapped = extract_html_map(fetched.get("text", ""), fetched.get("url") or target)
         return {
             "success": True,
+            "coverageStatus": "CONFIRMED",
+            "coverageReason": "HTTP_ROOT_FETCH_COMPLETED",
+            "verified": True,
             "target": target,
             "finalUrl": fetched.get("url"),
             "status": fetched.get("status"),
+            "redirects": redirects,
             "fallback": True,
             "fallbackReason": reason,
             **mapped,

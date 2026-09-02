@@ -35,6 +35,9 @@ UNSAFE_PATH_RE = re.compile(
 )
 HTML_RE = re.compile(r"(?is)<(?:!doctype|html|head|body|title)\b")
 INDEX_RE = re.compile(r"(?is)<title>\s*Index of\s+[^<]+</title>|<h1>\s*Index of\s+[^<]+</h1>")
+AUTOINDEX_RE = re.compile(
+    r"(?is)<title>\s*Index of\s+/[^<]*</title>|<h1>\s*Index of\s+/[^<]*</h1>"
+)
 SOURCE_MAP_RE = re.compile(r"(?://[#@]\s*sourceMappingURL\s*=\s*([^\s*]+))", re.I)
 COMMENT_RE = re.compile(r"(?is)<!--(.*?)-->")
 GIT_HEAD_RE = re.compile(r"^ref:\s+refs/heads/[A-Za-z0-9._/-]+\s*$", re.I)
@@ -72,6 +75,12 @@ CONNECTION_SECRET_RE = re.compile(
     r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?)://[^\s'\"<]+"
 )
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")
+SENSITIVE_QUERY_VALUE_RE = re.compile(
+    r"(?i)((?:\?|&(?:amp;|#0*38;|#x0*26;)?)(?:x-(?:amz|goog)-"
+    r"(?:signature|credential|security-token)|googleaccessid|awsaccesskeyid|"
+    r"signature|sig|secret|passw(?:or)?d|token|api[_-]?key|auth|session|csrf|xsrf)="
+    r")([^&#\"'\s<>]+)"
+)
 SOURCE_MARKERS = (
     "<?php",
     "public class ",
@@ -155,6 +164,22 @@ class _DiscoveryParser(HTMLParser):
             value = next((group for group in match.groups() if group), None)
             if value:
                 self.urls.append(value.strip())
+
+
+class _AutoindexEntryParser(HTMLParser):
+    """Collect only navigable anchors from a server-generated index."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.urls: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if str(tag or "").lower() != "a":
+            return
+        for name, value in attrs:
+            if str(name or "").lower() == "href" and value:
+                self.urls.append(str(value).strip())
+                return
 
 
 class WebInformationDisclosureProbeTool(ToolPlugin):
@@ -265,11 +290,22 @@ class WebInformationDisclosureProbeTool(ToolPlugin):
             negative = await self._request("GET", f"{target}/.xasm-not-found-{negative_token}")
             negative_hash = self._body_hash(negative.body)
 
-            page_urls, all_urls, bodies = await self._discover(target, root)
             candidates: List[Tuple[Dict[str, Any], HttpObservation, Optional[str]]] = []
+            directory_listing = self._classify_directory_listing(root, target, negative_hash)
+            if directory_listing:
+                candidates.append((directory_listing, root, None))
+
+            # A confirmed root autoindex is already sufficient evidence. Avoid
+            # downloading every listed file just to rediscover the same leak.
+            if candidates and self._stop_first:
+                page_urls = [target + "/"]
+                all_urls = [target + "/"]
+                bodies = {target + "/": root.body}
+            else:
+                page_urls, all_urls, bodies = await self._discover(target, root)
 
             # Observed pages first: debug links and typed query parameters.
-            for url in all_urls:
+            for url in (all_urls if not candidates else []):
                 path = urlparse(url).path.lower()
                 if any(token in path for token in ("debug", "phpinfo", "actuator", "server-status")):
                     obs = await self._cached_get(url)
@@ -284,9 +320,10 @@ class WebInformationDisclosureProbeTool(ToolPlugin):
             # Robots/sitemap and fixed read-only indicators are still bounded by
             # the same global request counter.
             robots_paths: List[str] = []
-            robots = await self._request("GET", target + "/robots.txt")
-            if robots.status == 200 and self._body_hash(robots.body) != negative_hash:
-                robots_paths = self._robots_paths(robots.body, target)
+            if not candidates:
+                robots = await self._request("GET", target + "/robots.txt")
+                if robots.status == 200 and self._body_hash(robots.body) != negative_hash:
+                    robots_paths = self._robots_paths(robots.body, target)
             if not candidates:
                 candidates.extend(await self._probe_backups(robots_paths, all_urls, negative_hash))
             if not candidates:
@@ -631,6 +668,71 @@ class WebInformationDisclosureProbeTool(ToolPlugin):
             }
         return None
 
+    def _classify_directory_listing(
+        self,
+        obs: HttpObservation,
+        target: str,
+        negative_hash: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Confirm a real same-origin autoindex and retain only bounded entry paths."""
+        if (
+            obs.status != 200
+            or not self._is_html(obs)
+            or self._body_hash(obs.body) == negative_hash
+            or not AUTOINDEX_RE.search(obs.body)
+        ):
+            return None
+
+        parser = _AutoindexEntryParser()
+        try:
+            parser.feed(obs.body)
+        except Exception:
+            return None
+
+        listing_path = urlparse(obs.url).path or "/"
+        entries: List[str] = []
+        for raw in parser.urls:
+            raw_value = str(raw or "").strip()
+            if not raw_value or raw_value.startswith(("?", "#")) or raw_value in {".", "..", "./", "../"}:
+                continue
+            absolute = self._safe_same_origin_url(target, obs.url, raw_value)
+            if not absolute:
+                continue
+            parsed = urlparse(absolute)
+            if parsed.path == listing_path or parsed.path.rstrip("/") == listing_path.rstrip("/"):
+                continue
+            # Evidence is deliberately path-only. Autoindexes may expose signed
+            # download URLs; persisting their query string would leak credentials.
+            entry = parsed.path
+            if entry not in entries:
+                entries.append(entry[:512])
+            if len(entries) >= 20:
+                break
+
+        # The heading alone can be application-authored text. At least one
+        # concrete same-origin child makes the autoindex proof reproducible.
+        if not entries:
+            return None
+        return {
+            "kind": "directory_listing",
+            "title": "Web Directory Listing Enabled",
+            "severity": "low",
+            "marker": f"Index of {listing_path}; entries={len(entries)}",
+            "description": (
+                "The web server exposes an automatically generated directory index with "
+                "unauthenticated child paths."
+            ),
+            "remediation": (
+                "Disable automatic directory indexing, add an explicit index document, and "
+                "review the exposed paths for sensitive content."
+            ),
+            "evidence": {
+                "listingPath": listing_path,
+                "directoryEntries": entries,
+                "directoryEntryCount": len(entries),
+            },
+        }
+
     def _classify_source(self, obs: HttpObservation) -> Optional[Dict[str, Any]]:
         lowered = obs.body.lower()
         if not any(marker.lower() in lowered for marker in SOURCE_MARKERS):
@@ -745,6 +847,7 @@ class WebInformationDisclosureProbeTool(ToolPlugin):
                 "fallback": False,
                 "verified": True,
                 "proofLevel": LAB_PROOF if solution.get("solutionAnswerSha256") else RUNTIME_PROOF,
+                **(hit.get("evidence") if isinstance(hit.get("evidence"), dict) else {}),
             },
             "info": {
                 "name": hit["title"],
@@ -867,6 +970,7 @@ class WebInformationDisclosureProbeTool(ToolPlugin):
 
     def _sanitize_body(self, body: str, raw_value: Optional[str]) -> str:
         safe = self._sanitize_text(str(body or ""), raw_value)
+        safe = SENSITIVE_QUERY_VALUE_RE.sub(r"\1[REDACTED]", safe)
         replacements: List[Tuple[str, str]] = []
         visible = self._visible_text(safe)
         for match in SECRET_ASSIGNMENT_RE.finditer(visible):
