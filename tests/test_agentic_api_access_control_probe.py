@@ -158,6 +158,41 @@ class ObservedIdentifierReplayTool(ApiAccessControlProbeTool):
         return self._response(url, 404, {"error": "not found"})
 
 
+class StaticCandidateBudgetTool(ApiAccessControlProbeTool):
+    def __init__(self):
+        super().__init__()
+        self.fetch_calls = []
+
+    async def _discover_readonly_endpoints(self, target, parameters, max_endpoints):
+        return [
+            {
+                "method": "GET",
+                "url": f"https://bank.test/_next/static/chunks/{index}-deadbeef.js",
+                "path": f"/_next/static/chunks/{index}-deadbeef.js",
+            }
+            for index in range(20)
+        ] + [
+            {
+                "method": "GET",
+                "url": "https://bank.test/health",
+                "path": "/health",
+            }
+        ]
+
+    async def _fetch(self, session, method, url, headers):
+        self.fetch_calls.append(url)
+        return {
+            "url": url,
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": '{"ok":true}',
+            "elapsedMs": 1,
+            "jsonKeys": ["ok"],
+            "bodyLength": 11,
+            "sensitiveBodyMarkers": [],
+        }
+
+
 def _params(**extra):
     base = {"target": "http://lab.test/", "urls": ["http://lab.test/api/users/2"],
             "includeAnonymousComparison": False, "includeIdMutation": False}
@@ -359,6 +394,26 @@ class ObservedIdentifierReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(call["url"].startswith("https://other.test/") for call in tool.fetch_calls))
 
 
+class StaticCandidateBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_static_candidates_are_filtered_before_endpoint_budget(self):
+        tool = StaticCandidateBudgetTool()
+
+        result = await tool.execute(
+            {
+                "target": "https://bank.test/",
+                "maxEndpoints": 2,
+                "maxRequests": 2,
+                "includeAnonymousComparison": False,
+                "includeIdMutation": False,
+            }
+        )
+
+        self.assertEqual(result["staticCandidatesFiltered"], 20)
+        self.assertEqual(result["summary"]["staticCandidatesFiltered"], 20)
+        self.assertTrue(any(url.endswith("/health") for url in tool.fetch_calls))
+        self.assertFalse(any("/_next/static/" in url for url in tool.fetch_calls))
+
+
 class HelperTests(unittest.TestCase):
     def setUp(self):
         self.tool = ApiAccessControlProbeTool()
@@ -409,6 +464,100 @@ class HelperTests(unittest.TestCase):
         )
         self.assertEqual(len(endpoints), 1)
         self.assertEqual(endpoints[0]["originalPath"], "/accounts/{account_id}")
+
+    def test_framework_chunks_maps_fonts_images_and_styles_are_static(self):
+        static_urls = [
+            "https://bank.test/_next/static/chunks/117-abc123.js",
+            "https://bank.test/_nuxt/app.mjs",
+            "https://bank.test/assets/css/main.css?v=3",
+            "https://bank.test/static/media/logo.svg",
+            "https://bank.test/fonts/inter.woff2",
+            "https://bank.test/app.js.map",
+            "https://bank.test/images/hero.webp",
+        ]
+
+        for url in static_urls:
+            with self.subTest(url=url):
+                self.assertTrue(self.tool._is_static_asset_candidate({"url": url}))
+
+    def test_extensionless_and_api_json_endpoints_are_preserved(self):
+        application_endpoints = [
+            {"url": "https://bank.test/api/users"},
+            {"url": "https://bank.test/api/config.json"},
+            {"url": "https://bank.test/internal/config.json"},
+            {
+                "url": "https://bank.test/download/report.js",
+                "source": "openapi",
+                "operationId": "downloadReport",
+            },
+            {
+                "url": "https://bank.test/data/report.js",
+                "resourceType": "fetch",
+                "contentType": "application/json",
+            },
+        ]
+
+        for endpoint in application_endpoints:
+            with self.subTest(endpoint=endpoint):
+                self.assertFalse(self.tool._is_static_asset_candidate(endpoint))
+
+    def test_observed_response_semantics_survive_endpoint_normalization(self):
+        endpoints = self.tool._normalize_endpoints(
+            {
+                "apiEndpoints": [
+                    {
+                        "method": "GET",
+                        "url": "https://bank.test/reports/current.js",
+                        "resourceType": "xhr",
+                        "contentType": "application/problem+json",
+                        "responseKeys": ["detail"],
+                    }
+                ]
+            },
+            "https://bank.test/",
+        )
+
+        self.assertEqual(len(endpoints), 2)
+        observed = next(endpoint for endpoint in endpoints if endpoint["url"].endswith("current.js"))
+        self.assertEqual(observed["resourceType"], "xhr")
+        self.assertEqual(observed["contentType"], "application/problem+json")
+        self.assertFalse(self.tool._is_static_asset_candidate(observed))
+
+    def test_static_manifest_is_filtered_but_api_manifest_is_preserved(self):
+        self.assertTrue(
+            self.tool._is_static_asset_candidate(
+                {"url": "https://bank.test/manifest.json"}
+            )
+        )
+        self.assertFalse(
+            self.tool._is_static_asset_candidate(
+                {"url": "https://bank.test/api/manifest.json"}
+            )
+        )
+
+    def test_filter_preserves_deterministic_application_endpoint_order(self):
+        candidates = self.tool._dedupe_endpoints(
+            [
+                {"method": "GET", "url": "https://bank.test/health", "path": "/health"},
+                {
+                    "method": "GET",
+                    "url": "https://bank.test/_next/static/chunks/123.js",
+                    "path": "/_next/static/chunks/123.js",
+                },
+                {"method": "GET", "url": "https://bank.test/api/users", "path": "/api/users"},
+            ]
+        )
+
+        application_endpoints, filtered = self.tool._without_static_candidates(candidates)
+
+        self.assertEqual(filtered, 1)
+        self.assertEqual(
+            [endpoint["url"] for endpoint in application_endpoints],
+            [
+                "https://bank.test/api/users",
+                "https://bank.test/health",
+            ],
+        )
 
     def test_identifier_extraction_rejects_credentials_and_unsafe_path_values(self):
         observed = {}

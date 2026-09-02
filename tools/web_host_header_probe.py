@@ -23,7 +23,12 @@ from urllib.parse import urljoin, urlsplit
 
 from plugin_interface import ToolPlugin
 from tools.web_authentication_probe import sanitize_evidence_text
-from tools.web_request_smuggling_probe import read_http_response
+from tools.web_request_smuggling_probe import (
+    BoundedHttpResponseTruncated,
+    bounded_http_incomplete_result,
+    raise_for_truncated_http_response,
+    read_http_response,
+)
 
 
 MODE = "host-auth-bypass-differential-v1"
@@ -358,7 +363,9 @@ class HostHeaderProbeTool(ToolPlugin):
         try:
             writer.write(raw_request)
             await asyncio.wait_for(writer.drain(), timeout=self._timeout)
-            raw_response = await read_http_response(reader, self._timeout)
+            raw_response = await read_http_response(
+                reader, self._timeout, max_body_bytes=MAX_RESPONSE_BYTES
+            )
         finally:
             writer.close()
             try:
@@ -366,6 +373,7 @@ class HostHeaderProbeTool(ToolPlugin):
             except (ConnectionError, ssl.SSLError):
                 pass
 
+        raise_for_truncated_http_response("GET", url, raw_response)
         status_line = str(raw_response.get("statusLine") or "")
         status_parts = status_line.split(" ", 2)
         headers: Dict[str, str] = {}
@@ -581,6 +589,10 @@ class HostHeaderProbeTool(ToolPlugin):
                         break
                 if verification:
                     break
+        except BoundedHttpResponseTruncated as exc:
+            return bounded_http_incomplete_result(
+                self.name, target, self._requests, exc, mode=MODE
+            )
         except (OSError, ConnectionError, TimeoutError, ValueError, ssl.SSLError) as exc:
             return {
                 "success": False,

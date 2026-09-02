@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     unzip \
     curl \
     ca-certificates \
+    openssl \
+    libnss3-tools \
     gcc \
     python3-dev \
     build-essential \

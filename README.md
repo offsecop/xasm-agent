@@ -66,6 +66,29 @@ and evidence-oriented vulnerability probes.
    registered tool inventory. The agent should then appear online in the xASM
    Platform operations interface.
 
+### Corporate TLS inspection
+
+Remote agents behind an authorized TLS-inspection proxy can trust the corporate
+root CA without disabling certificate verification. Add these two arguments to
+the generated `docker run` command, mounting a PEM bundle read-only and pointing
+`XASM_CA_BUNDLE` to its path inside the container:
+
+```bash
+--volume /absolute/path/corporate-root-ca.pem:/run/secrets/xasm/corporate-ca.pem:ro \
+-e XASM_CA_BUNDLE=/run/secrets/xasm/corporate-ca.pem \
+```
+
+For the provided Compose deployment, add the same bind mount and environment
+variable to `docker-compose.agent.yml` or an environment-specific override.
+
+At startup, the agent validates every certificate, installs it in the Linux
+system trust store and Chromium's NSS database, and configures Python, curl, and
+Node.js to use the same trust chain. The container refuses to start when the
+configured file is missing, empty, malformed, or contains a non-CA certificate.
+When `XASM_CA_BUNDLE` is unset, the default public trust store is left unchanged.
+Do not use `NODE_TLS_REJECT_UNAUTHORIZED=0`, `verify=False`, or Chromium
+certificate-bypass flags as a workaround.
+
 ## Enrollment options
 
 ### Dedicated agent enrollment
