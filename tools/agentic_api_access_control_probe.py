@@ -13,7 +13,7 @@ import re
 import time
 from http import HTTPStatus
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 
@@ -39,6 +39,48 @@ TRUNCATED_JSON_SCALAR_RE = re.compile(
 OBSERVED_IDENTIFIER_REQUEST_BUDGET = 6
 OBSERVED_IDENTIFIER_VALUES_PER_FIELD = 4
 OBSERVED_IDENTIFIER_FIELD_LIMIT = 24
+STATIC_ASSET_EXTENSIONS = {
+    ".avif",
+    ".bmp",
+    ".cjs",
+    ".css",
+    ".eot",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".less",
+    ".map",
+    ".mjs",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".otf",
+    ".png",
+    ".sass",
+    ".scss",
+    ".svg",
+    ".ttf",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+}
+STATIC_JSON_BASENAMES = {
+    "asset-manifest.json",
+    "build-manifest.json",
+    "manifest.json",
+    "package.json",
+    "react-loadable-manifest.json",
+    "routes-manifest.json",
+}
+FRAMEWORK_STATIC_PATH_RE = re.compile(
+    r"/(?:_next/static|_next/image|_nuxt|static/(?:chunks|css|js|media)|"
+    r"assets/(?:css|js|fonts?|images?)|dist|webpack)(?:/|$)",
+    re.I,
+)
 ID_PARAM_NAMES = {
     "id",
     "uid",
@@ -410,15 +452,27 @@ class ApiAccessControlProbeTool(ToolPlugin):
         include_discovered = bool(parameters.get("includeDiscoveredReadOnly", True))
         if target and include_discovered and len(endpoints) < max_endpoints:
             endpoints.extend(await self._discover_readonly_endpoints(target, parameters, max_endpoints))
-        endpoints = self._dedupe_endpoints([e for e in endpoints if self._is_authorized_endpoint(target, e)])[:max_endpoints]
+        authorized_endpoints = self._dedupe_endpoints(
+            [e for e in endpoints if self._is_authorized_endpoint(target, e)]
+        )
+        endpoints, static_candidates_filtered = self._without_static_candidates(
+            authorized_endpoints
+        )
+        endpoints = endpoints[:max_endpoints]
         if not endpoints:
             return {
                 "success": True,
                 "target": target,
                 "endpointsChecked": 0,
                 "requestsRun": 0,
+                "staticCandidatesFiltered": static_candidates_filtered,
                 "findings": [],
-                "summary": {"endpointsChecked": 0, "requestsRun": 0, "findings": 0},
+                "summary": {
+                    "endpointsChecked": 0,
+                    "requestsRun": 0,
+                    "findings": 0,
+                    "staticCandidatesFiltered": static_candidates_filtered,
+                },
                 "recommendations": ["No same-origin GET/HEAD API endpoints were supplied. Run browser:traffic_capture first."],
             }
 
@@ -548,6 +602,7 @@ class ApiAccessControlProbeTool(ToolPlugin):
             "tool": "api:access_control_probe",
             "endpointsChecked": len(endpoints),
             "requestsRun": request_count,
+            "staticCandidatesFiltered": static_candidates_filtered,
             "probes": probes[:500],
             "findings": findings,
             "total_findings": len(findings),
@@ -556,6 +611,7 @@ class ApiAccessControlProbeTool(ToolPlugin):
             "summary": {
                 "endpointsChecked": len(endpoints),
                 "requestsRun": request_count,
+                "staticCandidatesFiltered": static_candidates_filtered,
                 "findings": len(findings),
                 "findingTypes": self._finding_type_counts(findings),
                 "authContextDetected": has_auth_context,
@@ -610,6 +666,17 @@ class ApiAccessControlProbeTool(ToolPlugin):
                 endpoint["originalPath"] = original_path
             if operation_id:
                 endpoint["operationId"] = operation_id
+            if isinstance(candidate, dict):
+                for metadata_key in (
+                    "resourceType",
+                    "contentType",
+                    "status",
+                    "apiLike",
+                    "responseKeys",
+                    "requestBodyKeys",
+                ):
+                    if candidate.get(metadata_key) is not None:
+                        endpoint[metadata_key] = candidate[metadata_key]
             endpoints.append(endpoint)
 
         deduped: List[Dict[str, str]] = []
@@ -625,7 +692,16 @@ class ApiAccessControlProbeTool(ToolPlugin):
     def _dedupe_endpoints(self, endpoints: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
         output: List[Dict[str, str]] = []
         seen = set()
-        for endpoint in sorted(endpoints, key=self._endpoint_sort_key, reverse=True):
+        # Keep application endpoints ahead of delivery assets so callers that
+        # apply a bounded slice do not let numbered chunks displace real routes.
+        for endpoint in sorted(
+            endpoints,
+            key=lambda item: (
+                0 if self._is_static_asset_candidate(item) else 1,
+                self._endpoint_sort_key(item),
+            ),
+            reverse=True,
+        ):
             key = f"{endpoint.get('method', 'GET')} {endpoint.get('path') or self._path_shape(endpoint.get('url', ''))}"
             if key in seen:
                 continue
@@ -718,7 +794,17 @@ class ApiAccessControlProbeTool(ToolPlugin):
         endpoints.extend(generic_endpoints)
         output: List[Dict[str, str]] = []
         seen = set()
-        for endpoint in sorted(endpoints, key=self._endpoint_sort_key, reverse=True):
+        # This intermediate discovery list is bounded too. Rank application
+        # candidates first so static chunks cannot fill the cap before the
+        # pre-request filter in execute().
+        for endpoint in sorted(
+            endpoints,
+            key=lambda item: (
+                0 if self._is_static_asset_candidate(item) else 1,
+                self._endpoint_sort_key(item),
+            ),
+            reverse=True,
+        ):
             if not same_origin(target, endpoint["url"]):
                 continue
             key = endpoint["path"]
@@ -1055,6 +1141,55 @@ class ApiAccessControlProbeTool(ToolPlugin):
         method = str(endpoint.get("method") or "GET").upper()
         url = str(endpoint.get("url") or "")
         return method in SAFE_METHODS and same_origin(target, url)
+
+    def _is_static_asset_candidate(self, endpoint: Dict[str, Any]) -> bool:
+        """Return true only for high-confidence delivery assets, not API routes.
+
+        Explicit API contracts and observed XHR/fetch JSON responses win over a
+        filename heuristic. This keeps legitimate endpoints such as
+        `/api/export.json` while dropping framework chunks before they consume
+        the bounded authorization-probe budget.
+        """
+        source = str(endpoint.get("source") or "").strip().lower()
+        if source in {"openapi", "swagger", "api-spec", "graphql"}:
+            return False
+        if endpoint.get("operationId") or PATH_PARAM_RE.search(str(endpoint.get("originalPath") or "")):
+            return False
+
+        parsed = urlparse(str(endpoint.get("url") or ""))
+        path = unquote(parsed.path or "/").lower()
+        content_type = str(endpoint.get("contentType") or "").lower()
+        resource_type = str(endpoint.get("resourceType") or "").lower()
+        observed_application_response = (
+            resource_type in {"xhr", "fetch"}
+            and any(marker in content_type for marker in ("json", "graphql", "xml", "problem+"))
+        )
+        if observed_application_response:
+            return False
+
+        if FRAMEWORK_STATIC_PATH_RE.search(path):
+            return True
+
+        basename = path.rstrip("/").rsplit("/", 1)[-1]
+        if basename in STATIC_JSON_BASENAMES:
+            return not self._looks_api_path(str(endpoint.get("url") or ""))
+
+        suffix = "." + basename.rsplit(".", 1)[-1] if "." in basename else ""
+        if suffix not in STATIC_ASSET_EXTENSIONS:
+            return False
+        return True
+
+    def _without_static_candidates(
+        self, endpoints: Iterable[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        application_endpoints: List[Dict[str, Any]] = []
+        filtered = 0
+        for endpoint in endpoints:
+            if self._is_static_asset_candidate(endpoint):
+                filtered += 1
+            else:
+                application_endpoints.append(endpoint)
+        return application_endpoints, filtered
 
     async def _fetch(self, session: aiohttp.ClientSession, method: str, url: str, headers: Dict[str, str]) -> Dict[str, Any]:
         started = time.monotonic()

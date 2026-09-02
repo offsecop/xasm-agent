@@ -247,7 +247,8 @@ async def _readline(reader: asyncio.StreamReader, timeout: int) -> bytes:
 async def _read_chunked_body(
     reader: asyncio.StreamReader,
     timeout: int,
-) -> Tuple[bytes, bytes]:
+    max_body_bytes: int,
+) -> Tuple[bytes, bytes, bool]:
     wire = bytearray()
     decoded = bytearray()
     while True:
@@ -257,14 +258,23 @@ async def _read_chunked_body(
             size = int(size_line.split(b";", 1)[0].strip(), 16)
         except ValueError as exc:
             raise ValueError("invalid chunk size in HTTP response") from exc
-        if size < 0 or len(decoded) + size > MAX_RESPONSE_BYTES:
-            raise ValueError("HTTP response body exceeded the bounded limit")
+        if size < 0:
+            raise ValueError("invalid negative HTTP chunk size")
         if size == 0:
             while True:
                 trailer = await _readline(reader, timeout)
                 wire.extend(trailer)
                 if trailer in {b"\r\n", b"\n"}:
-                    return bytes(wire), bytes(decoded)
+                    return bytes(wire), bytes(decoded), False
+        remaining = max(0, max_body_bytes - len(decoded))
+        if size > remaining:
+            if remaining:
+                prefix = await asyncio.wait_for(
+                    reader.readexactly(remaining), timeout=timeout
+                )
+                wire.extend(prefix)
+                decoded.extend(prefix)
+            return bytes(wire), bytes(decoded), True
         chunk = await asyncio.wait_for(reader.readexactly(size + 2), timeout=timeout)
         if not chunk.endswith(b"\r\n"):
             raise ValueError("invalid chunk terminator in HTTP response")
@@ -272,7 +282,13 @@ async def _read_chunked_body(
         decoded.extend(chunk[:-2])
 
 
-async def read_http_response(reader: asyncio.StreamReader, timeout: int) -> Dict[str, Any]:
+async def read_http_response(
+    reader: asyncio.StreamReader,
+    timeout: int,
+    max_body_bytes: int = MAX_RESPONSE_BYTES,
+) -> Dict[str, Any]:
+    if max_body_bytes < 1 or max_body_bytes > 10 * 1024 * 1024:
+        raise ValueError("HTTP response body limit is outside the bounded contract")
     while True:
         try:
             header_blob = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
@@ -304,24 +320,34 @@ async def read_http_response(reader: asyncio.StreamReader, timeout: int) -> Dict
 
         raw_body = b""
         decoded_body = b""
+        truncated = False
+        advertised_body_bytes: Optional[int] = None
         transfer_encoding = header_map.get("transfer-encoding", "").lower()
         if "chunked" in transfer_encoding:
-            raw_body, decoded_body = await _read_chunked_body(reader, timeout)
+            raw_body, decoded_body, truncated = await _read_chunked_body(
+                reader, timeout, max_body_bytes
+            )
         elif "content-length" in header_map:
             try:
                 content_length = int(header_map["content-length"])
             except ValueError as exc:
                 raise ValueError("invalid HTTP response Content-Length") from exc
-            if content_length < 0 or content_length > MAX_RESPONSE_BYTES:
-                raise ValueError("HTTP response body exceeded the bounded limit")
+            if content_length < 0:
+                raise ValueError("invalid negative HTTP response Content-Length")
+            advertised_body_bytes = content_length
+            read_length = min(content_length, max_body_bytes)
             decoded_body = await asyncio.wait_for(
-                reader.readexactly(content_length), timeout=timeout
+                reader.readexactly(read_length), timeout=timeout
             )
             raw_body = decoded_body
+            truncated = content_length > max_body_bytes
         elif header_map.get("connection", "").lower() == "close":
-            raw_body = await asyncio.wait_for(reader.read(MAX_RESPONSE_BYTES + 1), timeout=timeout)
-            if len(raw_body) > MAX_RESPONSE_BYTES:
-                raise ValueError("HTTP response body exceeded the bounded limit")
+            raw_body = await asyncio.wait_for(
+                reader.read(max_body_bytes + 1), timeout=timeout
+            )
+            truncated = len(raw_body) > max_body_bytes
+            if truncated:
+                raw_body = raw_body[:max_body_bytes]
             decoded_body = raw_body
         else:
             raise ValueError("HTTP response has no bounded body framing")
@@ -334,7 +360,102 @@ async def read_http_response(reader: asyncio.StreamReader, timeout: int) -> Dict
             "bodyBytes": decoded_body,
             "rawBodyBytes": raw_body,
             "body": decoded_body.decode("utf-8", errors="replace").replace("\0", ""),
+            "bodyBytesRead": len(decoded_body),
+            "advertisedBodyBytes": advertised_body_bytes,
+            "truncated": truncated,
         }
+
+
+class BoundedHttpResponseTruncated(Exception):
+    """A valid HTTP response whose body was safely retained only as a prefix."""
+
+    def __init__(self, method: str, url: str, response: Dict[str, Any]):
+        super().__init__("HTTP response body exceeded the bounded limit")
+        self.method = str(method or "GET").upper()[:12]
+        self.url = str(url or "")[:4096]
+        self.response = response
+
+
+def raise_for_truncated_http_response(
+    method: str,
+    url: str,
+    response: Dict[str, Any],
+) -> None:
+    if response.get("truncated") is True:
+        raise BoundedHttpResponseTruncated(method, url, response)
+
+
+def bounded_http_incomplete_result(
+    tool_name: str,
+    target: str,
+    request_count: int,
+    error: BoundedHttpResponseTruncated,
+    *,
+    mode: Optional[str] = None,
+    proof_level: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a terminal, non-finding observation without retaining an oversized body."""
+
+    response = error.response
+    body_prefix = sanitize_evidence_text(response.get("body") or "", (), 4_096)
+    safe_headers = []
+    allowed_headers = {
+        "content-type",
+        "content-length",
+        "location",
+        "server",
+        "transfer-encoding",
+    }
+    for name, value in response.get("headers") or []:
+        if str(name).lower() in allowed_headers:
+            safe_headers.append([str(name)[:128], str(value)[:1_024]])
+    result: Dict[str, Any] = {
+        "success": True,
+        "tool": tool_name,
+        "target": target,
+        "verified": False,
+        "fallback": False,
+        "coverageStatus": "INCOMPLETE",
+        "requestCount": request_count,
+        "findings": [],
+        "total_findings": 0,
+        "coverage": {
+            "stopReason": "RESPONSE_TRUNCATED",
+            "retryable": False,
+            "requestsRun": request_count,
+        },
+        "boundedResponse": {
+            "method": error.method,
+            "url": error.url,
+            "status": int(response.get("status") or 0),
+            "headers": safe_headers,
+            "bodyPrefix": body_prefix,
+            "bodyPrefixSha256": hashlib.sha256(
+                bytes(response.get("bodyBytes") or b"")
+            ).hexdigest(),
+            "bodyBytesRead": int(response.get("bodyBytesRead") or 0),
+            "advertisedBodyBytes": response.get("advertisedBodyBytes"),
+            "truncated": True,
+        },
+        "verification": {
+            "verified": False,
+            "reason": "response exceeded the bounded body limit",
+            "reasonCode": "RESPONSE_TRUNCATED",
+        },
+        "summary": {
+            "requests": request_count,
+            "findings": 0,
+            "coverageStatus": "INCOMPLETE",
+            "stopReason": "RESPONSE_TRUNCATED",
+        },
+    }
+    if mode:
+        result["mode"] = mode
+        result["verification"]["mode"] = mode
+    if proof_level:
+        result["proofLevel"] = proof_level
+        result["verification"]["proofLevel"] = proof_level
+    return result
 
 
 def sanitize_evidence_text(
@@ -605,6 +726,19 @@ class RequestSmugglingProbeTool(ToolPlugin):
         assert baseline_response is not None
         assert attack_response is not None
         assert follow_up_response is not None
+        for method, response in (
+            ("GET", baseline_response),
+            ("POST", attack_response),
+            ("GET", follow_up_response),
+        ):
+            if response.get("truncated") is True:
+                return bounded_http_incomplete_result(
+                    self.name,
+                    target,
+                    request_count,
+                    BoundedHttpResponseTruncated(method, target, response),
+                    mode="classic-http1",
+                )
         signal = verify_gpost_signal(baseline_response, attack_response, follow_up_response)
         http_evidence = {
             "version": 1,

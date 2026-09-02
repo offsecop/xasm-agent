@@ -4,6 +4,11 @@ set -e
 
 CONFIG_FILE="${CONFIG_FILE:-config.docker.yaml}"
 
+# An explicitly mounted corporate CA is installed before enrollment, polling,
+# scanners, or browser tools make outbound TLS connections. Sourcing preserves
+# the trust-related environment variables for the agent process below.
+. /app/scripts/configure_custom_ca.sh
+
 # Auto-generate config YAML if it doesn't exist.
 # Phase 3a (2026-05-16) collapsed per-agent configs into one shared config.docker.yaml.
 # Per-instance identity (WP4) comes from AGENT_CLIENT_ID/AGENT_CLIENT_SECRET +

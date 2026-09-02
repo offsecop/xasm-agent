@@ -21,7 +21,12 @@ from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 from urllib.parse import quote_plus, urljoin, urlsplit
 
 from plugin_interface import ToolPlugin
-from tools.web_request_smuggling_probe import read_http_response
+from tools.web_request_smuggling_probe import (
+    BoundedHttpResponseTruncated,
+    bounded_http_incomplete_result,
+    raise_for_truncated_http_response,
+    read_http_response,
+)
 
 
 MODE = "private-object-authz-differential-v1"
@@ -346,6 +351,15 @@ class WebGraphqlProbeTool(ToolPlugin):
                 "verification": verification,
                 "summary": {"requests": self._requests, "findings": 1, "fallback": False},
             }
+        except BoundedHttpResponseTruncated as exc:
+            return bounded_http_incomplete_result(
+                self.name,
+                target,
+                self._requests,
+                exc,
+                mode=MODE,
+                proof_level=proof_level,
+            )
         except (OSError, ConnectionError, TimeoutError, ValueError, ssl.SSLError, json.JSONDecodeError) as exc:
             return self._error(f"bounded GraphQL probe failed: {type(exc).__name__}", target)
 
@@ -616,16 +630,17 @@ class WebGraphqlProbeTool(ToolPlugin):
         try:
             writer.write(raw)
             await writer.drain()
-            response = await read_http_response(reader, self._timeout)
+            response = await read_http_response(
+                reader, self._timeout, max_body_bytes=self._max_body
+            )
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
             except (ConnectionError, ssl.SSLError):
                 pass
+        raise_for_truncated_http_response(method, url, response)
         response_body = str(response.get("body") or "")
-        if len(response_body.encode()) > self._max_body:
-            raise ValueError("response exceeded bounded body limit")
         return {
             "method": method, "url": url, "rawRequest": raw.decode("utf-8", "replace"),
             "status": int(response["status"]), "headerText": str(response.get("headerText") or ""),

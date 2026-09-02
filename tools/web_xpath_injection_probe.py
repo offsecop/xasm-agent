@@ -21,7 +21,12 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from plugin_interface import ToolPlugin
-from tools.web_request_smuggling_probe import read_http_response
+from tools.web_request_smuggling_probe import (
+    BoundedHttpResponseTruncated,
+    bounded_http_incomplete_result,
+    raise_for_truncated_http_response,
+    read_http_response,
+)
 
 
 MODE = "xpath-filter-differential-v1"
@@ -441,6 +446,15 @@ class WebXPathInjectionProbeTool(ToolPlugin):
                 "no stable XPath filter differential was proven",
                 [root_step, negative_step],
             )
+        except BoundedHttpResponseTruncated as exc:
+            return bounded_http_incomplete_result(
+                self.name,
+                target,
+                self._requests,
+                exc,
+                mode=MODE,
+                proof_level=proof_level,
+            )
         except Exception as exc:
             return self._error(str(exc)[:300], target)
 
@@ -591,16 +605,16 @@ class WebXPathInjectionProbeTool(ToolPlugin):
         try:
             writer.write(raw)
             await writer.drain()
-            response = await read_http_response(reader, self._timeout)
+            response = await read_http_response(
+                reader, self._timeout, max_body_bytes=self._max_body
+            )
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
             except (ConnectionError, ssl.SSLError):
                 pass
-        body_bytes = bytes(response.get("bodyBytes") or b"")
-        if len(body_bytes) > self._max_body:
-            raise ValueError("response exceeded bounded body limit")
+        raise_for_truncated_http_response("GET", url, response)
         response.update(
             {"url": url, "rawRequest": raw.decode("utf-8", "replace")}
         )

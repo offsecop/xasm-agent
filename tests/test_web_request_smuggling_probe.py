@@ -4,7 +4,9 @@ import re
 import pytest
 
 from tools.web_request_smuggling_probe import (
+    BoundedHttpResponseTruncated,
     RequestSmugglingProbeTool,
+    bounded_http_incomplete_result,
     build_cl_te_attack,
     build_http_evidence_step,
     build_nuclei_finding,
@@ -108,6 +110,60 @@ async def test_response_reader_preserves_status_headers_and_body():
     assert response["status"] == 403
     assert response["body"] == "Unrecognized method GPOST"
     assert ("Content-Type", "text/plain") in response["headers"]
+    assert response["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_response_reader_preserves_bounded_prefix_instead_of_raising():
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\n"
+        b"0123456789abcdefghij"
+    )
+    reader.feed_eof()
+
+    response = await read_http_response(reader, 3, max_body_bytes=8)
+
+    assert response["status"] == 200
+    assert response["body"] == "01234567"
+    assert response["bodyBytesRead"] == 8
+    assert response["advertisedBodyBytes"] == 20
+    assert response["truncated"] is True
+
+
+def test_truncated_response_becomes_non_retryable_incomplete_observation():
+    response = {
+        "status": 200,
+        "headers": [
+            ("Content-Type", "application/json"),
+            ("Set-Cookie", "session=must-not-leak"),
+        ],
+        "body": '{"password":"must-not-leak","value":"bounded"}',
+        "bodyBytes": b'{"password":"must-not-leak","value":"bounded"}',
+        "bodyBytesRead": 48,
+        "advertisedBodyBytes": 100_000,
+        "truncated": True,
+    }
+
+    result = bounded_http_incomplete_result(
+        "web:test_probe",
+        "https://lab.test/",
+        1,
+        BoundedHttpResponseTruncated("GET", "https://lab.test/", response),
+        mode="bounded-v1",
+    )
+
+    assert result["success"] is True
+    assert result["coverageStatus"] == "INCOMPLETE"
+    assert result["coverage"] == {
+        "stopReason": "RESPONSE_TRUNCATED",
+        "retryable": False,
+        "requestsRun": 1,
+    }
+    assert result["boundedResponse"]["bodyBytesRead"] == 48
+    assert result["boundedResponse"]["advertisedBodyBytes"] == 100_000
+    assert "must-not-leak" not in str(result)
+    assert "Set-Cookie" not in str(result["boundedResponse"]["headers"])
 
 
 def test_gpost_proof_requires_clean_baseline_and_follow_up_parser_error():

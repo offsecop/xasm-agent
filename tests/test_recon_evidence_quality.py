@@ -9,7 +9,10 @@ from tools.agentic_browser_map import (
     same_websocket_origin,
 )
 from tools.katana_crawl import (
+    KATANA_JSONL_RECORD_MAX_BYTES,
+    KATANA_RAW_EVIDENCE_MAX_BYTES,
     KatanaCrawlTool,
+    KatanaStreamCollector,
     bounded_katana_timeout,
     classify_katana_coverage,
     exact_origin_scope_options,
@@ -134,8 +137,9 @@ class _ReadableBytes:
     def __init__(self, value):
         self.value = value
 
-    async def read(self):
-        return self.value
+    async def read(self, *_args):
+        value, self.value = self.value, b""
+        return value
 
 
 class _TimedOutKatanaProcess:
@@ -160,6 +164,28 @@ async def _close_awaitable_and_raise_timeout(awaitable, **_kwargs):
 
 
 class KatanaMultiOriginQualityTests(unittest.IsolatedAsyncioTestCase):
+    def test_stream_collector_caps_raw_bytes_and_drops_one_oversized_record(self):
+        collector = KatanaStreamCollector("https://target.test/", 10)
+        oversized = b'{"response":{"body":"' + (
+            b"x" * KATANA_JSONL_RECORD_MAX_BYTES
+        ) + b'"}}\n'
+        valid = (
+            b'{"request":{"endpoint":"https://target.test/ok"},'
+            b'"response":{"status_code":200}}\n'
+        )
+
+        for offset in range(0, len(oversized + valid), 32_768):
+            collector.feed((oversized + valid)[offset:offset + 32_768])
+        collector.finish()
+
+        self.assertEqual(collector.urls, ["https://target.test/ok"])
+        self.assertEqual(collector.oversized_records, 1)
+        self.assertGreaterEqual(collector.records_dropped, 1)
+        self.assertLessEqual(
+            len(collector.raw_output().encode("utf-8")),
+            KATANA_RAW_EVIDENCE_MAX_BYTES,
+        )
+
     async def test_partial_origin_errors_are_preserved_with_usable_urls(self):
         good = (
             b'{"request":{"endpoint":"http://one.test/"},'
@@ -185,6 +211,8 @@ class KatanaMultiOriginQualityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn.call_count, 2)
         self.assertTrue(all(call.kwargs["start_new_session"] for call in spawn.call_args_list))
         self.assertEqual(register_group.call_count, 2)
+        self.assertTrue(all("-or" in call.args for call in spawn.call_args_list))
+        self.assertTrue(all("-ob" in call.args for call in spawn.call_args_list))
 
         self.assertEqual(output["coverageStatus"], "CONFIRMED")
         self.assertEqual(output["coverageReason"], "PARTIAL_URL_INVENTORY_OBSERVED")
@@ -218,6 +246,8 @@ class KatanaMultiOriginQualityTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        self.assertIn("-or", spawn.call_args.args)
+        self.assertIn("-ob", spawn.call_args.args)
         register_group.assert_called_once_with(process)
         terminate_group.assert_awaited_once_with(process)
         self.assertEqual(output["coverageStatus"], "CONFIRMED")
