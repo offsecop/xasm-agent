@@ -10,15 +10,31 @@ coordinator.
 import asyncio
 import json
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urljoin, urlparse
 
 import aiohttp
 
 from plugin_interface import ToolPlugin
+from tools._browser_scoped_context import (
+    BrowserCoverageIncomplete,
+    ScopedBrowserContext,
+    attach_auth_loss_watch,
+    browser_origin_policy,
+    browser_scope_metadata,
+    create_scoped_browser_context,
+    has_browser_auth_material,
+    incomplete_output,
+    validate_authenticated_navigation,
+)
+from tools._browser_spa_traversal import (
+    enforce_public_output_cap,
+    merge_incomplete_output,
+    spa_traversal_budget,
+    traverse_bounded_spa,
+)
 from tools._agentic_exploration_common import (
     NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
-    RISKY_CLICK_WORDS,
     build_native_probe_form_contract,
     dedupe_keep_order,
     discover_site_metadata_urls,
@@ -44,7 +60,7 @@ class BrowserTrafficCaptureTool(ToolPlugin):
     @property
     def description(self) -> str:
         return (
-            "Uses a headless browser to capture same-origin XHR/fetch/API traffic, "
+            "Uses a headless browser to capture exact-authorized-origin XHR/fetch/API traffic, "
             "storage keys, cookies, and parameterized endpoints for follow-up API "
             "access-control and IDOR probes."
         )
@@ -57,7 +73,10 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                 "target": {"type": "string"},
                 "url": {"type": "string"},
                 "maxInteractions": {"type": "integer", "default": 14},
+                "maxPages": {"type": "integer", "default": 12},
+                "maxDepth": {"type": "integer", "default": 3},
                 "timeoutSeconds": {"type": "integer", "default": 60},
+                "maxOutputBytes": {"type": "integer", "default": 49152},
                 "safeInteract": {"type": "boolean", "default": True},
                 "fillSearchInputs": {"type": "boolean", "default": True},
                 "searchTerms": {"type": "array", "items": {"type": "string"}, "default": ["juice", "test", "admin"]},
@@ -65,6 +84,12 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                 "maxBodyBytes": {"type": "integer", "default": 12000},
                 "cookie": {"type": "string"},
                 "authCookies": {"type": "string"},
+                "cookieJar": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "x-hidden": True,
+                    "x-workflow-owned": True,
+                },
                 "headers": {"type": "object"},
                 "authHeaders": {"type": "object"},
             },
@@ -87,10 +112,18 @@ class BrowserTrafficCaptureTool(ToolPlugin):
         target = normalize_url(parameters.get("target") or parameters.get("url"))
         if not target:
             return {"success": False, "error": "target is required", "target": target}
+        try:
+            browser_origin_policy(parameters, target)
+        except BrowserCoverageIncomplete as exc:
+            return incomplete_output(target, exc)
 
         agent = parameters.get("_agent")
         timeout_seconds = max(15, min(int(parameters.get("timeoutSeconds") or 60), 180))
-        max_interactions = max(0, min(int(parameters.get("maxInteractions") or 14), 60))
+        budget = spa_traversal_budget(
+            parameters,
+            default_interactions=14,
+            default_timeout_seconds=timeout_seconds,
+        )
         max_requests = max(20, min(int(parameters.get("maxRequests") or 250), 1000))
         max_body_bytes = max(1000, min(int(parameters.get("maxBodyBytes") or 12000), 80000))
 
@@ -104,23 +137,32 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             return await self._http_fallback(target, parameters, f"Playwright unavailable: {exc}")
 
         browser = None
+        scoped = None
+        page = None
+        navigation = None
         records: List[Dict[str, Any]] = []
         request_meta: Dict[int, Dict[str, Any]] = {}
         response_tasks: List[asyncio.Task] = []
+        capture_state = {"omittedRequests": 0}
 
         def record_request(request: Any) -> None:
             if len(records) >= max_requests:
                 return
             try:
                 url = str(request.url)
-                if not same_origin(target, url) and not self._looks_api(url):
+                if scoped is None or not scoped.url_is_authorized(url):
                     return
+                try:
+                    route_url = str(request.frame.url or "")
+                except Exception:
+                    route_url = ""
                 meta = {
                     "method": str(request.method or "GET").upper(),
                     "url": url,
                     "resourceType": str(request.resource_type or ""),
                     "requestHeaders": redact_headers(dict(request.headers or {})),
                     "postDataSample": self._redact_text(request.post_data or "")[:1000],
+                    "routeUrl": route_url if same_origin(target, route_url) else str(getattr(page, "url", target)),
                 }
                 request_meta[id(request)] = meta
             except Exception:
@@ -128,11 +170,12 @@ class BrowserTrafficCaptureTool(ToolPlugin):
 
         async def record_response(response: Any) -> None:
             if len(records) >= max_requests:
+                capture_state["omittedRequests"] += 1
                 return
             try:
                 request = response.request
                 url = str(response.url)
-                if not same_origin(target, url):
+                if scoped is None or not scoped.url_is_authorized(url):
                     return
                 method = str(request.method or "GET").upper()
                 resource_type = str(request.resource_type or "")
@@ -172,7 +215,11 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                     "requestSample": meta.get("postDataSample", ""),
                     "responseSample": body_sample[:2500],
                     "apiLike": self._looks_api(url),
+                    "routeUrl": meta.get("routeUrl") or str(getattr(page, "url", target)),
                 }
+                if len(records) >= max_requests:
+                    capture_state["omittedRequests"] += 1
+                    return
                 records.append(record)
             except Exception:
                 return
@@ -180,61 +227,118 @@ class BrowserTrafficCaptureTool(ToolPlugin):
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                context = await browser.new_context(ignore_https_errors=True, extra_http_headers=parse_headers(parameters))
+                scoped = await create_scoped_browser_context(browser, target, parameters)
+                context = scoped.context
                 page = await context.new_page()
+                attach_auth_loss_watch(scoped, page)
                 page.set_default_timeout(timeout_seconds * 1000)
                 page.on("request", record_request)
                 page.on("response", lambda response: response_tasks.append(asyncio.create_task(record_response(response))))
 
-                await page.goto(target, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+                navigation = await page.goto(
+                    target,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_seconds * 1000,
+                )
+                await validate_authenticated_navigation(scoped, page, navigation, target)
                 await self._quiet_network(page, timeout_seconds)
 
-                if bool(parameters.get("fillSearchInputs", True)):
-                    await self._exercise_search_inputs(page, parameters)
-                    await self._quiet_network(page, min(timeout_seconds, 20))
-
-                if bool(parameters.get("safeInteract", True)) and max_interactions > 0:
-                    await self._safe_interactions(page, target, max_interactions)
-                    await self._quiet_network(page, min(timeout_seconds, 20))
+                search_terms = parameters.get("searchTerms")
+                search_term = (
+                    str(search_terms[0])[:80]
+                    if isinstance(search_terms, list) and search_terms
+                    else "test"
+                )
+                traversal = await traverse_bounded_spa(
+                    page,
+                    scoped,
+                    target,
+                    budget,
+                    root_navigation=navigation,
+                    safe_interact=bool(parameters.get("safeInteract", True)),
+                    fill_search_inputs=bool(parameters.get("fillSearchInputs", True)),
+                    search_term=search_term,
+                )
 
                 if response_tasks:
                     await asyncio.gather(*response_tasks, return_exceptions=True)
 
                 storage = await self._storage_summary(page)
-                html_map = await page.evaluate(
-                    """() => ({
-                      title: document.title || '',
-                      url: location.href,
-                      forms: Array.from(document.forms).map(f => ({
-                        action: new URL(f.getAttribute('action') || location.href, location.href).href,
-                        method: (f.getAttribute('method') || 'GET').toUpperCase(),
-                        contentType: (f.getAttribute('enctype') || 'application/x-www-form-urlencoded').toLowerCase(),
-                        fields: Array.from(f.querySelectorAll('input, textarea, select')).map(i => ({
-                          name: i.getAttribute('name') || i.id || '',
-                          type: (i.getAttribute('type') || i.tagName || 'text').toLowerCase(),
-                          value: (!['checkbox', 'radio'].includes((i.getAttribute('type') || '').toLowerCase()) || i.checked)
-                            ? String(i.value || '').slice(0, 4096)
-                            : null,
-                          valueSource: i.tagName === 'SELECT' ? 'selected-option' : 'browser-default'
-                        })).filter(i => i.name || ['password','email','search','file'].includes(i.type)),
-                      })).slice(0, 100)
-                    })"""
-                )
                 form_contract = build_native_probe_form_contract(
-                    html_map.get("forms", []),
+                    traversal.get("forms", []),
                     source="browser:traffic_capture",
                 )
-                html_map["forms"] = form_contract["forms"]
-                html_map[NATIVE_PROBE_PRIVATE_CANDIDATES_KEY] = form_contract[
+                for public_form, observed_form in zip(
+                    form_contract["forms"],
+                    traversal.get("forms", []),
+                ):
+                    public_form["routeUrl"] = observed_form.get("routeUrl")
+                traversal["forms"] = form_contract["forms"]
+                traversal[NATIVE_PROBE_PRIVATE_CANDIDATES_KEY] = form_contract[
                     NATIVE_PROBE_PRIVATE_CANDIDATES_KEY
                 ]
                 await context.close()
                 await close_browser_safe(browser)
 
-            output = self._build_output(target, html_map, records, storage, agent)
-            await self._enrich_with_site_metadata(output, target, parameters)
-            return output
+            output = self._build_output(
+                target,
+                traversal,
+                records,
+                storage,
+                agent,
+                omitted_requests=int(capture_state["omittedRequests"]),
+                scope_metadata=scoped.scope_metadata(),
+            )
+            # Authenticated browser material stays inside the native Playwright
+            # cookie jar/header context.  Do not replay it through aiohttp,
+            # whose redirect semantics are outside the exact-origin router.
+            if not has_browser_auth_material(parameters):
+                await self._enrich_with_site_metadata(
+                    output,
+                    target,
+                    parameters,
+                    scoped,
+                )
+            return enforce_public_output_cap(
+                output,
+                budget.max_output_bytes,
+                removable_lists=(
+                    "xhrRequests",
+                    "siteMapUrls",
+                    "parameterizedUrls",
+                    "linkObservations",
+                    "scriptObservations",
+                    "visitedStates",
+                    "routes",
+                    "apiEndpoints",
+                    "forms",
+                ),
+                private_keys=(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,),
+            )
+        except BrowserCoverageIncomplete as exc:
+            await close_browser_safe(browser)
+            return merge_incomplete_output(
+                incomplete_output(
+                    target,
+                    exc,
+                    final_url=getattr(page, "url", None),
+                    status=getattr(navigation, "status", None),
+                    scoped=scoped,
+                ),
+                exc,
+            )
         except Exception as exc:
+            if scoped and scoped.authenticated and scoped.blocked_navigation_urls:
+                await close_browser_safe(browser)
+                return incomplete_output(
+                    target,
+                    BrowserCoverageIncomplete(
+                        "AUTHENTICATION_LOST_REDIRECT",
+                        "authenticated navigation redirected outside the authorized origin",
+                    ),
+                    final_url=getattr(page, "url", None),
+                    scoped=scoped,
+                )
             await close_browser_safe(browser)
             return await self._http_fallback(target, parameters, f"browser traffic capture failed: {exc}")
 
@@ -243,56 +347,6 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             await page.wait_for_load_state("networkidle", timeout=max(3000, min(timeout_seconds * 1000, 12000)))
         except Exception:
             await page.wait_for_timeout(1200)
-
-    async def _exercise_search_inputs(self, page: Any, parameters: Dict[str, Any]) -> None:
-        search_terms = parameters.get("searchTerms")
-        if not isinstance(search_terms, list) or not search_terms:
-            search_terms = ["juice", "test", "admin"]
-        term = str(search_terms[0])[:80]
-        selectors = [
-            'input[type="search"]',
-            'input[name*="search" i]',
-            'input[id*="search" i]',
-            'input[placeholder*="search" i]',
-            'input[name="q"]',
-            'input[name="query"]',
-        ]
-        for selector in selectors:
-            try:
-                locator = page.locator(selector).first
-                if await locator.count() == 0:
-                    continue
-                await locator.fill(term, timeout=1200)
-                await locator.press("Enter", timeout=1200)
-                return
-            except Exception:
-                continue
-
-    async def _safe_interactions(self, page: Any, target: str, max_interactions: int) -> None:
-        clicked = 0
-        locators = await page.locator("button, [role=button], a").all()
-        for locator in locators[: max_interactions * 4]:
-            if clicked >= max_interactions:
-                break
-            try:
-                label = (await locator.inner_text(timeout=700)).strip()[:120]
-                href = await locator.get_attribute("href", timeout=700)
-                lowered = label.lower()
-                if any(word in lowered for word in RISKY_CLICK_WORDS):
-                    continue
-                if href and not href.startswith("#") and not same_origin(target, urljoin(page.url, href)):
-                    continue
-                before_url = page.url
-                await locator.click(timeout=1300, no_wait_after=True)
-                clicked += 1
-                await page.wait_for_timeout(600)
-                if page.url != before_url and same_origin(target, page.url):
-                    try:
-                        await page.go_back(wait_until="domcontentloaded", timeout=3000)
-                    except Exception:
-                        pass
-            except Exception:
-                continue
 
     async def _storage_summary(self, page: Any) -> Dict[str, Any]:
         try:
@@ -320,11 +374,117 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             return {"localStorage": [], "sessionStorage": [], "cookieCount": 0, "cookieNames": []}
 
     async def _http_fallback(self, target: str, parameters: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        policy = browser_origin_policy(parameters, target)
+        if has_browser_auth_material(parameters):
+            return incomplete_output(
+                target,
+                BrowserCoverageIncomplete(
+                    "BROWSER_REQUIRED_FOR_NATIVE_COOKIE_SESSION",
+                    "Playwright is required to preserve authenticated cookie semantics",
+                ),
+            )
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=30)) as session:
-            fetched = await fetch_text(session, target, headers=parse_headers(parameters), max_bytes=900_000)
+            current_url = target
+            fetched = None
+            redirects: List[str] = []
+            for _ in range(6):
+                fetched = await fetch_text(
+                    session,
+                    current_url,
+                    headers=parse_headers(parameters),
+                    max_bytes=900_000,
+                    allow_redirects=False,
+                )
+                status = int(fetched.get("status") or 0)
+                response_headers = fetched.get("headers") or {}
+                location = next(
+                    (
+                        value
+                        for key, value in response_headers.items()
+                        if str(key).lower() == "location"
+                    ),
+                    None,
+                )
+                if status not in {301, 302, 303, 307, 308} or not location:
+                    break
+                next_url = urljoin(current_url, str(location))
+                if not policy.url_is_primary(next_url):
+                    output = incomplete_output(
+                        target,
+                        BrowserCoverageIncomplete(
+                            "CROSS_ORIGIN_REDIRECT_BLOCKED",
+                            "redirect left the authorized origin",
+                        ),
+                        final_url=current_url,
+                        status=status,
+                    )
+                    output["scopeMetadata"] = browser_scope_metadata(
+                        policy,
+                        blocked_urls=[next_url],
+                        blocked_navigation_count=1,
+                    )
+                    return output
+                redirects.append(next_url)
+                current_url = next_url
+            else:
+                return incomplete_output(
+                    target,
+                    BrowserCoverageIncomplete(
+                        "REDIRECT_LIMIT_EXCEEDED",
+                        "same-origin redirect limit exceeded",
+                    ),
+                    final_url=current_url,
+                )
+        assert fetched is not None
         mapped = extract_html_map(fetched.get("text", ""), fetched.get("url") or target)
-        site_map_urls = await discover_site_metadata_urls(session, target, headers=parse_headers(parameters), max_urls=500)
+        blocked_urls = []
+        for key in ("links", "scripts", "stylesheets", "parameterizedUrls"):
+            values = list(mapped.get(key) or [])
+            mapped[key] = [value for value in values if policy.url_is_authorized(str(value))]
+            blocked_urls.extend(
+                str(value) for value in values if not policy.url_is_authorized(str(value))
+            )
+        forms = list(mapped.get("forms") or [])
+        mapped["forms"] = [
+            form
+            for form in forms
+            if isinstance(form, dict)
+            and policy.url_is_authorized(str(form.get("action") or ""))
+        ]
+        blocked_urls.extend(
+            str(form.get("action") or "")
+            for form in forms
+            if isinstance(form, dict)
+            and not policy.url_is_authorized(str(form.get("action") or ""))
+        )
+        private_candidates = list(
+            mapped.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY) or []
+        )
+        mapped[NATIVE_PROBE_PRIVATE_CANDIDATES_KEY] = [
+            candidate
+            for candidate in private_candidates
+            if isinstance(candidate, dict)
+            and policy.url_is_authorized(str(candidate.get("url") or ""))
+        ]
+        # Authenticated fallback is rejected above. Metadata discovery here is
+        # anonymous and therefore cannot leak session headers on redirects.
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=25)) as session:
+            site_map_urls = await discover_site_metadata_urls(
+                session,
+                target,
+                headers=parse_headers(parameters),
+                max_urls=500,
+            )
+        blocked_urls.extend(
+            str(value)
+            for value in site_map_urls
+            if not policy.url_is_authorized(str(value))
+        )
+        site_map_urls = [
+            value for value in site_map_urls if policy.url_is_authorized(str(value))
+        ]
         api_links = [url for url in mapped.get("links", []) + mapped.get("scripts", []) if self._looks_api(url)]
         api_endpoints = [self._endpoint_from_url("GET", url, None) for url in dedupe_keep_order(api_links, 80)]
         parameterized_urls = [
@@ -349,6 +509,10 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                 [],
             ),
             "storage": {"localStorage": [], "sessionStorage": [], "cookieCount": 0, "cookieNames": []},
+            "scopeMetadata": browser_scope_metadata(
+                policy,
+                blocked_urls=blocked_urls,
+            ),
             "summary": {
                 "apiEndpoints": len(api_endpoints),
                 "xhrRequests": 0,
@@ -366,9 +530,13 @@ class BrowserTrafficCaptureTool(ToolPlugin):
         records: List[Dict[str, Any]],
         storage: Dict[str, Any],
         agent: Any,
+        *,
+        omitted_requests: int = 0,
+        scope_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        same_origin_records = [r for r in records if same_origin(target, str(r.get("url") or ""))]
-        xhr_requests = [r for r in same_origin_records if r.get("resourceType") in {"xhr", "fetch"} or r.get("apiLike")]
+        xhr_requests = self._dedupe_records(
+            [r for r in records if r.get("resourceType") in {"xhr", "fetch"} or r.get("apiLike")]
+        )
         endpoint_keys = []
         endpoints = []
         for record in xhr_requests:
@@ -393,10 +561,13 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             recommendations.append("Inspect token-like storage keys during authenticated testing; do not expose token values in reports.")
 
         output = {
-            "success": True,
+            "success": html_map.get("coverageStatus") != "INCOMPLETE",
+            "coverageStatus": html_map.get("coverageStatus"),
+            "coverageReason": html_map.get("coverageReason"),
+            "verified": html_map.get("coverageStatus") != "INCOMPLETE",
             "target": target,
-            "finalUrl": html_map.get("url"),
-            "title": html_map.get("title"),
+            "finalUrl": (html_map.get("visitedStates") or [{}])[-1].get("routeUrl"),
+            "title": (html_map.get("visitedStates") or [{}])[0].get("title"),
             "apiEndpoints": endpoints[:300],
             "xhrRequests": xhr_requests[:300],
             "siteMapUrls": [],
@@ -407,6 +578,34 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                 [],
             ),
             "storage": storage,
+            "visitedStates": html_map.get("visitedStates", []),
+            "routes": list(
+                dict.fromkeys(
+                    str(item.get("routeUrl") or "")
+                    for item in html_map.get("visitedStates", [])
+                    if item.get("routeUrl")
+                )
+            ),
+            "linkObservations": html_map.get("linkObservations", []),
+            "scriptObservations": html_map.get("scriptObservations", []),
+            "scopeMetadata": scope_metadata or {},
+            "coverage": {
+                key: html_map.get(key)
+                for key in (
+                    "exhaustiveWithinBounds",
+                    "truncated",
+                    "truncatedBy",
+                    "omittedStates",
+                    "omittedArtifacts",
+                    "pagesObserved",
+                    "interactionsUsed",
+                    "interactionFailures",
+                    "candidatesObserved",
+                    "elapsedMs",
+                    "artifactBytes",
+                    "budget",
+                )
+            },
             "summary": {
                 "apiEndpoints": len(endpoints),
                 "xhrRequests": len(xhr_requests),
@@ -416,9 +615,30 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                 "localStorageKeys": len(storage.get("localStorage", [])),
                 "sessionStorageKeys": len(storage.get("sessionStorage", [])),
                 "cookieNames": len(storage.get("cookieNames", [])),
+                "visitedStates": html_map.get("pagesObserved", 0),
+                "routes": len(
+                    {
+                        str(item.get("routeUrl") or "")
+                        for item in html_map.get("visitedStates", [])
+                        if item.get("routeUrl")
+                    }
+                ),
+                "interactions": html_map.get("interactionsUsed", 0),
+                "truncated": bool(html_map.get("truncated")) or omitted_requests > 0,
+                "omittedStates": html_map.get("omittedStates", 0),
+                "omittedRequests": omitted_requests,
             },
             "recommendations": recommendations,
         }
+        if omitted_requests:
+            output["coverage"]["truncated"] = True
+            output["coverage"]["exhaustiveWithinBounds"] = False
+            truncated_by = output["coverage"].setdefault("truncatedBy", [])
+            if "maxRequests" not in truncated_by:
+                truncated_by.append("maxRequests")
+            if output["coverageStatus"] != "INCOMPLETE":
+                output["coverageStatus"] = "CONFIRMED"
+                output["coverageReason"] = "BOUNDED_SPA_CAP_REACHED"
         if agent:
             summary = output["summary"]
             agent.append_output(
@@ -427,7 +647,41 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             agent.report_progress("Browser API traffic capture completed", target, 1, 1)
         return output
 
-    async def _enrich_with_site_metadata(self, output: Dict[str, Any], target: str, parameters: Dict[str, Any]) -> None:
+    def _dedupe_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped: List[Dict[str, Any]] = []
+        by_key: Dict[str, Dict[str, Any]] = {}
+        for record in records:
+            key = json.dumps(
+                [
+                    record.get("method"),
+                    record.get("url"),
+                    record.get("status"),
+                    record.get("resourceType"),
+                    record.get("requestBodyKeys"),
+                    record.get("responseKeys"),
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            route_url = str(record.get("routeUrl") or "")
+            if key in by_key:
+                routes = by_key[key].setdefault("observedAtRoutes", [])
+                if route_url and route_url not in routes:
+                    routes.append(route_url)
+                continue
+            row = dict(record)
+            row["observedAtRoutes"] = [route_url] if route_url else []
+            by_key[key] = row
+            deduped.append(row)
+        return deduped
+
+    async def _enrich_with_site_metadata(
+        self,
+        output: Dict[str, Any],
+        target: str,
+        parameters: Dict[str, Any],
+        scoped: ScopedBrowserContext,
+    ) -> None:
         connector = aiohttp.TCPConnector(ssl=False)
         try:
             async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=25)) as session:
@@ -439,6 +693,19 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                 )
         except Exception:
             site_map_urls = []
+        rejected = [
+            value
+            for value in site_map_urls
+            if not scoped.url_is_authorized(str(value))
+        ]
+        for value in rejected:
+            scoped.note_blocked_url(str(value))
+        site_map_urls = [
+            value
+            for value in site_map_urls
+            if scoped.url_is_authorized(str(value))
+        ]
+        output["scopeMetadata"] = scoped.scope_metadata()
         if not site_map_urls:
             return
         output["siteMapUrls"] = site_map_urls
@@ -465,6 +732,7 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             "contentType": record.get("contentType") if record else None,
             "requestBodyKeys": record.get("requestBodyKeys") if record else [],
             "responseKeys": record.get("responseKeys") if record else [],
+            "observedAtRoutes": record.get("observedAtRoutes") if record else [],
             "sensitiveHint": self._sensitive_hint(url),
         }
 
