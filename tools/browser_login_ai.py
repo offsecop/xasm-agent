@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 from plugin_interface import ToolPlugin
+from tools._browser_scoped_context import normalize_browser_cookie
 
 
 def _coerce_float(value: Any, default: float) -> float:
@@ -555,6 +556,33 @@ def filter_login_cookies(
     return out
 
 
+def serialize_login_cookie_jar(cookies: List[dict], login_url: str) -> List[dict]:
+    """Retain only safe Playwright cookie attributes for encrypted reuse.
+
+    Full storage state is deliberately excluded. Cookie values remain opaque
+    (including embedded ``=``), while malformed names and CR/LF/NUL injection
+    are dropped before the result crosses the agent boundary.
+    """
+
+    serialized: List[dict] = []
+    for raw in cookies or []:
+        normalized = normalize_browser_cookie(raw, login_url)
+        if normalized is None:
+            continue
+        row = {
+            "name": normalized["name"],
+            "value": normalized["value"],
+            "domain": normalized.get("domain", ""),
+            "path": normalized.get("path", "/"),
+            "secure": bool(normalized.get("secure", False)),
+            "httpOnly": bool(normalized.get("httpOnly", False)),
+            "sameSite": normalized.get("sameSite"),
+            "expiry": normalized.get("expires"),
+        }
+        serialized.append({key: value for key, value in row.items() if value is not None})
+    return serialized
+
+
 def looks_like_login_url(url: Optional[str]) -> bool:
     """Best-effort guard against using a login page as the validation target."""
     if not url:
@@ -611,6 +639,178 @@ def normalize_protected_resource_url(
             "session validation will rely on post-login state instead."
         ),
     )
+
+
+def select_login_entry_url(login_url: str, protected_resource_url: Optional[str]) -> str:
+    """Start SSO at the relying party so the IdP can return to the right app."""
+    candidate = (protected_resource_url or "").strip()
+    return candidate or login_url
+
+
+def needs_local_network_auth_retry(
+    current_url: str,
+    login_url: str,
+    protected_resource_url: Optional[str],
+    failed_request_urls: List[str],
+    visible_login_inputs: int,
+) -> bool:
+    """Detect a Chromium Local Network Access block during RP-initiated SSO.
+
+    Chrome 142+ denies headless permission prompts.  Corporate QA deployments
+    commonly serve the relying party publicly while their configured IdP
+    resolves to an RFC1918 address.  Only retry when the still-loaded relying
+    party made a failed request to the exact configured IdP host and no login
+    form became available.  The recovery then grants the relying-party origin
+    (not every origin) the browser's ``local-network-access`` permission.
+    """
+    protected_origin = _normalized_origin(protected_resource_url)
+    login_origin = _normalized_origin(login_url)
+    current_origin = _normalized_origin(current_url)
+    login_host = _url_host(login_url).lower()
+
+    if (
+        not protected_origin
+        or not login_origin
+        or protected_origin == login_origin
+        or current_origin != protected_origin
+        or visible_login_inputs > 0
+        or not login_host
+    ):
+        return False
+
+    return any(_url_host(url).lower() == login_host for url in failed_request_urls)
+
+
+async def wait_for_local_network_auth_retry_signal(
+    page,
+    *,
+    login_url: str,
+    protected_resource_url: Optional[str],
+    failed_request_urls: List[str],
+    wait_ms: int = 8000,
+    poll_interval_ms: int = 500,
+) -> bool:
+    """Wait briefly for an asynchronous SPA IdP bootstrap failure.
+
+    Some relying-party SPAs start OIDC discovery several seconds after
+    ``DOMContentLoaded``.  Checking ``requestfailed`` only once races that
+    bootstrap and leaves the agent analysing a blank page as if it were a
+    login form.  Keep the wait bounded and stop as soon as the page redirects,
+    exposes a login field, or renders meaningful visible content.
+    """
+    protected_origin = _normalized_origin(protected_resource_url)
+    login_origin = _normalized_origin(login_url)
+    if (
+        not protected_origin
+        or not login_origin
+        or protected_origin == login_origin
+        or wait_ms <= 0
+    ):
+        return False
+
+    waited_ms = 0
+    poll_interval_ms = max(100, min(poll_interval_ms, wait_ms))
+    while True:
+        visible_login_inputs = await count_visible_login_inputs(page)
+        if needs_local_network_auth_retry(
+            page.url or "",
+            login_url,
+            protected_resource_url,
+            failed_request_urls,
+            visible_login_inputs,
+        ):
+            return True
+
+        if (
+            _normalized_origin(page.url or "") != protected_origin
+            or visible_login_inputs > 0
+        ):
+            return False
+
+        try:
+            body_text = await page.locator("body").inner_text(timeout=500)
+            if len(" ".join((body_text or "").split())) > 120:
+                return False
+        except Exception:
+            pass
+
+        if waited_ms >= wait_ms:
+            return False
+
+        delay_ms = min(poll_interval_ms, wait_ms - waited_ms)
+        await page.wait_for_timeout(delay_ms)
+        waited_ms += delay_ms
+
+
+async def recover_local_network_auth_bootstrap(
+    context,
+    page,
+    *,
+    login_url: str,
+    protected_resource_url: Optional[str],
+    failed_request_urls: List[str],
+    page_load_strategy: str,
+    load_timeout_ms: int,
+    settle_ms: int,
+    bootstrap_wait_ms: int = 8000,
+    bootstrap_poll_interval_ms: int = 500,
+) -> bool:
+    """Retry an RP bootstrap with an origin-scoped LNA permission grant."""
+    visible_login_inputs = await count_visible_login_inputs(page)
+    retry_required = needs_local_network_auth_retry(
+        page.url or "",
+        login_url,
+        protected_resource_url,
+        failed_request_urls,
+        visible_login_inputs,
+    )
+    if not retry_required:
+        retry_required = await wait_for_local_network_auth_retry_signal(
+            page,
+            login_url=login_url,
+            protected_resource_url=protected_resource_url,
+            failed_request_urls=failed_request_urls,
+            wait_ms=bootstrap_wait_ms,
+            poll_interval_ms=bootstrap_poll_interval_ms,
+        )
+    if not retry_required:
+        return False
+
+    protected_origin = _normalized_origin(protected_resource_url)
+    try:
+        await context.grant_permissions(
+            ["local-network-access"],
+            origin=protected_origin,
+        )
+        print(
+            "[AI Login] Detected blocked corporate IdP bootstrap; granted "
+            f"origin-scoped local-network-access to {protected_origin} and retrying"
+        )
+        await page.reload(
+            wait_until=page_load_strategy,
+            timeout=load_timeout_ms,
+        )
+        if settle_ms > 0:
+            await page.wait_for_timeout(settle_ms)
+        print(
+            "[AI Login] Corporate IdP bootstrap retry completed; current URL: "
+            f"{_safe_url_for_error(page.url or '')}"
+        )
+        return True
+    except Exception as exc:
+        print(
+            "[AI Login] Origin-scoped local-network-access recovery was unavailable: "
+            f"{exc.__class__.__name__}"
+        )
+        return False
+
+
+def resolve_page_load_strategy(parameters: Dict[str, Any]) -> str:
+    """Use a bounded page milestone by default; SPAs may never become network-idle."""
+    strategy = parameters.get('pageLoadStrategy', 'domcontentloaded')
+    if strategy not in ('commit', 'domcontentloaded', 'load', 'networkidle'):
+        return 'domcontentloaded'
+    return strategy
 
 
 # ---------------------------------------------------------------------------
@@ -3049,6 +3249,16 @@ class BrowserLoginAiTool(ToolPlugin):
                     "type": "string",
                     "description": "Natural language instructions for AI (auto-injected from credentials)"
                 },
+                "protectedResourceUrl": {
+                    "type": "string",
+                    "description": "Protected application URL used to initiate and validate an SSO flow"
+                },
+                "pageLoadStrategy": {
+                    "type": "string",
+                    "enum": ["commit", "domcontentloaded", "load", "networkidle"],
+                    "default": "domcontentloaded",
+                    "description": "Playwright navigation milestone (defaults to domcontentloaded)"
+                },
                 "loginFlow": {
                     "type": "string",
                     "description": "UI-selected login flow hint (AI_PASSWORD, AI_ASSISTED_SSO, MICROSOFT_SSO, GOOGLE_SSO, OKTA_SSO)"
@@ -3317,7 +3527,15 @@ class BrowserLoginAiTool(ToolPlugin):
             if dropped > 0:
                 print(f"[AI Login] Filtered out {dropped} non-session/cross-domain cookie(s) before artifact generation.")
 
-            if not filtered_cookies:
+            cookie_jar = serialize_login_cookie_jar(filtered_cookies, login_url)
+            rejected_cookie_count = len(filtered_cookies) - len(cookie_jar)
+            if rejected_cookie_count > 0:
+                print(
+                    f"[AI Login] Rejected {rejected_cookie_count} malformed cookie(s) "
+                    "before session persistence."
+                )
+
+            if not cookie_jar:
                 return {
                     'success': False,
                     'status': 'FAILED',
@@ -3336,7 +3554,7 @@ class BrowserLoginAiTool(ToolPlugin):
             # in localStorage in plaintext). The downstream scanners only
             # need the cookie string; storage_state is intentionally dropped.
             artifacts = self._generate_artifacts(
-                cookies=filtered_cookies,
+                cookies=cookie_jar,
                 storage_state={}
             )
 
@@ -3350,7 +3568,7 @@ class BrowserLoginAiTool(ToolPlugin):
                 )
 
             # Generate inline cookies string for auto-injection to subsequent steps
-            cookies_string = '; '.join([f"{c['name']}={c['value']}" for c in filtered_cookies])
+            cookies_string = '; '.join([f"{c['name']}={c['value']}" for c in cookie_jar])
 
             result = {
                 'success': True,
@@ -3360,10 +3578,13 @@ class BrowserLoginAiTool(ToolPlugin):
                 'cookies_file': artifacts['cookies_file'],
                 'secrets_file': artifacts['secrets_file'],
                 'cookies': cookies_string,  # Inline cookies for auto-injection (Phase 3)
+                # Raw values are captured server-side into encrypted
+                # SessionData and removed from durable Job/trace/LLM output.
+                'cookieJar': cookie_jar,
                 'session_valid': True,
                 'cookies_list': [
                     {'name': c['name'], 'domain': c.get('domain', '')}
-                    for c in filtered_cookies
+                    for c in cookie_jar
                 ],
                 'protected_resource_url': protected_resource_url,
                 'original_protected_resource_url': original_protected_resource_url,
@@ -3455,20 +3676,16 @@ class BrowserLoginAiTool(ToolPlugin):
                 mfa_auto_fill_timeout = min(mfa_auto_fill_timeout, 5)
                 mfa_max_rounds = min(mfa_max_rounds, 1)
                 # 25s was too tight for a cold browser navigating a real
-                # OIDC login over a corporate VPN (observed timeouts on
-                # login.uat.questrade.com). 60s keeps the smoke test fast while
-                # tolerating cold-start + redirect latency.
+                # OIDC login over a corporate network. 60s keeps the smoke test
+                # fast while tolerating cold-start + redirect latency.
                 timeout_seconds = min(timeout_seconds, 60)
-            page_load_strategy = parameters.get(
-                'pageLoadStrategy',
-                'domcontentloaded' if login_test_mode else 'networkidle',
-            )
-            if page_load_strategy not in ('commit', 'domcontentloaded', 'load', 'networkidle'):
-                page_load_strategy = 'domcontentloaded' if login_test_mode else 'networkidle'
+            page_load_strategy = resolve_page_load_strategy(parameters)
             post_submit_wait_ms = int(parameters.get('postSubmitWaitMs', 1000 if login_test_mode else 2000))
             post_submit_load_timeout_ms = int(parameters.get('postSubmitLoadTimeoutMs', 3000 if login_test_mode else 15000))
             llm_timeout_seconds = int(parameters.get('llmTimeoutSeconds', 15 if login_test_mode else 75))
-            initial_render_wait_ms = int(parameters.get('initialRenderWaitMs', 1000 if login_test_mode else 0))
+            # `domcontentloaded` avoids indefinite waits on chatty SPAs; a short,
+            # deterministic render settle still gives client-side forms time to mount.
+            initial_render_wait_ms = int(parameters.get('initialRenderWaitMs', 1000))
 
             print(
                 "[AI Login] Config: "
@@ -3567,11 +3784,7 @@ class BrowserLoginAiTool(ToolPlugin):
 
             start_time = time.time()
             actions_count = 0
-            entry_url = (
-                protected_resource_url
-                if protected_resource_url and interactive_mfa
-                else login_url
-            )
+            entry_url = select_login_entry_url(login_url, protected_resource_url)
             interactive_browser_cdp_url = get_interactive_browser_cdp_url(parameters)
             use_trusted_interactive_browser = bool(
                 interactive_browser_cdp_url and sso_provider == "google"
@@ -3655,6 +3868,19 @@ class BrowserLoginAiTool(ToolPlugin):
                         """
                     )
                     page = await context.new_page()
+
+                failed_idp_request_urls: List[str] = []
+                configured_login_host = _url_host(login_url).lower()
+
+                def record_failed_idp_request(request) -> None:
+                    request_url = getattr(request, "url", "") or ""
+                    if (
+                        configured_login_host
+                        and _url_host(request_url).lower() == configured_login_host
+                    ):
+                        failed_idp_request_urls.append(request_url)
+
+                page.on("requestfailed", record_failed_idp_request)
 
                 async def finalize_success(reason: str, screenshot_step: int) -> Dict[str, Any]:
                     protected_validation = await validate_protected_resource_session(
@@ -3754,6 +3980,25 @@ class BrowserLoginAiTool(ToolPlugin):
                     )
                     if initial_render_wait_ms > 0:
                         await asyncio.sleep(initial_render_wait_ms / 1000)
+
+                    recovered_local_network_auth = await recover_local_network_auth_bootstrap(
+                        context,
+                        page,
+                        login_url=login_url,
+                        protected_resource_url=protected_resource_url,
+                        failed_request_urls=failed_idp_request_urls,
+                        page_load_strategy=page_load_strategy,
+                        load_timeout_ms=timeout_seconds * 1000,
+                        settle_ms=initial_render_wait_ms,
+                    )
+                    if recovered_local_network_auth and agent:
+                        agent.report_progress(
+                            current_operation=(
+                                "Retried protected application after an origin-scoped "
+                                "corporate IdP network permission grant"
+                            ),
+                            current_target=protected_resource_url or entry_url,
+                        )
 
                     opened_login_surface = await open_login_surface_if_needed(
                         page,

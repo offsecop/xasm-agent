@@ -420,7 +420,10 @@ class BrowserMapCoverageVerdictTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(output["verified"])
         self.assertEqual(output["coverageStatus"], "INCOMPLETE")
         self.assertEqual(output["coverageReason"], "CROSS_ORIGIN_REDIRECT_BLOCKED")
-        self.assertEqual(output["redirectTarget"], f"{destination}/outside")
+        self.assertNotIn("redirectTarget", output)
+        self.assertEqual(output["scopeMetadata"]["blockedNavigationCount"], 1)
+        self.assertEqual(output["scopeMetadata"]["blockedRequestCount"], 1)
+        self.assertNotIn(destination, str(output["scopeMetadata"]))
 
 
 if __name__ == "__main__":

@@ -23,7 +23,9 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timezone
 from plugin_loader import PluginLoader
+from lib.completion_count import describe_record_count
 from lib import process_reaper
+from lib.scanner_evidence_redactor import redact_agent_result, redact_scanner_evidence
 
 def parse_env_tags(raw_tags):
     if not raw_tags:
@@ -34,6 +36,7 @@ def parse_env_tags(raw_tags):
 @dataclass
 class JobExecutionState:
     job_id: str
+    tool_name: str = ""
     retry_count: int = 0
     output_buffer: list[str] = field(default_factory=list)
     last_output_flush: datetime | None = None
@@ -866,7 +869,7 @@ class Agent:
                     return
 
         try:
-            output_text = '\n'.join(state.output_buffer)
+            output_text = redact_scanner_evidence('\n'.join(state.output_buffer))
             if state.job_id and output_text:
                 session = await self._get_session()
                 timeout = aiohttp.ClientTimeout(total=10)
@@ -999,7 +1002,7 @@ class Agent:
         # Job is already claimed by poll endpoint (atomic claiming)
         # No need to claim again - proceed directly to execution
 
-        state = JobExecutionState(job_id=job_id, retry_count=retry_count)
+        state = JobExecutionState(job_id=job_id, tool_name=tool_name, retry_count=retry_count)
         state.effective_timeout = effective_timeout
         self._active_jobs[job_id] = state
         state_token = self._current_execution_state.set(state)
@@ -1054,7 +1057,7 @@ class Agent:
             # window after the tool returns, process_queued_results() will
             # replay this result instead of letting the backend hit timeout.
             await asyncio.shield(
-                self.queue_result(job_id, result, success=tool_success, retry_count=retry_count)
+                self.queue_result(job_id, result, success=tool_success, retry_count=retry_count, tool_name=tool_name)
             )
 
             # Send completion (BUG-032: Pass retryCount for version checking)
@@ -1094,7 +1097,7 @@ class Agent:
             await self.flush_output_buffer(force=True, state=state)
             if result is not None:
                 await asyncio.shield(
-                    self.queue_result(job_id, result, success=tool_success, retry_count=retry_count)
+                    self.queue_result(job_id, result, success=tool_success, retry_count=retry_count, tool_name=tool_name)
                 )
             raise
         except asyncio.TimeoutError:
@@ -1112,7 +1115,7 @@ class Agent:
             # clean { success: false, error, rawOutput }.
             error_payload = {'success': False, 'error': error_msg, 'rawOutput': ''}
             await asyncio.shield(
-                self.queue_result(job_id, error_payload, success=False, retry_count=retry_count)
+                self.queue_result(job_id, error_payload, success=False, retry_count=retry_count, tool_name=tool_name)
             )
             await self.complete_job(job_id, error_payload, success=False, retry_count=retry_count)
             # Don't cleanup on failure - keep queue file for retry
@@ -1124,7 +1127,7 @@ class Agent:
             error_payload = {'success': False, 'error': error_msg, 'rawOutput': ''}
             # BUG-032: Include retryCount in failure case too
             await asyncio.shield(
-                self.queue_result(job_id, error_payload, success=False, retry_count=retry_count)
+                self.queue_result(job_id, error_payload, success=False, retry_count=retry_count, tool_name=tool_name)
             )
             await self.complete_job(job_id, error_payload, success=False, retry_count=retry_count)
             # Don't cleanup on failure - keep queue file for retry
@@ -1212,18 +1215,20 @@ class Agent:
             print(f"[ExecHeartbeat] Stopped for job {job_id[:8]}")
             raise
 
-    async def complete_job(self, job_id, output, success=True, retry_count=None):
+    async def complete_job(self, job_id, output, success=True, retry_count=None, tool_name=None):
         """Mark job as complete via REST API (BUG-032: Added retry_count parameter)"""
         try:
             self._last_completion_status = None
             url = f"{self.api_url}/agents/jobs/{job_id}/complete"
             print(f"[DEBUG] Sending completion to: {url}")
             print(f"[DEBUG] Output keys: {list(output.keys()) if isinstance(output, dict) else 'not a dict'}")
-            print(f"[DEBUG] Findings count: {len(output.get('findings', [])) if isinstance(output, dict) else 'N/A'}")
+            print(f"[DEBUG] Findings count: {describe_record_count(output)}")
             print(f"[DEBUG] Retry Count: {retry_count if retry_count is not None else 'not provided'}")  # BUG-032
 
             # BUG-032: Include retryCount in request payload for version checking
-            payload = {'output': output, 'success': success}
+            active_state = self._active_jobs.get(job_id)
+            effective_tool_name = tool_name or (active_state.tool_name if active_state else None)
+            payload = {'output': redact_agent_result(effective_tool_name, output), 'success': success}
             if retry_count is not None:
                 payload['retryCount'] = retry_count
 
@@ -1278,8 +1283,14 @@ class Agent:
             print(f"[FindingsACK] ✗ Error for job {job_id[:8]}: {e}")
             return False
 
-    async def queue_result(self, job_id, result, success=True, retry_count=None):
+    async def queue_result(self, job_id, result, success=True, retry_count=None, tool_name=None):
         """Queue result for resilience (BUG-032: Added retry_count parameter)"""
+        # Authentication results are the one raw credential handoff to the
+        # backend session vault. Never persist that handoff in the local replay
+        # spool: if delivery fails, the backend will requeue the login job.
+        if str(tool_name or "").startswith("authentication:"):
+            print(f"[Queue] Skipping credential-bearing auth result spool for job {job_id[:8]}")
+            return
         try:
             queue_dir = "/tmp/agent_queue"
             os.makedirs(queue_dir, exist_ok=True)
@@ -1298,7 +1309,8 @@ class Agent:
             with open(queue_file, 'w') as f:
                 json.dump({
                     'job_id': job_id,
-                    'result': result,
+                    'result': redact_agent_result(tool_name, result),
+                    'tool_name': tool_name,
                     'success': success,
                     'retry_count': retry_count,  # BUG-032: Store retryCount in queue
                     'timestamp': datetime.now().isoformat()
@@ -1353,6 +1365,7 @@ class Agent:
                     result = data['result']
                     success = data['success']
                     retry_count = data.get('retry_count')  # BUG-032: Load retryCount from queue
+                    tool_name = data.get('tool_name')
                     queued_at_raw = data.get('timestamp')
 
                     if queued_at_raw:
@@ -1369,7 +1382,7 @@ class Agent:
                             print(f"[Queue] Warning: could not parse queued timestamp for {job_id[:8]}: {age_err}")
 
                     print(f"[Queue] Resending result for job {job_id[:8]} with retryCount={retry_count}")
-                    completion_sent = await self.complete_job(job_id, result, success, retry_count=retry_count)  # BUG-032
+                    completion_sent = await self.complete_job(job_id, result, success, retry_count=retry_count, tool_name=tool_name)  # BUG-032
 
                     if completion_sent:
                         # Wait for ACK before deleting queue file
