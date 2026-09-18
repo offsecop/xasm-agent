@@ -716,8 +716,13 @@ class AgenticCandidateCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dalfox_decision["status"], "BLOCKED")
         self.assertEqual(
             dalfox_decision["reasonCode"],
-            "ADAPTER_NOT_IMPLEMENTED",
+            "MISSING_SIGNAL",
         )
+        self.assertIn(
+            "persisted same-origin GET query candidate",
+            dalfox_decision["reason"],
+        )
+        self.assertNotIn("adapter", dalfox_decision["reason"].lower())
         self.assertTrue(dalfox_decision["candidateIds"])
         self.assertNotIn("parameters", dalfox_decision)
         self.assertFalse(action_by_tool["dalfox:xss_scan"]["autonomousReady"])
