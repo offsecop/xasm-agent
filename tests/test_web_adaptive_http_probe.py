@@ -232,6 +232,7 @@ class WebAdaptiveHttpProbeTests(unittest.IsolatedAsyncioTestCase):
                 "bodySha256",
                 "bodyLength",
                 "truncated",
+                "projectionTruncated",
                 "elapsedMs",
             },
         )
@@ -331,28 +332,103 @@ class WebAdaptiveHttpProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("differential", output["outcomes"][0])
         self.assertNotIn("findings", output)
 
-    async def test_evidence_truncation_completes_the_job_with_incomplete_coverage(self):
+    async def test_evidence_projection_is_classified_without_incomplete_coverage(self):
         responses = [
             _response("A" * (EXPECTED_BUDGETS["maxEvidenceBodyBytes"] + 1)),
-            _response("result=ok; value=2"),
-            _response("SQL syntax error near value='", status=500),
-            _response("result=ok; value=''"),
-            _response("result=ok; value=1"),
+            _response("A" * (EXPECTED_BUDGETS["maxEvidenceBodyBytes"] + 1)),
+            _response(
+                "A" * EXPECTED_BUDGETS["maxEvidenceBodyBytes"]
+                + "SQL syntax error",
+                status=500,
+            ),
+            _response("A" * (EXPECTED_BUDGETS["maxEvidenceBodyBytes"] + 1)),
+            _response("A" * (EXPECTED_BUDGETS["maxEvidenceBodyBytes"] + 1)),
         ]
 
         output, execute_one = await self._execute_with(responses)
 
         self.assertTrue(output["success"])
-        self.assertEqual(output["coverageStatus"], "INCOMPLETE")
-        self.assertEqual(output["coverage"]["stopReason"], "EVIDENCE_BODY_TRUNCATED")
+        self.assertEqual(output["coverageStatus"], "COMPLETE_NO_FINDING")
+        self.assertIsNone(output["coverage"]["stopReason"])
+        self.assertFalse(output["coverage"]["retryable"])
         self.assertEqual(output["coverage"]["requestsRun"], 5)
         self.assertEqual(execute_one.await_count, 5)
-        self.assertEqual(output["outcomes"][0]["status"], "INCOMPLETE")
-        self.assertEqual(
-            output["outcomes"][0]["reasonCode"],
-            "EVIDENCE_BODY_TRUNCATED",
+        self.assertEqual(output["outcomes"][0]["status"], "NO_DIFFERENTIAL")
+        self.assertTrue(
+            all(
+                exchange["response"]["projectionTruncated"]
+                for exchange in output["outcomes"][0]["evidence"]["exchanges"]
+            )
+        )
+        self.assertTrue(
+            all(
+                not exchange["response"]["truncated"]
+                for exchange in output["outcomes"][0]["evidence"]["exchanges"]
+            )
         )
         self.assertNotIn("findings", output)
+
+    async def test_six_units_with_oversized_bodies_settle_without_projection_retry(self):
+        plan = _plan()
+        template_unit = plan["units"][0]
+        plan["units"] = []
+        responses = []
+        oversized_normal = "A" * (EXPECTED_BUDGETS["maxEvidenceBodyBytes"] + 512)
+        oversized_break = (
+            "SQL syntax error near value='; "
+            + "B" * (EXPECTED_BUDGETS["maxEvidenceBodyBytes"] + 512)
+        )
+        for index in range(6):
+            unit = json.loads(json.dumps(template_unit))
+            unit["unitId"] = f"unit-{index}"
+            unit["candidateId"] = f"cand-{index:016x}"
+            unit["requests"] = [
+                {
+                    **request,
+                    "url": request["url"].replace("/search?", f"/search-{index}?"),
+                }
+                for request in unit["requests"]
+            ]
+            plan["units"].append(unit)
+            responses.extend(
+                [
+                    _response(oversized_normal),
+                    _response(oversized_normal),
+                    _response(
+                        oversized_break if index == 0 else oversized_normal,
+                        status=500 if index == 0 else 200,
+                    ),
+                    _response(oversized_normal),
+                    _response(oversized_normal),
+                ]
+            )
+
+        output, execute_one = await self._execute_with(
+            responses,
+            _parameters(**{SERVER_PLAN_KEY: plan}),
+        )
+
+        self.assertTrue(output["success"])
+        self.assertEqual(output["coverageStatus"], "CONFIRMED")
+        self.assertIsNone(output["coverage"]["stopReason"])
+        self.assertFalse(output["coverage"]["retryable"])
+        self.assertEqual(output["coverage"]["requestsRun"], 30)
+        self.assertEqual(execute_one.await_count, 30)
+        self.assertEqual(output["outcomes"][0]["status"], "CONFIRMED")
+        self.assertTrue(
+            all(
+                outcome["status"] == "NO_DIFFERENTIAL"
+                for outcome in output["outcomes"][1:]
+            )
+        )
+        self.assertTrue(
+            all(
+                exchange["response"]["projectionTruncated"]
+                for outcome in output["outcomes"]
+                for exchange in outcome["evidence"]["exchanges"]
+            )
+        )
+        self.assertNotIn("EVIDENCE_BODY_TRUNCATED", json.dumps(output))
 
     async def test_transport_truncation_on_fifth_response_is_a_completed_incomplete_unit(self):
         responses = [
@@ -369,6 +445,7 @@ class WebAdaptiveHttpProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(output["success"])
         self.assertEqual(output["coverageStatus"], "INCOMPLETE")
         self.assertEqual(output["coverage"]["stopReason"], "RESPONSE_TRUNCATED")
+        self.assertFalse(output["coverage"]["retryable"])
         self.assertEqual(output["coverage"]["requestsRun"], 5)
         self.assertEqual(execute_one.await_count, 5)
         self.assertEqual(output["outcomes"][0]["status"], "INCOMPLETE")

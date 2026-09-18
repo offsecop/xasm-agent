@@ -12,6 +12,7 @@ returns explicit coverage metadata whenever a configured bound is reached.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -32,6 +33,8 @@ DEFAULT_MAX_DEPTH = 3
 DEFAULT_MAX_OUTPUT_BYTES = 48 * 1024
 HARD_MAX_OUTPUT_BYTES = 64 * 1024
 _MIN_OUTPUT_BYTES = 8 * 1024
+_MAX_INTERSTITIAL_ACKNOWLEDGEMENTS = 3
+_MAX_INTERACTION_DIAGNOSTICS = 40
 
 _EXTRA_RISKY_WORDS = {
     "delete",
@@ -79,6 +82,27 @@ class _Action:
 
 
 @dataclass(frozen=True)
+class _ActionExecution:
+    extra_interactions: int = 0
+    diagnostic: Optional[Dict[str, Any]] = None
+
+
+class _SafeInteractionBlocked(RuntimeError):
+    """A classified browser control stayed unreachable without unsafe clicking."""
+
+    def __init__(
+        self,
+        detail: str,
+        diagnostic: Dict[str, Any],
+        *,
+        extra_interactions: int = 0,
+    ):
+        super().__init__(detail)
+        self.diagnostic = diagnostic
+        self.extra_interactions = extra_interactions
+
+
+@dataclass(frozen=True)
 class _QueuedState:
     path: Tuple[_Action, ...]
     depth: int
@@ -92,6 +116,9 @@ class _TraversalState:
     candidates_observed: int = 0
     omitted_states: int = 0
     omitted_artifacts: int = 0
+    blockers_observed: int = 0
+    blockers_acknowledged: int = 0
+    navigation_fallbacks: int = 0
     truncated_by: List[str] = field(default_factory=list)
 
 
@@ -218,21 +245,61 @@ async def traverse_bounded_spa(
                 # Every attempted browser mutation consumes the bound, even if
                 # Playwright later reports a detached element or timeout.
                 state.interactions_used += 1
-                await _perform_action(
-                    page,
-                    scoped,
-                    target,
-                    current,
-                    search_term,
-                    deadline,
-                )
+                try:
+                    execution = await _perform_action(
+                        page,
+                        scoped,
+                        target,
+                        current,
+                        search_term,
+                        deadline,
+                        allow_acknowledgement=(
+                            state.interactions_used < budget.max_interactions
+                            and state.blockers_acknowledged
+                            < _MAX_INTERSTITIAL_ACKNOWLEDGEMENTS
+                        ),
+                    )
+                except _SafeInteractionBlocked as exc:
+                    state.interactions_used += exc.extra_interactions
+                    if exc.diagnostic.get("blockerKind"):
+                        state.blockers_observed += 1
+                    if exc.diagnostic.get("acknowledged"):
+                        state.blockers_acknowledged += 1
+                    _record_interaction_diagnostic(
+                        aggregates,
+                        exc.diagnostic,
+                        state,
+                        budget,
+                    )
+                    raise
+                state.interactions_used += execution.extra_interactions
+                if execution.diagnostic:
+                    state.blockers_observed += 1
+                    if execution.diagnostic.get("acknowledged"):
+                        state.blockers_acknowledged += 1
+                    if execution.diagnostic.get("resolution") == "same-origin-goto":
+                        state.navigation_fallbacks += 1
+                    _record_interaction_diagnostic(
+                        aggregates,
+                        execution.diagnostic,
+                        state,
+                        budget,
+                    )
 
             snapshot = await _snapshot(page, target, fill_search_inputs)
             await validate_authenticated_navigation(scoped, page, None, target)
         except SpaTraversalIncomplete:
             raise
-        except BrowserCoverageIncomplete:
-            raise
+        except BrowserCoverageIncomplete as exc:
+            partial = _finish_result(aggregates, state, budget, target, started)
+            partial.update(
+                {
+                    "coverageStatus": "INCOMPLETE",
+                    "coverageReason": exc.reason,
+                    "exhaustiveWithinBounds": False,
+                }
+            )
+            raise SpaTraversalIncomplete(exc.reason, exc.detail, partial) from exc
         except Exception:
             state.interaction_failures += 1
             continue
@@ -299,11 +366,94 @@ async def _perform_action(
     candidate: Dict[str, Any],
     search_term: str,
     deadline: float,
-) -> None:
+    *,
+    allow_acknowledgement: bool,
+) -> _ActionExecution:
     selector = f'[data-xasm-spa-key="{candidate["key"]}"]'
     locator = page.locator(selector).first
     blocked_before = len(scoped.blocked_navigation_urls)
-    action_timeout = max(250, min(int((deadline - time.monotonic()) * 1000), 2_000))
+    remaining_ms = max(250, int((deadline - time.monotonic()) * 1000))
+    action_timeout = min(remaining_ms, 2_000)
+    navigation_timeout = min(remaining_ms, 5_000)
+    inspection = await _inspect_actionability(page, selector)
+    diagnostic: Optional[Dict[str, Any]] = None
+    extra_interactions = 0
+
+    if inspection.get("state") != "actionable":
+        diagnostic = _actionability_diagnostic(candidate, inspection)
+        recognized_blocker = bool(inspection.get("blockerKind"))
+        ack_key = str(inspection.get("ackKey") or "")
+        if recognized_blocker and ack_key and allow_acknowledgement:
+            ack_locator = page.locator(
+                f'[data-xasm-interstitial-key="{ack_key}"]'
+            ).first
+            extra_interactions = 1
+            try:
+                await ack_locator.click(timeout=action_timeout, no_wait_after=True)
+                diagnostic["acknowledged"] = True
+                await page.wait_for_timeout(min(350, max(100, action_timeout // 5)))
+                await _validate_action_scope(
+                    page,
+                    scoped,
+                    target,
+                    None,
+                    blocked_before,
+                )
+                inspection = await _inspect_actionability(page, selector)
+            except BrowserCoverageIncomplete:
+                raise
+            except Exception:
+                diagnostic["acknowledgementFailed"] = True
+                await _validate_action_scope(
+                    page,
+                    scoped,
+                    target,
+                    None,
+                    blocked_before,
+                )
+
+        if inspection.get("state") != "actionable":
+            if recognized_blocker and _safe_navigation_fallback(candidate, scoped):
+                try:
+                    navigation = await _goto_primary_fallback(
+                        page,
+                        scoped,
+                        str(candidate.get("href") or ""),
+                        navigation_timeout,
+                        blocked_before,
+                    )
+                except Exception:
+                    await _validate_action_scope(
+                        page,
+                        scoped,
+                        target,
+                        None,
+                        blocked_before,
+                    )
+                    raise
+                await _validate_action_scope(
+                    page,
+                    scoped,
+                    target,
+                    navigation,
+                    blocked_before,
+                )
+                diagnostic["resolution"] = "same-origin-goto"
+                return _ActionExecution(
+                    extra_interactions=extra_interactions,
+                    diagnostic=diagnostic,
+                )
+            diagnostic["resolution"] = (
+                "acknowledgement-cap-reached"
+                if recognized_blocker and ack_key and not allow_acknowledgement
+                else "blocked"
+            )
+            raise _SafeInteractionBlocked(
+                "safe SPA control is covered by an unacknowledged or unclassified interstitial",
+                diagnostic,
+                extra_interactions=extra_interactions,
+            )
+
     if candidate.get("kind") == "search":
         # Filling dispatches input/change events but never submits the form.
         await locator.fill(str(search_term or "test")[:80], timeout=action_timeout)
@@ -314,6 +464,103 @@ async def _perform_action(
         await page.wait_for_load_state("networkidle", timeout=min(action_timeout, 1_500))
     except Exception:
         pass
+    await _validate_action_scope(
+        page,
+        scoped,
+        target,
+        None,
+        blocked_before,
+    )
+    if diagnostic is not None:
+        diagnostic["resolution"] = "acknowledged"
+    return _ActionExecution(
+        extra_interactions=extra_interactions,
+        diagnostic=diagnostic,
+    )
+
+
+async def _goto_primary_fallback(
+    page: Any,
+    scoped: ScopedBrowserContext,
+    href: str,
+    timeout_ms: int,
+    blocked_before: int,
+) -> Any:
+    """Navigate a proved primary href without following a document redirect out."""
+
+    session = None
+    paused_tasks: List[asyncio.Task[Any]] = []
+
+    async def keep_fallback_document_primary(event: Dict[str, Any]) -> None:
+        request = event.get("request") or {}
+        request_url = str(request.get("url") or "")
+        resource_type = str(event.get("resourceType") or "").lower()
+        request_id = str(event.get("requestId") or "")
+        if resource_type == "document" and not scoped.url_is_primary(request_url):
+            scoped.note_blocked_url(
+                request_url,
+                navigation=True,
+                reason="CROSS_ORIGIN_REDIRECT_BLOCKED",
+            )
+            await session.send(
+                "Fetch.failRequest",
+                {"requestId": request_id, "errorReason": "BlockedByClient"},
+            )
+            return
+        # Continue without rewriting headers, cookies, or the request URL. The
+        # existing context policy remains responsible for subresource scope and
+        # cross-origin authentication-header stripping.
+        await session.send("Fetch.continueRequest", {"requestId": request_id})
+
+    try:
+        session = await page.context.new_cdp_session(page)
+        session.on(
+            "Fetch.requestPaused",
+            lambda event: paused_tasks.append(
+                asyncio.create_task(keep_fallback_document_primary(event))
+            ),
+        )
+        await session.send(
+            "Fetch.enable",
+            {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+        )
+        return await page.goto(
+            href,
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+    except BrowserCoverageIncomplete:
+        raise
+    except Exception:
+        if paused_tasks:
+            await asyncio.gather(*paused_tasks, return_exceptions=True)
+        if len(scoped.blocked_navigation_urls) > blocked_before:
+            raise BrowserCoverageIncomplete(
+                "CROSS_ORIGIN_REDIRECT_BLOCKED",
+                "safe SPA navigation fallback attempted to leave the primary origin",
+            )
+        raise
+    finally:
+        if paused_tasks:
+            await asyncio.gather(*paused_tasks, return_exceptions=True)
+        if session is not None:
+            try:
+                await session.send("Fetch.disable")
+            except Exception:
+                pass
+            try:
+                await session.detach()
+            except Exception:
+                pass
+
+
+async def _validate_action_scope(
+    page: Any,
+    scoped: ScopedBrowserContext,
+    target: str,
+    navigation: Any,
+    blocked_before: int,
+) -> None:
     if len(scoped.blocked_navigation_urls) > blocked_before:
         raise BrowserCoverageIncomplete(
             "CROSS_ORIGIN_REDIRECT_BLOCKED",
@@ -324,7 +571,152 @@ async def _perform_action(
             "CROSS_ORIGIN_REDIRECT_BLOCKED",
             "safe SPA interaction left the authorized primary origin",
         )
-    await validate_authenticated_navigation(scoped, page, None, target)
+    await validate_authenticated_navigation(scoped, page, navigation, target)
+
+
+def _safe_navigation_fallback(
+    candidate: Dict[str, Any],
+    scoped: ScopedBrowserContext,
+) -> bool:
+    href = str(candidate.get("href") or "").strip()
+    parsed = urlparse(href)
+    return bool(
+        candidate.get("kind") == "navigate"
+        and str(candidate.get("navigationSource") or "")
+        in {"anchor-href", "router-href"}
+        and parsed.scheme.lower() in _SAFE_SCHEMES
+        and scoped.url_is_primary(href)
+    )
+
+
+def _actionability_diagnostic(
+    candidate: Dict[str, Any],
+    inspection: Dict[str, Any],
+) -> Dict[str, Any]:
+    signature = str(candidate.get("signature") or "")
+    diagnostic: Dict[str, Any] = {
+        "actionId": hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12],
+        "kind": str(candidate.get("kind") or "")[:24],
+        "actionability": str(inspection.get("state") or "unknown")[:40],
+        "resolution": "pending",
+    }
+    blocker_kind = str(inspection.get("blockerKind") or "")[:24]
+    ack_label = str(inspection.get("ackLabel") or "")[:32]
+    if blocker_kind:
+        diagnostic["blockerKind"] = blocker_kind
+    if ack_label:
+        # The browser-side classifier returns only a canonical allowlist token,
+        # never arbitrary DOM text.
+        diagnostic["ackControl"] = ack_label
+    return diagnostic
+
+
+async def _inspect_actionability(page: Any, selector: str) -> Dict[str, Any]:
+    """Return a bounded classification without exposing page text or selectors."""
+
+    result = await page.evaluate(
+        """({ selector }) => {
+          const target = document.querySelector(selector);
+          const visible = (el) => {
+            if (!el || !el.isConnected) return false;
+            const style = getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+              style.pointerEvents !== 'none' && Number(style.opacity || 1) > 0 &&
+              rect.width > 0 && rect.height > 0;
+          };
+          if (!target) return { state: 'missing' };
+          if (!visible(target)) return { state: 'not-visible' };
+          const rect = target.getBoundingClientRect();
+          const x = Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2));
+          const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2));
+          const hit = document.elementFromPoint(x, y);
+          if (hit && (hit === target || target.contains(hit))) {
+            return { state: 'actionable' };
+          }
+
+          const normalize = (value, max = 1200) => String(value || '')
+            .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase().replace(/\\s+/g, ' ').trim().slice(0, max);
+          const category = (el) => {
+            const heading = el.querySelector('h1, h2, h3, [role=heading]');
+            const text = normalize(`${el.getAttribute('aria-label') || ''} ${heading ? heading.textContent : ''} ${el.textContent || ''}`);
+            if (/\\b(cookie|cookies|consent|privacy|privacidade|preferencias de cookies|preferencias de privacidad)\\b/.test(text)) return 'consent';
+            if (/\\b(disclosure|disclaimer|important notice|security notice|aviso importante|termos e condicoes|terms and conditions)\\b/.test(text)) return 'disclosure';
+            return '';
+          };
+          const candidates = [];
+          let current = hit;
+          while (current && current !== document.documentElement) {
+            candidates.push(current);
+            current = current.parentElement;
+          }
+          document.querySelectorAll('[role=dialog], [role=alertdialog], [aria-modal=true], dialog[open]').forEach(el => candidates.push(el));
+          const unique = Array.from(new Set(candidates));
+          const blocker = unique.find((el) => {
+            if (!visible(el) || !category(el)) return false;
+            const blockerRect = el.getBoundingClientRect();
+            const coversPoint = x >= blockerRect.left && x <= blockerRect.right &&
+              y >= blockerRect.top && y <= blockerRect.bottom;
+            const role = normalize(el.getAttribute('role'), 40);
+            const style = getComputedStyle(el);
+            const zIndex = Number.parseInt(style.zIndex || '0', 10) || 0;
+            const positionedOverlay = style.position === 'fixed' ||
+              style.position === 'sticky' ||
+              (style.position === 'absolute' && zIndex > 0);
+            const modal = el.getAttribute('aria-modal') === 'true' ||
+              role === 'dialog' || role === 'alertdialog' ||
+              (el.tagName.toLowerCase() === 'dialog' && el.hasAttribute('open'));
+            if (!positionedOverlay && !modal) return false;
+            return coversPoint || (modal && hit && el.contains(hit));
+          });
+          if (!blocker) return { state: 'covered-unclassified' };
+
+          document.querySelectorAll('[data-xasm-interstitial-key]').forEach(el =>
+            el.removeAttribute('data-xasm-interstitial-key'));
+          const allow = [
+            [/^(accept|accept all|allow all)( cookies)?$/, 'accept'],
+            [/^(aceitar|aceitar tudo|permitir tudo)( cookies)?$/, 'accept'],
+            [/^(agree|i agree|concordo)$/, 'agree'],
+            [/^(continue|continuar|prosseguir)$/, 'continue'],
+            [/^(acknowledge|i understand|got it|entendi)$/, 'acknowledge'],
+            [/^(ok|okay)$/, 'ok'],
+            [/^(close|dismiss|fechar)$/, 'close'],
+          ];
+          let ackKey = '';
+          let ackLabel = '';
+          const controls = blocker.querySelectorAll('button, input[type=button], [role=button]');
+          for (const control of controls) {
+            if (!visible(control) || control.disabled || control.getAttribute('aria-disabled') === 'true') continue;
+            if (control.closest('form') || control.hasAttribute('form') || control.hasAttribute('formaction')) continue;
+            if (control.hasAttribute('href')) continue;
+            const type = normalize(control.getAttribute('type'), 20);
+            if (type && type !== 'button') continue;
+            const label = normalize(control.getAttribute('aria-label') || control.value || control.textContent, 80);
+            const matched = allow.find(([pattern]) => pattern.test(label));
+            if (!matched) continue;
+            ackKey = 'ack0';
+            ackLabel = matched[1];
+            control.setAttribute('data-xasm-interstitial-key', ackKey);
+            break;
+          }
+          return {
+            state: 'covered-by-safe-interstitial',
+            blockerKind: category(blocker),
+            ackKey,
+            ackLabel,
+          };
+        }""",
+        {"selector": selector},
+    )
+    if not isinstance(result, dict):
+        return {"state": "unknown"}
+    return {
+        "state": str(result.get("state") or "unknown")[:40],
+        "blockerKind": str(result.get("blockerKind") or "")[:24],
+        "ackKey": str(result.get("ackKey") or "")[:32],
+        "ackLabel": str(result.get("ackLabel") or "")[:32],
+    }
 
 
 async def _snapshot(page: Any, target: str, include_search: bool) -> Dict[str, Any]:
@@ -377,8 +769,11 @@ async def _snapshot(page: Any, target: str, include_search: bool) -> Dict[str, A
           rawCandidates.forEach((el, index) => {
             const tag = el.tagName.toLowerCase();
             const role = clean(el.getAttribute('role'), 40).toLowerCase();
-            const hrefRaw = el.getAttribute('href') || el.getAttribute('routerlink') || el.getAttribute('data-route') || '';
+            const anchorHref = tag === 'a' ? (el.getAttribute('href') || '') : '';
+            const routerHref = el.getAttribute('routerlink') || '';
+            const hrefRaw = anchorHref || routerHref || el.getAttribute('data-route') || '';
             const href = hrefRaw ? absolute(hrefRaw) : '';
+            const navigationSource = anchorHref ? 'anchor-href' : (routerHref ? 'router-href' : '');
             const label = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name'));
             const ariaControls = clean(el.getAttribute('aria-controls'), 120);
             const type = clean(el.getAttribute('type'), 40).toLowerCase();
@@ -388,10 +783,10 @@ async def _snapshot(page: Any, target: str, include_search: bool) -> Dict[str, A
             if (el.closest('form') && !search && tag !== 'a') return;
             if (tag === 'button' && type === 'submit') return;
             const kind = search ? 'search' : (href ? 'navigate' : 'toggle');
-            const signature = JSON.stringify([kind, tag, role, href, ariaControls, label]);
+            const signature = JSON.stringify([kind, tag, role, href, navigationSource, ariaControls, label]);
             const key = `c${index}`;
             el.setAttribute('data-xasm-spa-key', key);
-            candidates.push({ key, signature, kind, tag, role, href, ariaControls, label });
+            candidates.push({ key, signature, kind, tag, role, href, navigationSource, ariaControls, label });
           });
           return {
             title: document.title || '',
@@ -516,6 +911,7 @@ def _new_aggregates() -> Dict[str, Any]:
         "buttons": [],
         "inputs": [],
         "safeInteractions": [],
+        "interactionDiagnostics": [],
         "_seen": {
             "links": set(),
             "externalLinks": set(),
@@ -667,6 +1063,28 @@ def _append_bounded(
     return True
 
 
+def _record_interaction_diagnostic(
+    aggregates: Dict[str, Any],
+    diagnostic: Dict[str, Any],
+    state: _TraversalState,
+    budget: SpaTraversalBudget,
+) -> None:
+    diagnostics = aggregates.get("interactionDiagnostics")
+    if not isinstance(diagnostics, list):
+        return
+    if len(diagnostics) >= _MAX_INTERACTION_DIAGNOSTICS:
+        state.omitted_artifacts += 1
+        _mark_truncated(state, "maxInteractionDiagnostics")
+        return
+    _append_bounded(
+        aggregates,
+        "interactionDiagnostics",
+        diagnostic,
+        state,
+        budget,
+    )
+
+
 def _mark_truncated(state: _TraversalState, reason: str) -> None:
     if reason not in state.truncated_by:
         state.truncated_by.append(reason)
@@ -711,6 +1129,9 @@ def _finish_result(
             "interactionsUsed": state.interactions_used,
             "interactionFailures": state.interaction_failures,
             "candidatesObserved": state.candidates_observed,
+            "blockersObserved": state.blockers_observed,
+            "blockersAcknowledged": state.blockers_acknowledged,
+            "navigationFallbacks": state.navigation_fallbacks,
             "elapsedMs": elapsed_ms,
             "artifactBytes": int(aggregates["_artifactBytes"]),
             "budget": {

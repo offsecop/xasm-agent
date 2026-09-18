@@ -2,10 +2,12 @@ import unittest
 
 from tools._browser_scoped_context import (
     BrowserCoverageIncomplete,
+    MAX_AUTH_BOOTSTRAP_NAVIGATION_HOPS,
     SERVER_BROWSER_ORIGIN_POLICY_KEY,
     attach_auth_loss_watch,
     browser_extra_headers,
     create_scoped_browser_context,
+    incomplete_output,
     normalize_browser_cookie,
     parse_cookie_header,
     validate_authenticated_navigation,
@@ -16,12 +18,14 @@ from tools.browser_login_ai import serialize_login_cookie_jar
 TARGET = "https://app.example.test/protected"
 
 
-def _origin_policy(*origins):
+def _origin_policy(*origins, authentication_origin=None):
     return {
-        "version": 1,
+        "version": 2,
         "primaryOrigin": "https://app.example.test",
         "allowedOrigins": sorted(origins or ("https://app.example.test",)),
+        "authenticationBootstrapOrigin": authentication_origin,
         "requireExactOrigin": True,
+        "requireFinalPrimaryOrigin": True,
         "stripCrossOriginAuthHeaders": True,
     }
 
@@ -41,13 +45,15 @@ class _Route:
         self.continued = False
         self.continue_headers = None
         self.aborted = False
+        self.abort_reason = None
 
     async def continue_(self, **kwargs):
         self.continued = True
         self.continue_headers = kwargs.get("headers")
 
-    async def abort(self, _reason):
+    async def abort(self, reason):
         self.aborted = True
+        self.abort_reason = reason
 
 
 class _Context:
@@ -74,6 +80,19 @@ class _Browser:
     async def new_context(self, **kwargs):
         self.kwargs = kwargs
         return self.context
+
+
+class _WebSocket:
+    def __init__(self, url):
+        self.url = url
+        self.connected = False
+        self.closed = False
+
+    def connect_to_server(self):
+        self.connected = True
+
+    async def close(self, **_kwargs):
+        self.closed = True
 
 
 class _Locator:
@@ -115,6 +134,29 @@ class BrowserScopedContextTests(unittest.IsolatedAsyncioTestCase):
                 **_origin_policy("https://app.example.test"),
                 "version": True,
             },
+            {
+                **_origin_policy("https://app.example.test"),
+                "authenticationBootstrapOrigin": ["https://login.example.test"],
+            },
+            {
+                **_origin_policy("https://app.example.test"),
+                "authenticationBootstrapOrigin": "https://login.example.test/path",
+            },
+            {
+                **_origin_policy("https://app.example.test"),
+                "authenticationBootstrapOrigin": "https://app.example.test",
+            },
+            {
+                **_origin_policy(
+                    "https://app.example.test",
+                    "https://login.example.test",
+                ),
+                "authenticationBootstrapOrigin": "https://login.example.test",
+            },
+            {
+                **_origin_policy("https://app.example.test"),
+                "authenticationOrigins": ["https://login.example.test"],
+            },
         ):
             with self.assertRaises(BrowserCoverageIncomplete) as raised:
                 await create_scoped_browser_context(
@@ -123,6 +165,25 @@ class BrowserScopedContextTests(unittest.IsolatedAsyncioTestCase):
                     {SERVER_BROWSER_ORIGIN_POLICY_KEY: policy},
                 )
             self.assertEqual(raised.exception.reason, "INVALID_BROWSER_ORIGIN_POLICY")
+
+    async def test_policy_accepts_absent_or_null_single_auth_bootstrap_origin(self):
+        absent = _origin_policy("https://app.example.test")
+        absent.pop("authenticationBootstrapOrigin")
+        for policy in (
+            absent,
+            _origin_policy("https://app.example.test"),
+            _origin_policy(
+                "https://app.example.test",
+                authentication_origin="https://login.example.test",
+            ),
+        ):
+            scoped = await create_scoped_browser_context(
+                _Browser(),
+                TARGET,
+                {SERVER_BROWSER_ORIGIN_POLICY_KEY: policy},
+            )
+            self.assertEqual(scoped.scope_metadata()["policyVersion"], 2)
+            self.assertFalse(scoped.url_is_authentication("not-an-http-url"))
 
     async def test_unrelated_cookie_domain_is_rejected_but_allowed_cookie_keeps_attributes(self):
         browser = _Browser()
@@ -178,6 +239,266 @@ class BrowserScopedContextTests(unittest.IsolatedAsyncioTestCase):
         await browser.context.routes[0](secondary_navigation)
         self.assertTrue(secondary_navigation.aborted)
         self.assertEqual(len(scoped.blocked_navigation_urls), 1)
+
+    async def test_server_attested_auth_origin_allows_bounded_login_bootstrap(self):
+        browser = _Browser()
+        scoped = await create_scoped_browser_context(
+            browser,
+            TARGET,
+            {
+                SERVER_BROWSER_ORIGIN_POLICY_KEY: _origin_policy(
+                    "https://app.example.test",
+                    authentication_origin="https://login.example.test",
+                ),
+                "cookieJar": [
+                    {
+                        "name": "idp-session",
+                        "value": "opaque",
+                        "domain": "login.example.test",
+                        "path": "/",
+                        "secure": True,
+                    }
+                ],
+                "authHeaders": {"Authorization": "Bearer primary-only"},
+            },
+        )
+
+        initial_primary_navigation = _Route(TARGET, navigation=True)
+        await browser.context.routes[0](initial_primary_navigation)
+        self.assertTrue(initial_primary_navigation.continued)
+
+        auth_navigation = _Route(
+            "https://login.example.test/connect/authorize",
+            navigation=True,
+            headers={
+                "Authorization": "Bearer must-not-cross",
+                "Referer": "https://app.example.test/protected?session=secret",
+                "Accept": "text/html",
+                "Cookie": "native-cookie-semantics",
+            },
+        )
+        await browser.context.routes[0](auth_navigation)
+
+        self.assertTrue(auth_navigation.continued)
+        self.assertFalse(auth_navigation.aborted)
+        self.assertNotIn("Authorization", auth_navigation.continue_headers)
+        self.assertNotIn("Referer", auth_navigation.continue_headers)
+        self.assertEqual(auth_navigation.continue_headers["Accept"], "text/html")
+        self.assertIn("Cookie", auth_navigation.continue_headers)
+        self.assertEqual(scoped.installed_cookie_count, 1)
+        self.assertEqual(scoped.scope_metadata()["authenticationOriginCount"], 1)
+        self.assertFalse(
+            scoped.url_is_authorized("https://login.example.test/connect/authorize")
+        )
+
+        auth_subresource = _Route(
+            "https://login.example.test/assets/login.js",
+            headers={"Referer": "https://login.example.test/connect/authorize"},
+        )
+        await browser.context.routes[0](auth_subresource)
+        self.assertTrue(auth_subresource.continued)
+        self.assertNotIn("Referer", auth_subresource.continue_headers)
+
+        primary_return = _Route(TARGET, navigation=True)
+        await browser.context.routes[0](primary_return)
+        self.assertTrue(primary_return.continued)
+        self.assertTrue(scoped.auth_bootstrap_sealed)
+
+        await validate_authenticated_navigation(
+            scoped,
+            _Page(TARGET),
+            type("Response", (), {"status": 200})(),
+            TARGET,
+        )
+
+    async def test_auth_origin_terminal_page_is_typed_incomplete(self):
+        browser = _Browser()
+        scoped = await create_scoped_browser_context(
+            browser,
+            TARGET,
+            {
+                SERVER_BROWSER_ORIGIN_POLICY_KEY: _origin_policy(
+                    "https://app.example.test",
+                    authentication_origin="https://login.example.test",
+                ),
+                "authCookies": "session=opaque",
+            },
+        )
+
+        await browser.context.routes[0](_Route(TARGET, navigation=True))
+        await browser.context.routes[0](
+            _Route("https://login.example.test/account/login", navigation=True)
+        )
+
+        with self.assertRaises(BrowserCoverageIncomplete) as raised:
+            await validate_authenticated_navigation(
+                scoped,
+                _Page(
+                    "https://login.example.test/account/login?code=secret#access_token",
+                    password_count=1,
+                ),
+                type("Response", (), {"status": 200})(),
+                TARGET,
+            )
+        self.assertEqual(raised.exception.reason, "AUTH_BOOTSTRAP_TERMINAL_AUTH_ORIGIN")
+        output = incomplete_output(
+            TARGET,
+            raised.exception,
+            final_url="https://login.example.test/account/login?code=secret#access_token",
+            scoped=scoped,
+        )
+        self.assertEqual(output["finalUrl"], "https://login.example.test/account/login")
+        self.assertNotIn("secret", str(output))
+        self.assertNotIn("access_token", str(output))
+
+    async def test_auth_origin_is_rejected_without_auth_material(self):
+        browser = _Browser()
+        scoped = await create_scoped_browser_context(
+            browser,
+            TARGET,
+            {
+                SERVER_BROWSER_ORIGIN_POLICY_KEY: _origin_policy(
+                    "https://app.example.test",
+                    authentication_origin="https://login.example.test",
+                )
+            },
+        )
+        await browser.context.routes[0](_Route(TARGET, navigation=True))
+        auth_navigation = _Route(
+            "https://login.example.test/account/login",
+            navigation=True,
+        )
+        await browser.context.routes[0](auth_navigation)
+        self.assertTrue(auth_navigation.aborted)
+        self.assertEqual(len(scoped.blocked_navigation_urls), 1)
+
+    async def test_auth_origin_requires_initial_primary_and_active_document(self):
+        browser = _Browser()
+        scoped = await create_scoped_browser_context(
+            browser,
+            TARGET,
+            {
+                SERVER_BROWSER_ORIGIN_POLICY_KEY: _origin_policy(
+                    "https://app.example.test",
+                    authentication_origin="https://login.example.test",
+                ),
+                "authCookies": "session=opaque",
+            },
+        )
+
+        premature_subresource = _Route("https://login.example.test/assets/login.js")
+        await browser.context.routes[0](premature_subresource)
+        self.assertTrue(premature_subresource.aborted)
+
+        premature_navigation = _Route(
+            "https://login.example.test/connect/authorize",
+            navigation=True,
+        )
+        await browser.context.routes[0](premature_navigation)
+        self.assertTrue(premature_navigation.aborted)
+        self.assertEqual(
+            scoped.blocked_navigation_reason,
+            "AUTH_BOOTSTRAP_INITIAL_PRIMARY_REQUIRED",
+        )
+
+    async def test_auth_origin_never_becomes_websocket_authority(self):
+        browser = _Browser()
+        await create_scoped_browser_context(
+            browser,
+            TARGET,
+            {
+                SERVER_BROWSER_ORIGIN_POLICY_KEY: _origin_policy(
+                    "https://app.example.test",
+                    authentication_origin="https://login.example.test",
+                ),
+                "authCookies": "session=opaque",
+            },
+        )
+        await browser.context.routes[0](_Route(TARGET, navigation=True))
+        await browser.context.routes[0](
+            _Route("https://login.example.test/connect/authorize", navigation=True)
+        )
+
+        websocket = _WebSocket("wss://login.example.test/socket")
+        await browser.context.websocket_handler(websocket)
+
+        self.assertFalse(websocket.connected)
+        self.assertTrue(websocket.closed)
+
+    async def test_primary_return_seals_bootstrap_and_rejects_reentry_and_auth_resources(self):
+        browser = _Browser()
+        scoped = await create_scoped_browser_context(
+            browser,
+            TARGET,
+            {
+                SERVER_BROWSER_ORIGIN_POLICY_KEY: _origin_policy(
+                    "https://app.example.test",
+                    authentication_origin="https://login.example.test",
+                ),
+                "authCookies": "session=opaque",
+            },
+        )
+
+        await browser.context.routes[0](_Route(TARGET, navigation=True))
+        await browser.context.routes[0](
+            _Route("https://login.example.test/connect/authorize", navigation=True)
+        )
+        active_resource = _Route("https://login.example.test/assets/login.js")
+        await browser.context.routes[0](active_resource)
+        self.assertTrue(active_resource.continued)
+
+        await browser.context.routes[0](_Route(TARGET, navigation=True))
+        self.assertTrue(scoped.auth_bootstrap_sealed)
+
+        stale_resource = _Route("https://login.example.test/assets/late.js")
+        await browser.context.routes[0](stale_resource)
+        self.assertTrue(stale_resource.aborted)
+
+        reentry = _Route(
+            "https://login.example.test/connect/authorize",
+            navigation=True,
+        )
+        await browser.context.routes[0](reentry)
+        self.assertTrue(reentry.aborted)
+        self.assertEqual(scoped.blocked_navigation_reason, "AUTH_BOOTSTRAP_REENTRY_BLOCKED")
+
+    async def test_auth_bootstrap_navigation_hop_cap_fails_closed(self):
+        browser = _Browser()
+        scoped = await create_scoped_browser_context(
+            browser,
+            TARGET,
+            {
+                SERVER_BROWSER_ORIGIN_POLICY_KEY: _origin_policy(
+                    "https://app.example.test",
+                    authentication_origin="https://login.example.test",
+                ),
+                "authCookies": "session=opaque",
+            },
+        )
+        await browser.context.routes[0](_Route(TARGET, navigation=True))
+
+        for hop in range(MAX_AUTH_BOOTSTRAP_NAVIGATION_HOPS):
+            route = _Route(
+                f"https://login.example.test/redirect/{hop}",
+                navigation=True,
+            )
+            await browser.context.routes[0](route)
+            self.assertTrue(route.continued)
+
+        over_limit = _Route(
+            "https://login.example.test/redirect/overflow",
+            navigation=True,
+        )
+        await browser.context.routes[0](over_limit)
+        self.assertTrue(over_limit.aborted)
+        self.assertEqual(
+            scoped.blocked_navigation_reason,
+            "AUTH_BOOTSTRAP_HOP_LIMIT_EXCEEDED",
+        )
+        self.assertEqual(
+            scoped.scope_metadata()["authenticationBootstrapHopCount"],
+            MAX_AUTH_BOOTSTRAP_NAVIGATION_HOPS,
+        )
 
     def test_cookie_attributes_and_equals_are_preserved(self):
         cookie = normalize_browser_cookie(
@@ -288,6 +609,7 @@ class BrowserScopedContextTests(unittest.IsolatedAsyncioTestCase):
             headers={
                 "Authorization": "Bearer must-not-cross",
                 "X-Access-Token": "must-not-cross",
+                "Referer": "https://app.example.test/protected?session=must-not-cross",
                 "Accept": "application/json",
                 "Cookie": "native-cookie-semantics",
             },
@@ -296,6 +618,7 @@ class BrowserScopedContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(secondary.continued)
         self.assertNotIn("Authorization", secondary.continue_headers)
         self.assertNotIn("X-Access-Token", secondary.continue_headers)
+        self.assertNotIn("Referer", secondary.continue_headers)
         self.assertEqual(secondary.continue_headers["Accept"], "application/json")
         self.assertIn("Cookie", secondary.continue_headers)
 
@@ -309,7 +632,7 @@ class BrowserScopedContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(scoped.blocked_navigation_urls), 1)
         self.assertNotIn("tracker.invalid", scoped.blocked_navigation_urls[0])
         self.assertEqual(scoped.scope_metadata()["blockedRequestCount"], 2)
-        self.assertEqual(scoped.scope_metadata()["strippedCrossOriginAuthHeaders"], 2)
+        self.assertEqual(scoped.scope_metadata()["strippedCrossOriginAuthHeaders"], 3)
 
     async def test_auth_loss_is_typed_incomplete(self):
         browser = _Browser()

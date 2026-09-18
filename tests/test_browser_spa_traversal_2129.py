@@ -109,6 +109,42 @@ document.addEventListener('click', (event) => {
 </script></body></html>"""
 
 
+def _interstitial_html(
+    *,
+    blocker_text: str,
+    acknowledgement: str = "",
+    acknowledgement_type: str = "button",
+) -> str:
+    acknowledgement_markup = ""
+    if acknowledgement:
+        control = (
+            f'<button type="{acknowledgement_type}" id="ack">'
+            f"{acknowledgement}</button>"
+        )
+        if acknowledgement_type == "submit":
+            control = f'<form action="/danger" method="POST">{control}</form>'
+        acknowledgement_markup = control
+    return f"""<!doctype html><html><head><title>Interstitial SPA</title>
+<style>
+#interstitial {{ position: fixed; inset: 0; z-index: 9999; background: white; }}
+</style></head><body>
+<main><a href="/profile">Profile</a></main>
+<section id="interstitial" role="dialog" aria-modal="true" aria-label="notice">
+  <h2>{blocker_text}</h2>{acknowledgement_markup}
+</section>
+<script>
+const ack = document.getElementById('ack');
+if (ack && ack.type !== 'submit') ack.addEventListener('click', () =>
+  document.getElementById('interstitial').remove());
+</script></body></html>"""
+
+
+def _profile_html() -> str:
+    return """<!doctype html><html><head><title>Profile</title></head>
+<body><main><h1>Profile</h1><form action="/profile/search" method="GET">
+<input name="q" type="search"></form></main></body></html>"""
+
+
 def _origin(value: str) -> str:
     parsed = urlparse(value)
     return f"{parsed.scheme}://{parsed.netloc}"
@@ -117,20 +153,29 @@ def _origin(value: str) -> str:
 def _origin_policy(target: str, *secondary: str):
     primary = _origin(target)
     return {
-        "version": 1,
+        "version": 2,
         "primaryOrigin": primary,
         "allowedOrigins": sorted({primary, *(_origin(item) for item in secondary)}),
+        "authenticationBootstrapOrigin": None,
         "requireExactOrigin": True,
+        "requireFinalPrimaryOrigin": True,
         "stripCrossOriginAuthHeaders": True,
     }
 
 
 class BrowserSpaBudgetTests(unittest.TestCase):
     def test_browser_snapshot_never_serializes_live_form_values(self):
-        source = (Path(__file__).resolve().parents[1] / "tools" / "_browser_spa_traversal.py").read_text()
+        source = Path("tools/_browser_spa_traversal.py").read_text()
         self.assertNotIn('value: successful ?', source)
         self.assertNotIn('String(i.value || \'\').slice', source)
         self.assertIn('hasValue: Boolean(i.value)', source)
+
+    def test_traversal_has_no_force_or_dom_event_click_escape_hatch(self):
+        source = Path("tools/_browser_spa_traversal.py").read_text()
+        self.assertNotIn("force=True", source)
+        self.assertNotIn("force: true", source)
+        self.assertNotIn("dispatchEvent", source)
+        self.assertNotIn(".click()", source)
 
     def test_zero_interactions_and_depth_are_preserved_and_hard_caps_apply(self):
         budget = spa_traversal_budget(
@@ -313,6 +358,283 @@ class BrowserSpaTraversalTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(
             len(json.dumps(public, separators=(",", ":")).encode("utf-8")),
             output["coverage"]["maxOutputBytes"],
+        )
+
+    async def test_consent_interstitial_acknowledges_only_safe_non_submit_control(self):
+        async def root(_request):
+            return web.Response(
+                text=_interstitial_html(
+                    blocker_text="Cookie privacy consent",
+                    acknowledgement="Accept all cookies",
+                ),
+                content_type="text/html",
+            )
+
+        async def profile(_request):
+            return web.Response(text=_profile_html(), content_type="text/html")
+
+        app = web.Application()
+        app.router.add_get("/", root)
+        app.router.add_get("/profile", profile)
+        async with _TestServer(app) as target:
+            output = await BrowserMapAppTool().execute(
+                {
+                    "target": target,
+                    "maxPages": 4,
+                    "maxDepth": 2,
+                    "maxInteractions": 6,
+                    "timeoutSeconds": 25,
+                }
+            )
+
+        self.assertTrue(output["success"], output)
+        self.assertIn(f"{target}/profile", output["routes"])
+        self.assertGreaterEqual(output["coverage"]["blockersAcknowledged"], 1)
+        diagnostic = next(
+            row
+            for row in output["interactionDiagnostics"]
+            if row.get("resolution") == "acknowledged"
+        )
+        self.assertEqual(diagnostic["blockerKind"], "consent")
+        self.assertEqual(diagnostic["ackControl"], "accept")
+        self.assertNotIn("Cookie privacy consent", json.dumps(diagnostic))
+
+    async def test_disclosure_interstitial_uses_primary_real_href_fallback(self):
+        observed_headers = {}
+
+        async def root(_request):
+            return web.Response(
+                text=_interstitial_html(
+                    blocker_text="Important security notice disclosure",
+                ),
+                content_type="text/html",
+            )
+
+        async def profile(request):
+            observed_headers.update(dict(request.headers))
+            return web.Response(text=_profile_html(), content_type="text/html")
+
+        app = web.Application()
+        app.router.add_get("/", root)
+        app.router.add_get("/profile", profile)
+        async with _TestServer(app) as target:
+            output = await BrowserTrafficCaptureTool().execute(
+                {
+                    "target": target,
+                    "maxPages": 4,
+                    "maxDepth": 2,
+                    "maxInteractions": 5,
+                    "timeoutSeconds": 25,
+                    "fillSearchInputs": False,
+                    "headers": {"X-Fallback-Proof": "preserved"},
+                }
+            )
+
+        self.assertTrue(output["success"], output)
+        self.assertIn(f"{target}/profile", output["routes"])
+        self.assertEqual(observed_headers.get("X-Fallback-Proof"), "preserved")
+        self.assertGreaterEqual(output["coverage"]["navigationFallbacks"], 1)
+        self.assertTrue(
+            any(
+                row.get("resolution") == "same-origin-goto"
+                and row.get("blockerKind") == "disclosure"
+                for row in output["interactionDiagnostics"]
+            ),
+            output,
+        )
+
+    async def test_submit_ack_is_never_pressed_and_route_fallback_stays_get_only(self):
+        dangerous = {"posts": 0}
+
+        async def root(_request):
+            return web.Response(
+                text=_interstitial_html(
+                    blocker_text="Cookie consent",
+                    acknowledgement="Accept all cookies",
+                    acknowledgement_type="submit",
+                ),
+                content_type="text/html",
+            )
+
+        async def profile(_request):
+            return web.Response(text=_profile_html(), content_type="text/html")
+
+        async def danger(_request):
+            dangerous["posts"] += 1
+            return web.Response(text="unexpected")
+
+        app = web.Application()
+        app.router.add_get("/", root)
+        app.router.add_get("/profile", profile)
+        app.router.add_post("/danger", danger)
+        async with _TestServer(app) as target:
+            output = await BrowserMapAppTool().execute(
+                {
+                    "target": target,
+                    "maxPages": 4,
+                    "maxDepth": 2,
+                    "maxInteractions": 5,
+                    "timeoutSeconds": 25,
+                }
+            )
+
+        self.assertTrue(output["success"], output)
+        self.assertEqual(dangerous["posts"], 0)
+        self.assertEqual(output["coverage"]["blockersAcknowledged"], 0)
+        self.assertGreaterEqual(output["coverage"]["navigationFallbacks"], 1)
+
+    async def test_unclassified_overlay_never_triggers_ack_or_navigation_fallback(self):
+        profile_hits = {"count": 0}
+
+        async def root(_request):
+            return web.Response(
+                text=_interstitial_html(
+                    blocker_text="Welcome promotion",
+                    acknowledgement="Continue",
+                ),
+                content_type="text/html",
+            )
+
+        async def profile(_request):
+            profile_hits["count"] += 1
+            return web.Response(text=_profile_html(), content_type="text/html")
+
+        app = web.Application()
+        app.router.add_get("/", root)
+        app.router.add_get("/profile", profile)
+        async with _TestServer(app) as target:
+            output = await BrowserMapAppTool().execute(
+                {
+                    "target": target,
+                    "maxPages": 4,
+                    "maxDepth": 2,
+                    "maxInteractions": 5,
+                    "timeoutSeconds": 25,
+                }
+            )
+
+        self.assertFalse(output["success"], output)
+        self.assertEqual(output["coverageReason"], "SAFE_SPA_INTERACTIONS_UNREACHABLE")
+        self.assertEqual(profile_hits["count"], 0)
+        self.assertEqual(output["coverage"]["blockersAcknowledged"], 0)
+        self.assertEqual(output["coverage"]["navigationFallbacks"], 0)
+        self.assertTrue(
+            any(
+                row.get("actionability") == "covered-unclassified"
+                and row.get("resolution") == "blocked"
+                for row in output["interactionDiagnostics"]
+            ),
+            output,
+        )
+
+    async def test_data_route_without_real_href_is_not_navigation_fallback(self):
+        profile_hits = {"count": 0}
+
+        async def root(_request):
+            return web.Response(
+                text="""<!doctype html><html><head><style>
+#interstitial { position: fixed; inset: 0; z-index: 9999; background: white; }
+</style></head><body><main><div data-route="/profile">Profile</div></main>
+<section id="interstitial" role="dialog" aria-modal="true">
+<h2>Important security notice disclosure</h2></section></body></html>""",
+                content_type="text/html",
+            )
+
+        async def profile(_request):
+            profile_hits["count"] += 1
+            return web.Response(text=_profile_html(), content_type="text/html")
+
+        app = web.Application()
+        app.router.add_get("/", root)
+        app.router.add_get("/profile", profile)
+        async with _TestServer(app) as target:
+            output = await BrowserMapAppTool().execute(
+                {
+                    "target": target,
+                    "maxPages": 4,
+                    "maxDepth": 2,
+                    "maxInteractions": 5,
+                    "timeoutSeconds": 25,
+                }
+            )
+
+        self.assertFalse(output["success"], output)
+        self.assertEqual(profile_hits["count"], 0)
+        self.assertEqual(output["coverage"]["navigationFallbacks"], 0)
+
+    async def test_primary_href_fallback_revalidates_authenticated_401(self):
+        async def root(_request):
+            return web.Response(
+                text=_interstitial_html(
+                    blocker_text="Important security notice disclosure",
+                ),
+                content_type="text/html",
+            )
+
+        async def denied(_request):
+            return web.Response(status=401, text="login required")
+
+        app = web.Application()
+        app.router.add_get("/", root)
+        app.router.add_get("/profile", denied)
+        async with _TestServer(app) as target:
+            output = await BrowserMapAppTool().execute(
+                {
+                    "target": target,
+                    "cookieJar": [
+                        {"name": "session", "value": "synthetic", "path": "/"}
+                    ],
+                    "maxPages": 4,
+                    "maxDepth": 2,
+                    "maxInteractions": 5,
+                    "timeoutSeconds": 25,
+                }
+            )
+
+        self.assertFalse(output["success"], output)
+        self.assertEqual(output["coverageReason"], "AUTHENTICATION_LOST_HTTP_401")
+        self.assertNotIn("synthetic", json.dumps(output))
+
+    async def test_primary_href_fallback_blocks_cross_origin_redirect(self):
+        external_hits = {"count": 0}
+
+        async def external(_request):
+            external_hits["count"] += 1
+            return web.Response(text="outside")
+
+        external_app = web.Application()
+        external_app.router.add_get("/outside", external)
+        async with _TestServer(external_app) as external_origin:
+            async def root(_request):
+                return web.Response(
+                    text=_interstitial_html(
+                        blocker_text="Important security notice disclosure",
+                    ),
+                    content_type="text/html",
+                )
+
+            async def redirect(_request):
+                raise web.HTTPFound(f"{external_origin}/outside")
+
+            app = web.Application()
+            app.router.add_get("/", root)
+            app.router.add_get("/profile", redirect)
+            async with _TestServer(app) as target:
+                output = await BrowserMapAppTool().execute(
+                    {
+                        "target": target,
+                        "maxPages": 4,
+                        "maxDepth": 2,
+                        "maxInteractions": 5,
+                        "timeoutSeconds": 25,
+                    }
+                )
+
+        self.assertFalse(output["success"], output)
+        self.assertEqual(output["coverageReason"], "CROSS_ORIGIN_REDIRECT_BLOCKED")
+        self.assertEqual(external_hits["count"], 0)
+        self.assertGreaterEqual(
+            output["scopeMetadata"]["blockedNavigationCount"], 1
         )
 
     async def test_authorized_secondary_api_is_captured_without_forwarding_auth_headers(self):

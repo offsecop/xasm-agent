@@ -23,17 +23,30 @@ RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap 
     && ln -s /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap \
     && chmod +x /usr/local/bin/sqlmap
 
-# Install nuclei via binary (faster and more reliable) - v3.3.6 (supports -dast flag)
-# v3.3.6 is the latest stable v3.3.x - avoids v3.4.x which produces 0 findings (BROKEN)
-# Upgraded from v3.1.5 to enable DAST mode (headless browser scanning)
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then NUCLEI_ARCH="arm64"; else NUCLEI_ARCH="amd64"; fi && \
-    wget https://github.com/projectdiscovery/nuclei/releases/download/v3.3.6/nuclei_3.3.6_linux_${NUCLEI_ARCH}.zip \
-    && unzip nuclei_3.3.6_linux_${NUCLEI_ARCH}.zip \
-    && mv nuclei /usr/local/bin/ \
-    && rm nuclei_3.3.6_linux_${NUCLEI_ARCH}.zip README.md LICENSE.md \
-    && nuclei -version \
-    && nuclei -update-templates || echo "Template update skipped"
+# Install the pinned Nuclei release for the image architecture. Verify the
+# archive against ProjectDiscovery's release checksum manifest before unzip.
+ARG NUCLEI_VERSION=3.11.1
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    case "$ARCH" in \
+        amd64) NUCLEI_ARCH="amd64" ;; \
+        arm64) NUCLEI_ARCH="arm64" ;; \
+        *) echo "Unsupported Nuclei architecture: $ARCH" >&2; exit 1 ;; \
+    esac; \
+    NUCLEI_ASSET="nuclei_${NUCLEI_VERSION}_linux_${NUCLEI_ARCH}.zip"; \
+    NUCLEI_CHECKSUMS="nuclei_${NUCLEI_VERSION}_checksums.txt"; \
+    NUCLEI_RELEASE_URL="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}"; \
+    wget -q "${NUCLEI_RELEASE_URL}/${NUCLEI_ASSET}"; \
+    wget -q "${NUCLEI_RELEASE_URL}/${NUCLEI_CHECKSUMS}"; \
+    grep -E "[[:space:]]${NUCLEI_ASSET}$" "$NUCLEI_CHECKSUMS" > nuclei.sha256; \
+    test -s nuclei.sha256; \
+    sha256sum -c nuclei.sha256; \
+    unzip "$NUCLEI_ASSET" nuclei; \
+    mv nuclei /usr/local/bin/; \
+    chmod +x /usr/local/bin/nuclei; \
+    rm -f "$NUCLEI_ASSET" "$NUCLEI_CHECKSUMS" nuclei.sha256; \
+    nuclei -version; \
+    nuclei -update-templates || echo "Template update skipped"
 
 # Install katana web crawler (architecture-aware)
 # v1.6.x adds automatic form fill, stronger headless crawling, page load
