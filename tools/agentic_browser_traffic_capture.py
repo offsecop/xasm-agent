@@ -306,6 +306,7 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                     "xhrRequests",
                     "siteMapUrls",
                     "parameterizedUrls",
+                    "interactionDiagnostics",
                     "linkObservations",
                     "scriptObservations",
                     "visitedStates",
@@ -588,6 +589,7 @@ class BrowserTrafficCaptureTool(ToolPlugin):
             ),
             "linkObservations": html_map.get("linkObservations", []),
             "scriptObservations": html_map.get("scriptObservations", []),
+            "interactionDiagnostics": html_map.get("interactionDiagnostics", []),
             "scopeMetadata": scope_metadata or {},
             "coverage": {
                 key: html_map.get(key)
@@ -601,6 +603,9 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                     "interactionsUsed",
                     "interactionFailures",
                     "candidatesObserved",
+                    "blockersObserved",
+                    "blockersAcknowledged",
+                    "navigationFallbacks",
                     "elapsedMs",
                     "artifactBytes",
                     "budget",
@@ -624,6 +629,10 @@ class BrowserTrafficCaptureTool(ToolPlugin):
                     }
                 ),
                 "interactions": html_map.get("interactionsUsed", 0),
+                "blockersAcknowledged": html_map.get(
+                    "blockersAcknowledged", 0
+                ),
+                "navigationFallbacks": html_map.get("navigationFallbacks", 0),
                 "truncated": bool(html_map.get("truncated")) or omitted_requests > 0,
                 "omittedStates": html_map.get("omittedStates", 0),
                 "omittedRequests": omitted_requests,

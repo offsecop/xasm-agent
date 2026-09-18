@@ -57,6 +57,11 @@ EXPECTED_BUDGETS: Dict[str, int] = {
     "requestsPerOriginPerSecond": 2,
     "concurrency": 1,
 }
+NON_RETRYABLE_STOP_REASONS = {
+    "REQUEST_BUDGET_EXHAUSTED",
+    "RESPONSE_BYTE_BUDGET_EXHAUSTED",
+    "RESPONSE_TRUNCATED",
+}
 
 _PLAN_KEYS = {"version", "templateId", "origin", "units", "skipped", "budgets"}
 _UNIT_KEYS = {
@@ -591,6 +596,10 @@ class WebAdaptiveHttpProbeTool(ToolPlugin):
                 ),
                 "durationMs": elapsed_ms,
                 "stopReason": stop_reason,
+                "retryable": bool(
+                    stop_reason
+                    and stop_reason not in NON_RETRYABLE_STOP_REASONS
+                ),
                 "skippedByReason": skipped_by_reason,
             },
             "outcomes": outcomes,
@@ -644,8 +653,8 @@ class WebAdaptiveHttpProbeTool(ToolPlugin):
         response_headers = _redact_transcript_headers(result.get("headers"))
         sanitized_body = sanitizer.sanitize_text(result.get("body"))
         body_bytes = sanitized_body.encode("utf-8", errors="replace")
-        evidence_truncated = len(body_bytes) > EXPECTED_BUDGETS["maxEvidenceBodyBytes"]
-        if evidence_truncated:
+        projection_truncated = len(body_bytes) > EXPECTED_BUDGETS["maxEvidenceBodyBytes"]
+        if projection_truncated:
             sanitized_body = body_bytes[: EXPECTED_BUDGETS["maxEvidenceBodyBytes"]].decode(
                 "utf-8", errors="ignore"
             )
@@ -672,12 +681,14 @@ class WebAdaptiveHttpProbeTool(ToolPlugin):
                 },
                 "body": sanitized_body,
                 "bodySha256": _sha256(sanitized_body),
-                "bodyLength": (
-                    len(body_bytes)
-                    if evidence_truncated
-                    else len(sanitized_body.encode("utf-8", errors="replace"))
-                ),
-                "truncated": bool(result.get("truncated")) or evidence_truncated,
+                # `bodyLength` describes the fully sanitized response while
+                # `body` is the bounded proof projection persisted for server
+                # recomputation. Transport truncation is deliberately kept
+                # separate: projection clipping alone does not mean the probe
+                # failed to read or analyse the response.
+                "bodyLength": len(body_bytes),
+                "truncated": bool(result.get("truncated")),
+                "projectionTruncated": projection_truncated,
                 "elapsedMs": max(0, int(result.get("_elapsedMs") or 0)),
             },
         }
@@ -696,7 +707,7 @@ class WebAdaptiveHttpProbeTool(ToolPlugin):
                 if exchange["response"].get("truncated")
             )
             return self._incomplete_outcome(
-                unit, exchanges[:first_truncated], "EVIDENCE_BODY_TRUNCATED"
+                unit, exchanges[:first_truncated], "RESPONSE_TRUNCATED"
             )
         values = _request_parameter_values(unit.requests, unit.parameter_name)
         bodies = {

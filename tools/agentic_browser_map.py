@@ -196,6 +196,9 @@ class BrowserMapAppTool(ToolPlugin):
                     "buttons": traversal.get("buttons", []),
                     "inputs": traversal.get("inputs", []),
                     "safeInteractions": traversal.get("safeInteractions", []),
+                    "interactionDiagnostics": traversal.get(
+                        "interactionDiagnostics", []
+                    ),
                     "visitedStates": visited_states,
                     "routes": routes,
                     "linkObservations": traversal.get("linkObservations", []),
@@ -213,6 +216,9 @@ class BrowserMapAppTool(ToolPlugin):
                             "interactionsUsed",
                             "interactionFailures",
                             "candidatesObserved",
+                            "blockersObserved",
+                            "blockersAcknowledged",
+                            "navigationFallbacks",
                             "elapsedMs",
                             "artifactBytes",
                             "budget",
@@ -231,6 +237,12 @@ class BrowserMapAppTool(ToolPlugin):
                         "visitedStates": traversal.get("pagesObserved", 0),
                         "routes": len(routes),
                         "interactions": traversal.get("interactionsUsed", 0),
+                        "blockersAcknowledged": traversal.get(
+                            "blockersAcknowledged", 0
+                        ),
+                        "navigationFallbacks": traversal.get(
+                            "navigationFallbacks", 0
+                        ),
                         "truncated": bool(traversal.get("truncated")),
                         "omittedStates": traversal.get("omittedStates", 0),
                     },
@@ -251,6 +263,7 @@ class BrowserMapAppTool(ToolPlugin):
                         "linkObservations",
                         "scripts",
                         "links",
+                        "interactionDiagnostics",
                         "safeInteractions",
                         "visitedStates",
                         "routes",

@@ -21,12 +21,14 @@ SAFE_BROWSER_SCHEMES = ("about:", "blob:", "data:")
 BROWSER_CONTEXT_SCOPE_OPTIONS = {"service_workers": "block"}
 SERVER_BROWSER_ORIGIN_POLICY_KEY = "_serverBrowserOriginPolicy"
 MAX_AUTHORIZED_BROWSER_ORIGINS = 64
+MAX_AUTH_BOOTSTRAP_NAVIGATION_HOPS = 8
 
 
 @dataclass(frozen=True)
 class BrowserOriginPolicy:
     primary_origin: str
     allowed_origins: Tuple[str, ...]
+    authentication_bootstrap_origin: Optional[str]
     server_attested: bool
 
     def url_is_primary(self, value: str) -> bool:
@@ -34,6 +36,12 @@ class BrowserOriginPolicy:
 
     def url_is_authorized(self, value: str) -> bool:
         return _exact_http_origin(value) in self.allowed_origins
+
+    def url_is_authentication(self, value: str) -> bool:
+        return (
+            self.authentication_bootstrap_origin is not None
+            and _exact_http_origin(value) == self.authentication_bootstrap_origin
+        )
 
 
 class BrowserCoverageIncomplete(RuntimeError):
@@ -91,6 +99,22 @@ def _safe_origin_fingerprint(value: Any) -> str:
     return hashlib.sha256(origin.encode("utf-8")).hexdigest()[:16]
 
 
+def _safe_url_projection(value: Any) -> Optional[str]:
+    """Project an HTTP(S) URL without credentials, params, query, or fragment."""
+
+    origin = _exact_http_origin(value)
+    if origin is None or not isinstance(value, str):
+        return None
+    try:
+        parsed = urlparse(value.strip())
+        path = parsed.path or "/"
+        if any(char in path for char in ("\r", "\n", "\0")):
+            return origin
+        return f"{origin}{path}"
+    except (TypeError, ValueError):
+        return origin
+
+
 def browser_scope_metadata(
     policy: BrowserOriginPolicy,
     *,
@@ -107,9 +131,12 @@ def browser_scope_metadata(
         if len(fingerprints) >= 20:
             break
     return {
-        "policyVersion": 1,
+        "policyVersion": 2 if policy.server_attested else 1,
         "serverAttested": policy.server_attested,
         "allowedOriginCount": len(policy.allowed_origins),
+        "authenticationOriginCount": int(
+            policy.authentication_bootstrap_origin is not None
+        ),
         "blockedRequestCount": len(blocked_urls or []),
         "blockedNavigationCount": blocked_navigation_count,
         "blockedOriginFingerprints": fingerprints,
@@ -140,15 +167,23 @@ def browser_origin_policy(parameters: Dict[str, Any], target: str) -> BrowserOri
         return BrowserOriginPolicy(
             primary_origin=target_origin,
             allowed_origins=(target_origin,),
+            authentication_bootstrap_origin=None,
             server_attested=False,
         )
-    if not isinstance(raw, dict) or set(raw) != {
+    required_keys = {
         "version",
         "primaryOrigin",
         "allowedOrigins",
         "requireExactOrigin",
+        "requireFinalPrimaryOrigin",
         "stripCrossOriginAuthHeaders",
-    }:
+    }
+    optional_keys = {"authenticationBootstrapOrigin"}
+    if (
+        not isinstance(raw, dict)
+        or not required_keys.issubset(raw)
+        or not set(raw).issubset(required_keys | optional_keys)
+    ):
         raise BrowserCoverageIncomplete(
             "INVALID_BROWSER_ORIGIN_POLICY",
             "server browser origin policy has an invalid shape",
@@ -156,8 +191,9 @@ def browser_origin_policy(parameters: Dict[str, Any], target: str) -> BrowserOri
     allowed = raw.get("allowedOrigins")
     if (
         type(raw.get("version")) is not int
-        or raw.get("version") != 1
+        or raw.get("version") != 2
         or raw.get("requireExactOrigin") is not True
+        or raw.get("requireFinalPrimaryOrigin") is not True
         or raw.get("stripCrossOriginAuthHeaders") is not True
         or not isinstance(allowed, list)
         or not allowed
@@ -169,6 +205,12 @@ def browser_origin_policy(parameters: Dict[str, Any], target: str) -> BrowserOri
             "server browser origin policy is not an exact-origin policy",
         )
 
+    authentication = raw.get("authenticationBootstrapOrigin")
+    if authentication is not None and not isinstance(authentication, str):
+        raise BrowserCoverageIncomplete(
+            "INVALID_BROWSER_ORIGIN_POLICY",
+            "server browser authentication origin policy is invalid",
+        )
     canonical_allowed = tuple(
         origin
         for origin in (
@@ -179,6 +221,11 @@ def browser_origin_policy(parameters: Dict[str, Any], target: str) -> BrowserOri
     canonical_primary = _exact_http_origin(
         raw.get("primaryOrigin"), require_origin_only=True
     )
+    canonical_authentication = (
+        _exact_http_origin(authentication, require_origin_only=True)
+        if authentication is not None
+        else None
+    )
     if (
         len(canonical_allowed) != len(allowed)
         or tuple(allowed) != canonical_allowed
@@ -186,6 +233,9 @@ def browser_origin_policy(parameters: Dict[str, Any], target: str) -> BrowserOri
         or canonical_primary != raw.get("primaryOrigin")
         or canonical_primary != target_origin
         or canonical_primary not in canonical_allowed
+        or (authentication is not None and canonical_authentication != authentication)
+        or canonical_authentication == canonical_primary
+        or canonical_authentication in canonical_allowed
     ):
         raise BrowserCoverageIncomplete(
             "INVALID_BROWSER_ORIGIN_POLICY",
@@ -194,6 +244,7 @@ def browser_origin_policy(parameters: Dict[str, Any], target: str) -> BrowserOri
     return BrowserOriginPolicy(
         primary_origin=canonical_primary,
         allowed_origins=canonical_allowed,
+        authentication_bootstrap_origin=canonical_authentication,
         server_attested=True,
     )
 
@@ -201,8 +252,20 @@ def browser_origin_policy(parameters: Dict[str, Any], target: str) -> BrowserOri
 def _header_is_sensitive_cross_origin(name: Any) -> bool:
     normalized = str(name or "").strip().lower().replace("_", "-")
     return (
-        normalized in {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+        normalized
+        in {
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "api-key",
+            "apikey",
+            "referer",
+            "referrer",
+        }
         or "token" in normalized
+        or "csrf" in normalized
+        or "xsrf" in normalized
+        or "api-key" in normalized
         or normalized.endswith("-secret")
         or normalized == "secret"
     )
@@ -244,13 +307,20 @@ class ScopedBrowserContext:
     rejected_cookie_count: int
     primary_origin: str = ""
     allowed_origins: Tuple[str, ...] = field(default_factory=tuple)
+    authentication_bootstrap_origin: Optional[str] = None
     server_attested_policy: bool = False
     has_sensitive_extra_headers: bool = False
     blocked_navigation_urls: List[str] = field(default_factory=list)
+    blocked_navigation_reason: Optional[str] = None
     blocked_request_count: int = 0
     blocked_origin_fingerprints: List[str] = field(default_factory=list)
     stripped_cross_origin_auth_headers: int = 0
     auth_failure_status: Optional[int] = None
+    auth_bootstrap_initial_primary_seen: bool = False
+    auth_bootstrap_started: bool = False
+    auth_bootstrap_document_active: bool = False
+    auth_bootstrap_sealed: bool = False
+    auth_bootstrap_navigation_hops: int = 0
 
     def url_is_primary(self, value: str) -> bool:
         return _exact_http_origin(value) == self.primary_origin
@@ -258,7 +328,57 @@ class ScopedBrowserContext:
     def url_is_authorized(self, value: str) -> bool:
         return _exact_http_origin(value) in self.allowed_origins
 
-    def note_blocked_url(self, value: str, *, navigation: bool = False) -> None:
+    def url_is_authentication(self, value: str) -> bool:
+        return (
+            self.authentication_bootstrap_origin is not None
+            and _exact_http_origin(value) == self.authentication_bootstrap_origin
+        )
+
+    def authorize_top_level_navigation(self, value: str) -> Tuple[bool, Optional[str]]:
+        """Advance the one-shot authentication bootstrap state machine."""
+
+        if self.url_is_primary(value):
+            if not self.auth_bootstrap_initial_primary_seen:
+                self.auth_bootstrap_initial_primary_seen = True
+            elif self.auth_bootstrap_started and not self.auth_bootstrap_sealed:
+                self.seal_auth_bootstrap()
+            return True, None
+
+        if not self.url_is_authentication(value):
+            return False, "AUTHENTICATION_LOST_REDIRECT"
+        if not self.authenticated or not self.server_attested_policy:
+            return False, "AUTHENTICATION_LOST_REDIRECT"
+        if not self.auth_bootstrap_initial_primary_seen:
+            return False, "AUTH_BOOTSTRAP_INITIAL_PRIMARY_REQUIRED"
+        if self.auth_bootstrap_sealed:
+            return False, "AUTH_BOOTSTRAP_REENTRY_BLOCKED"
+        if self.auth_bootstrap_navigation_hops >= MAX_AUTH_BOOTSTRAP_NAVIGATION_HOPS:
+            return False, "AUTH_BOOTSTRAP_HOP_LIMIT_EXCEEDED"
+
+        self.auth_bootstrap_started = True
+        self.auth_bootstrap_document_active = True
+        self.auth_bootstrap_navigation_hops += 1
+        return True, None
+
+    def auth_subresource_is_authorized(self, value: str) -> bool:
+        return (
+            self.url_is_authentication(value)
+            and self.auth_bootstrap_started
+            and self.auth_bootstrap_document_active
+            and not self.auth_bootstrap_sealed
+        )
+
+    def seal_auth_bootstrap(self) -> None:
+        self.auth_bootstrap_document_active = False
+        self.auth_bootstrap_sealed = True
+
+    def note_blocked_url(
+        self,
+        value: str,
+        *,
+        navigation: bool = False,
+        reason: Optional[str] = None,
+    ) -> None:
         self.blocked_request_count += 1
         fingerprint = _safe_origin_fingerprint(value)
         if fingerprint not in self.blocked_origin_fingerprints:
@@ -266,12 +386,19 @@ class ScopedBrowserContext:
             del self.blocked_origin_fingerprints[20:]
         if navigation:
             self.blocked_navigation_urls.append(fingerprint)
+            if self.blocked_navigation_reason is None:
+                self.blocked_navigation_reason = reason or "AUTHENTICATION_LOST_REDIRECT"
 
     def scope_metadata(self) -> Dict[str, Any]:
         return {
-            "policyVersion": 1,
+            "policyVersion": 2 if self.server_attested_policy else 1,
             "serverAttested": self.server_attested_policy,
             "allowedOriginCount": len(self.allowed_origins),
+            "authenticationOriginCount": int(
+                self.authentication_bootstrap_origin is not None
+            ),
+            "authenticationBootstrapHopCount": self.auth_bootstrap_navigation_hops,
+            "authenticationBootstrapSealed": self.auth_bootstrap_sealed,
             "blockedRequestCount": self.blocked_request_count,
             "blockedNavigationCount": len(self.blocked_navigation_urls),
             "blockedOriginFingerprints": list(self.blocked_origin_fingerprints),
@@ -463,7 +590,14 @@ async def create_scoped_browser_context(
     """Create one authenticated Playwright context with an exact-origin policy."""
 
     policy = browser_origin_policy(parameters, target)
-    cookies, rejected = browser_cookie_rows(parameters, target, policy.allowed_origins)
+    cookie_origins = policy.allowed_origins
+    if policy.authentication_bootstrap_origin is not None:
+        cookie_origins = tuple(
+            sorted(
+                set(cookie_origins).union((policy.authentication_bootstrap_origin,))
+            )
+        )
+    cookies, rejected = browser_cookie_rows(parameters, target, cookie_origins)
     structured_present = parameters.get("cookieJar") is not None
     legacy_present = bool(parameters.get("cookie") or parameters.get("authCookies"))
     if (structured_present or legacy_present) and not cookies:
@@ -488,6 +622,7 @@ async def create_scoped_browser_context(
         rejected_cookie_count=rejected,
         primary_origin=policy.primary_origin,
         allowed_origins=policy.allowed_origins,
+        authentication_bootstrap_origin=policy.authentication_bootstrap_origin,
         server_attested_policy=policy.server_attested,
         has_sensitive_extra_headers=has_sensitive_headers,
     )
@@ -495,20 +630,36 @@ async def create_scoped_browser_context(
     async def keep_requests_in_scope(route: Any) -> None:
         request = route.request
         request_url = str(request.url)
-        if request_url.startswith(SAFE_BROWSER_SCHEMES):
-            await route.continue_()
-            return
         navigation = False
         try:
             frame = request.frame
             navigation = request.is_navigation_request() and frame.parent_frame is None
         except Exception:
             pass
-        # Secondary origins authorize SPA resources/API calls, not visible
-        # navigation. The browser must remain rooted at the primary app.
-        if state.url_is_authorized(request_url) and not (
-            navigation and not state.url_is_primary(request_url)
-        ):
+        if request_url.startswith(SAFE_BROWSER_SCHEMES):
+            if navigation:
+                state.note_blocked_url(
+                    request_url,
+                    navigation=True,
+                    reason="AUTHENTICATION_LOST_REDIRECT",
+                )
+                await route.abort("blockedbyclient")
+            else:
+                await route.continue_()
+            return
+        # Persisted scope origins authorize SPA resources/API calls, not visible
+        # navigation. The single server-attested authentication origin is a
+        # one-shot bootstrap lane and never joins the normal resource scope.
+        if navigation:
+            request_authorized, blocked_reason = state.authorize_top_level_navigation(
+                request_url
+            )
+        else:
+            request_authorized = state.url_is_authorized(
+                request_url
+            ) or state.auth_subresource_is_authorized(request_url)
+            blocked_reason = None
+        if request_authorized:
             if not state.url_is_primary(request_url):
                 request_headers: Dict[str, str]
                 try:
@@ -532,15 +683,19 @@ async def create_scoped_browser_context(
                     return
             await route.continue_()
             return
-        state.note_blocked_url(request_url, navigation=navigation)
+        state.note_blocked_url(
+            request_url,
+            navigation=navigation,
+            reason=blocked_reason,
+        )
         await route.abort("blockedbyclient")
 
     async def keep_websockets_in_scope(websocket: Any) -> None:
         websocket_origin = _websocket_http_origin(websocket.url)
         secondary = websocket_origin != state.primary_origin
-        if (
-            websocket_origin in state.allowed_origins
-            and not (secondary and state.has_sensitive_extra_headers)
+        request_authorized = websocket_origin in state.allowed_origins
+        if request_authorized and not (
+            secondary and state.has_sensitive_extra_headers
         ):
             websocket.connect_to_server()
         else:
@@ -601,10 +756,15 @@ async def validate_authenticated_navigation(
         )
     if state.blocked_navigation_urls:
         raise BrowserCoverageIncomplete(
-            "AUTHENTICATION_LOST_REDIRECT",
+            state.blocked_navigation_reason or "AUTHENTICATION_LOST_REDIRECT",
             "authenticated navigation redirected outside the authorized origin",
         )
     if not state.url_is_primary(page.url):
+        if state.url_is_authentication(page.url):
+            raise BrowserCoverageIncomplete(
+                "AUTH_BOOTSTRAP_TERMINAL_AUTH_ORIGIN",
+                "authentication bootstrap did not return to the primary origin",
+            )
         raise BrowserCoverageIncomplete(
             "AUTHENTICATION_LOST_REDIRECT",
             "authenticated navigation left the authorized origin",
@@ -629,6 +789,8 @@ async def validate_authenticated_navigation(
             "AUTHENTICATION_LOST_LOGIN_FORM",
             "protected navigation resolved to a login surface",
         )
+    if state.authentication_bootstrap_origin is not None:
+        state.seal_auth_bootstrap()
 
 
 def incomplete_output(
@@ -645,7 +807,7 @@ def incomplete_output(
         "coverageReason": failure.reason,
         "verified": False,
         "target": target,
-        "finalUrl": final_url,
+        "finalUrl": _safe_url_projection(final_url),
         "status": status,
         "error": failure.detail,
         "findings": [],

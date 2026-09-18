@@ -26,6 +26,49 @@ TEMPLATE_CATEGORIES = [
 DEFAULT_CATEGORY_TIMEOUT_SECONDS = 180
 MIN_CATEGORY_TIMEOUT_SECONDS = 30
 MAX_CATEGORY_TIMEOUT_SECONDS = 900
+MAX_CATEGORY_ELAPSED_MS = MAX_CATEGORY_TIMEOUT_SECONDS * 1000
+MAX_CATEGORY_FINDING_COUNT = 100000
+MAX_STDERR_CLASSIFICATION_BYTES = 8192
+MIN_EXIT_CODE = -255
+MAX_EXIT_CODE = 255
+TEMPLATE_LOADING_CONCURRENCY = 4
+
+CATEGORY_STATUS_COMPLETED = "COMPLETED"
+CATEGORY_STATUS_TIMED_OUT = "TIMED_OUT"
+CATEGORY_STATUS_PROCESS_FAILED = "PROCESS_FAILED"
+
+DIAGNOSTIC_NONE = "NONE"
+DIAGNOSTIC_CATEGORY_TIMEOUT = "CATEGORY_TIMEOUT"
+DIAGNOSTIC_NUCLEI_NONZERO_EXIT = "NUCLEI_NONZERO_EXIT"
+DIAGNOSTIC_NUCLEI_THREAD_LIMIT = "NUCLEI_THREAD_LIMIT"
+DIAGNOSTIC_NUCLEI_FATAL_RUNTIME = "NUCLEI_FATAL_RUNTIME"
+DIAGNOSTIC_NUCLEI_SPAWN_FAILED = "NUCLEI_SPAWN_FAILED"
+DIAGNOSTIC_NUCLEI_PROCESS_ERROR = "NUCLEI_PROCESS_ERROR"
+
+
+def _bounded_exit_code(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return max(MIN_EXIT_CODE, min(value, MAX_EXIT_CODE))
+
+
+def _bounded_elapsed_ms(started_at: float, finished_at: float) -> int:
+    elapsed_ms = int(max(0.0, finished_at - started_at) * 1000)
+    return min(elapsed_ms, MAX_CATEGORY_ELAPSED_MS)
+
+
+def _classify_process_diagnostic(stderr_bytes: bytes, exit_code):
+    """Classify bounded stderr in memory without returning or logging its content."""
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").lower()
+    if "newosproc" in stderr_text or "failed to create new os thread" in stderr_text:
+        return DIAGNOSTIC_NUCLEI_THREAD_LIMIT
+    if "fatal error:" in stderr_text or "panic:" in stderr_text:
+        return DIAGNOSTIC_NUCLEI_FATAL_RUNTIME
+    if exit_code not in (None, 0):
+        return DIAGNOSTIC_NUCLEI_NONZERO_EXIT
+    if exit_code is None:
+        return DIAGNOSTIC_NUCLEI_PROCESS_ERROR
+    return DIAGNOSTIC_NONE
 
 
 def coerce_category_timeout_seconds(value) -> int:
@@ -211,13 +254,11 @@ class NucleiFullScanTool(ToolPlugin):
             else:
                 print(f"[Nuclei Full] Public/unauthenticated scan mode")
 
-            # Write exclusion patterns to temp file for nuclei -exclude-targets
-            exclude_file = None
+            # Nuclei's -exclude-hosts is a repeatable string-slice flag; it does
+            # not accept a filename containing exclusions.
             if exclusion_url_patterns:
-                exclude_file = f"{output_dir}/exclude_{job_id[:8]}_{timestamp}.txt"
-                with open(exclude_file, 'w') as f:
-                    f.write('\n'.join(exclusion_url_patterns))
-                common_extra_args.extend(["-exclude-targets", exclude_file])
+                for exclusion_pattern in exclusion_url_patterns:
+                    common_extra_args.extend(["-exclude-hosts", exclusion_pattern])
                 print(f"[Nuclei Full] Excluding {len(exclusion_url_patterns)} URL patterns")
 
             # Rate limiting from config (overrides defaults). Intentionally left at
@@ -246,6 +287,7 @@ class NucleiFullScanTool(ToolPlugin):
             all_findings = []
             start_time = time.time()
             category_results = {}
+            category_outcomes = []
 
             for cat_idx, category in enumerate(TEMPLATE_CATEGORIES):
                 cat_label = category.rstrip('/').split('/')[-1]
@@ -274,10 +316,17 @@ class NucleiFullScanTool(ToolPlugin):
                     "-timeout", "15",
                     "-c", c_val,
                     "-bs", bs_val,
+                    "-tlc", str(TEMPLATE_LOADING_CONCURRENCY),
                     "-rl", rl_val,
                 ] + common_extra_args
 
                 batch_findings = []
+                category_started_at = time.monotonic()
+                category_status = CATEGORY_STATUS_PROCESS_FAILED
+                diagnostic_code = DIAGNOSTIC_NUCLEI_SPAWN_FAILED
+                exit_code = None
+                process = None
+                stderr_buffer = bytearray()
 
                 try:
                     process = await asyncio.create_subprocess_exec(
@@ -297,9 +346,35 @@ class NucleiFullScanTool(ToolPlugin):
                                 chunk = await process.stderr.read(1024)
                                 if not chunk:
                                     break
-                                stderr_line = chunk.decode('utf-8', errors='replace').strip()
-                                if stderr_line:
-                                    print(f"[Nuclei Full] [{cat_label}] stderr: {stderr_line}")
+                                stderr_buffer.extend(chunk)
+                                overflow = len(stderr_buffer) - MAX_STDERR_CLASSIFICATION_BYTES
+                                if overflow > 0:
+                                    del stderr_buffer[:overflow]
+
+                        def record_finding(line):
+                            line_str = line.decode('utf-8', errors='replace').strip().replace('\0', '')
+                            if not line_str:
+                                return
+                            try:
+                                finding = json.loads(line_str)
+                            except json.JSONDecodeError:
+                                return
+                            batch_findings.append(finding)
+
+                            if agent:
+                                total_so_far = len(all_findings) + len(batch_findings)
+                                finding_name = finding.get('info', {}).get('name', 'Unknown')
+                                finding_severity = finding.get('info', {}).get('severity', 'unknown').upper()
+                                finding_url = finding.get('matched-at', 'N/A')
+                                agent.append_output(
+                                    f"[Nuclei Full] Found: {finding_name} ({finding_severity}) at {finding_url}"
+                                )
+                                agent.report_progress(
+                                    current_operation=f"Scanning {cat_label} ({total_so_far} findings total)",
+                                    current_target=scan_target,
+                                    items_processed=total_so_far,
+                                    total_items=total_targets
+                                )
 
                         stderr_task = asyncio.create_task(read_stderr())
 
@@ -312,29 +387,7 @@ class NucleiFullScanTool(ToolPlugin):
                                 line_buffer += chunk
                                 while b'\n' in line_buffer:
                                     line, line_buffer = line_buffer.split(b'\n', 1)
-                                    line_str = line.decode('utf-8', errors='replace').strip().replace('\0', '')
-
-                                    if line_str:
-                                        try:
-                                            finding = json.loads(line_str)
-                                            batch_findings.append(finding)
-
-                                            if agent:
-                                                total_so_far = len(all_findings) + len(batch_findings)
-                                                finding_name = finding.get('info', {}).get('name', 'Unknown')
-                                                finding_severity = finding.get('info', {}).get('severity', 'unknown').upper()
-                                                finding_url = finding.get('matched-at', 'N/A')
-                                                agent.append_output(
-                                                    f"[Nuclei Full] Found: {finding_name} ({finding_severity}) at {finding_url}"
-                                                )
-                                                agent.report_progress(
-                                                    current_operation=f"Scanning {cat_label} ({total_so_far} findings total)",
-                                                    current_target=scan_target,
-                                                    items_processed=total_so_far,
-                                                    total_items=total_targets
-                                                )
-                                        except json.JSONDecodeError:
-                                            pass
+                                    record_finding(line)
 
                                 # Periodic progress update
                                 current_time = time.time()
@@ -352,18 +405,32 @@ class NucleiFullScanTool(ToolPlugin):
                                             f"[Nuclei Full] [{cat_label}] Scanning... ({int(elapsed)}s elapsed)"
                                         )
                                     last_progress_update = current_time
-                        finally:
-                            stderr_task.cancel()
-                            try:
-                                await stderr_task
-                            except asyncio.CancelledError:
-                                pass
 
-                        await process.wait()
+                            if line_buffer:
+                                record_finding(line_buffer)
+
+                            await process.wait()
+                            await stderr_task
+                        finally:
+                            if not stderr_task.done():
+                                stderr_task.cancel()
+                            await asyncio.gather(stderr_task, return_exceptions=True)
 
                     await asyncio.wait_for(read_batch_output(), timeout=category_timeout_seconds)
 
+                    exit_code = _bounded_exit_code(process.returncode)
+                    diagnostic_code = _classify_process_diagnostic(
+                        bytes(stderr_buffer), exit_code
+                    )
+                    if exit_code == 0 and diagnostic_code == DIAGNOSTIC_NONE:
+                        category_status = CATEGORY_STATUS_COMPLETED
+                    else:
+                        category_status = CATEGORY_STATUS_PROCESS_FAILED
+
                 except asyncio.TimeoutError:
+                    category_status = CATEGORY_STATUS_TIMED_OUT
+                    diagnostic_code = DIAGNOSTIC_CATEGORY_TIMEOUT
+                    exit_code = None
                     print(
                         f"[Nuclei Full] [{cat_label}] Timed out after "
                         f"{category_timeout_seconds}s, got {len(batch_findings)} partial findings"
@@ -374,16 +441,41 @@ class NucleiFullScanTool(ToolPlugin):
                             f"{category_timeout_seconds}s; keeping {len(batch_findings)} partial findings"
                         )
                     try:
-                        process.kill()
-                        await process.wait()
+                        if process is not None:
+                            process.kill()
+                            await process.wait()
                     except Exception:
                         pass
-                except Exception as e:
-                    print(f"[Nuclei Full] [{cat_label}] Error: {e}")
+                except Exception:
+                    category_status = CATEGORY_STATUS_PROCESS_FAILED
+                    diagnostic_code = (
+                        DIAGNOSTIC_NUCLEI_SPAWN_FAILED
+                        if process is None
+                        else DIAGNOSTIC_NUCLEI_PROCESS_ERROR
+                    )
+                    exit_code = None
+                    try:
+                        if process is not None and process.returncode is None:
+                            process.kill()
+                            await process.wait()
+                    except Exception:
+                        pass
 
                 category_results[cat_label] = len(batch_findings)
                 all_findings.extend(batch_findings)
-                print(f"[Nuclei Full] [{cat_label}] Completed: {len(batch_findings)} findings (total so far: {len(all_findings)})")
+                category_outcomes.append({
+                    "category": category,
+                    "status": category_status,
+                    "elapsedMs": _bounded_elapsed_ms(category_started_at, time.monotonic()),
+                    "findingCount": min(len(batch_findings), MAX_CATEGORY_FINDING_COUNT),
+                    "exitCode": exit_code,
+                    "diagnosticCode": diagnostic_code,
+                })
+                print(
+                    f"[Nuclei Full] [{cat_label}] {category_status}: "
+                    f"{len(batch_findings)} findings; diagnostic={diagnostic_code} "
+                    f"(total so far: {len(all_findings)})"
+                )
 
             # Cleanup temp files
             if target_file and os.path.exists(target_file):
@@ -391,12 +483,6 @@ class NucleiFullScanTool(ToolPlugin):
                     os.remove(target_file)
                 except Exception as e:
                     print(f"[Nuclei Full] Warning: Could not delete target file: {e}")
-
-            if exclude_file and os.path.exists(exclude_file):
-                try:
-                    os.remove(exclude_file)
-                except Exception as e:
-                    print(f"[Nuclei Full] Warning: Could not delete exclude file: {e}")
 
             elapsed = time.time() - start_time
             print(f"[Nuclei Full] All categories completed in {int(elapsed)}s: {len(all_findings)} total findings")
@@ -445,6 +531,25 @@ class NucleiFullScanTool(ToolPlugin):
                 finding_str = finding_str.replace('\0', '')
                 findings_sanitized.append(json.loads(finding_str))
 
+            incomplete_outcomes = [
+                outcome
+                for outcome in category_outcomes
+                if outcome["status"] != CATEGORY_STATUS_COMPLETED
+            ]
+            if incomplete_outcomes:
+                coverage_status = "INCOMPLETE"
+                coverage_reason = incomplete_outcomes[0]["diagnosticCode"]
+                coverage_retryable = all(
+                    outcome["diagnosticCode"] != DIAGNOSTIC_NUCLEI_SPAWN_FAILED
+                    for outcome in incomplete_outcomes
+                )
+            else:
+                coverage_status = (
+                    "CONFIRMED" if findings_sanitized else "COMPLETE_NO_FINDING"
+                )
+                coverage_reason = "ALL_CATEGORIES_COMPLETED"
+                coverage_retryable = False
+
             return {
                 "success": True,
                 "output": {
@@ -455,6 +560,16 @@ class NucleiFullScanTool(ToolPlugin):
                     "tool": "nuclei",
                     "scan_type": "full",
                     "category_results": category_results,
+                    "categoryOutcomes": category_outcomes,
+                    "coverageStatus": coverage_status,
+                    "coverageReason": coverage_reason,
+                    "coverage": {
+                        "plannedCategories": len(TEMPLATE_CATEGORIES),
+                        "completedCategories": len(TEMPLATE_CATEGORIES) - len(incomplete_outcomes),
+                        "incompleteCategories": len(incomplete_outcomes),
+                        "retryable": coverage_retryable,
+                        "stopReason": coverage_reason,
+                    },
                     "elapsed_seconds": int(elapsed)
                 },
                 "raw_output": raw_output_sanitized
