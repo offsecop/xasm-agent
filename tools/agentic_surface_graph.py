@@ -15,6 +15,8 @@ import aiohttp
 from plugin_interface import ToolPlugin
 from tools._agentic_exploration_common import (
     NATIVE_PROBE_PRIVATE_CANDIDATES_KEY,
+    NATIVE_PROBE_QUERY_CANDIDATES_KEY,
+    build_native_probe_query_contract,
     classify_parameters,
     dedupe_keep_order,
     extract_html_map,
@@ -22,6 +24,7 @@ from tools._agentic_exploration_common import (
     fetch_text,
     normalize_url,
     parse_headers,
+    sanitize_native_probe_public_url,
     same_origin,
 )
 
@@ -161,9 +164,14 @@ class SurfaceGraphTool(ToolPlugin):
                     mapped.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
                 )
                 queue.extend(page_links)
+                observed_page_url = str(fetched.get("url") or url)
                 pages.append(
                     {
-                        "url": fetched.get("url") or url,
+                        "url": (
+                            sanitize_native_probe_public_url(observed_page_url)
+                            if "?" in observed_page_url
+                            else observed_page_url
+                        ),
                         "status": fetched.get("status"),
                         "title": mapped.get("title"),
                         "links": len(page_links),
@@ -187,17 +195,54 @@ class SurfaceGraphTool(ToolPlugin):
                     continue
 
         all_urls = dedupe_keep_order([*all_urls, *js_routes, *api_paths, *graphql_hints], 1000)
+        query_contract = build_native_probe_query_contract(
+            all_urls,
+            source="surface:graph",
+        )
+        private_probe_candidates.extend(
+            query_contract.get(NATIVE_PROBE_PRIVATE_CANDIDATES_KEY, [])
+        )
+        all_urls = dedupe_keep_order(
+            [
+                sanitize_native_probe_public_url(url) if "?" in url else url
+                for url in all_urls
+            ],
+            1000,
+        )
         forms = self._dedupe_forms(forms)
         classified = classify_parameters(all_urls, forms)
         hypotheses = self._build_hypotheses(base, all_urls, forms, classified, pages)
+        query_candidates = query_contract.get(NATIVE_PROBE_QUERY_CANDIDATES_KEY, [])
+        public_scripts = dedupe_keep_order(
+            [
+                sanitize_native_probe_public_url(url) if "?" in url else url
+                for url in scripts
+            ],
+            250,
+        )
+        public_api_paths = dedupe_keep_order(
+            [
+                sanitize_native_probe_public_url(url) if "?" in url else url
+                for url in api_paths
+            ],
+            200,
+        )
+        public_graphql_hints = dedupe_keep_order(
+            [
+                sanitize_native_probe_public_url(url) if "?" in url else url
+                for url in graphql_hints
+            ],
+            30,
+        )
         graph = {
             "pages": pages[:250],
             "urls": all_urls[:1000],
             "parameterizedUrls": classified.get("urlsWithParams", []),
+            NATIVE_PROBE_QUERY_CANDIDATES_KEY: query_candidates,
             "forms": forms[:250],
-            "scripts": dedupe_keep_order(scripts, 250),
-            "apiPaths": dedupe_keep_order(api_paths, 200),
-            "graphqlHints": dedupe_keep_order(graphql_hints, 30),
+            "scripts": public_scripts,
+            "apiPaths": public_api_paths,
+            "graphqlHints": public_graphql_hints,
             "parameters": classified.get("parameters", {}),
             "interestingParameters": classified.get("interestingParameters", []),
             "sensitivePaths": self._sensitive_paths(all_urls),
@@ -205,16 +250,20 @@ class SurfaceGraphTool(ToolPlugin):
         }
         return {
             "success": True,
-            "target": base,
+            "target": (
+                sanitize_native_probe_public_url(base) if "?" in base else base
+            ),
             "surfaceGraph": graph,
             "urls": graph["urls"],
             "forms": graph["forms"],
+            NATIVE_PROBE_QUERY_CANDIDATES_KEY: query_candidates,
             NATIVE_PROBE_PRIVATE_CANDIDATES_KEY: private_probe_candidates[:250],
             "hypotheses": hypotheses,
             "summary": {
                 "pagesFetched": len(pages),
                 "urls": len(graph["urls"]),
                 "parameterizedUrls": len(graph["parameterizedUrls"]),
+                "nativeQueryCandidates": len(query_candidates),
                 "forms": len(graph["forms"]),
                 "scripts": len(graph["scripts"]),
                 "apiPaths": len(graph["apiPaths"]),
